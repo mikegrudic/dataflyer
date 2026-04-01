@@ -174,7 +174,7 @@ class Camera:
         else:
             center = ((pmin + pmax) / 2).astype(np.float32)
 
-        self.position = center + np.array([0, 0, extent * 0.3], dtype=np.float32)
+        self.position = center.copy()
         self.speed = extent / 10
         self.near = extent * 1e-6
         self.far = extent * 10
