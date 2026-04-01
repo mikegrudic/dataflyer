@@ -83,7 +83,7 @@ class SnapshotData:
     def _cosmo_correct(self, data, ptype, field):
         """Apply cosmological scale factor corrections if applicable."""
         h = self.header
-        if "HubbleParam" not in h or h.get("Time", 1) == h.get("Redshift", 0):
+        if not h.get("ComovingIntegrationOn", 0):
             return data  # Not cosmological
 
         a = float(h.get("Time", 1))
