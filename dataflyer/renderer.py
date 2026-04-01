@@ -248,11 +248,11 @@ class SpatialGrid:
             cell_qty[ne_idx] = mq_ne / safe
             cell_mx2[ne_idx] = mp2_ne
             cell_mh2[ne_idx] = mh2_ne
-            # h from variance matching (cubic spline 2D variance = h^2/12.65 per dim):
-            # h = sqrt(4.22 * var_3d + mean(h^2))
-            # Floor at 1.5 * cell_spacing so adjacent splats overlap smoothly
-            # (cubic spline has compact support at r=h, need h > spacing for continuity)
-            h_var = np.sqrt(np.maximum(4.22 * var_ne + mh2_ne / safe, 1e-30))
+            # Variance matching with sigma = h/2:
+            #   <r^2>_kernel = h^2/2, projected spatial var = 2/3 * V_3d
+            #   h_summary^2/2 = 2/3 * V_3d + <h^2>/2
+            #   h_summary = sqrt(4/3 * V_3d + <h^2>)
+            h_var = np.sqrt(np.maximum((4.0/3.0) * var_ne + mh2_ne / safe, 1e-30))
             cell_hsml[ne_idx] = h_var
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
@@ -302,7 +302,7 @@ class SpatialGrid:
         cell_com = cell_mp / safe[:, None]
         cell_qty = cell_mq / safe
         var = (cell_mx2 / safe[:, None] - cell_com ** 2).sum(axis=1)
-        h_var = np.sqrt(np.maximum(4.22 * var + cell_mh2 / safe, 1e-30))
+        h_var = np.sqrt(np.maximum((4.0/3.0) * var + cell_mh2 / safe, 1e-30))
         cell_hsml = h_var
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
