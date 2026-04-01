@@ -9,6 +9,7 @@ from .camera import Camera
 from .data_manager import SnapshotData, find_snapshots
 from .renderer import SplatRenderer
 from .colormaps import create_colormap_texture_safe, AVAILABLE_COLORMAPS
+from .overlay import DevOverlay
 
 
 class DataFlyerApp:
@@ -57,6 +58,11 @@ class DataFlyerApp:
 
         # Renderer
         self.renderer = SplatRenderer(self.ctx)
+
+        # Dev overlay
+        self.overlay = DevOverlay(self.ctx)
+        self._last_message = ""
+        self._timings = {"cull": 0, "upload": 0, "render": 0}
 
         # Colormaps
         self._colormap_textures = {}
@@ -121,6 +127,11 @@ class DataFlyerApp:
 
         self._needs_auto_range = True
 
+    def _msg(self, text):
+        """Print and capture for dev overlay."""
+        print(text)
+        self._last_message = text
+
     def _range_str(self):
         lo, hi = self.renderer.qty_min, self.renderer.qty_max
         if self.renderer.log_scale:
@@ -132,7 +143,7 @@ class DataFlyerApp:
         lo, hi = self.renderer.read_accum_range()
         self.renderer.qty_min = lo
         self.renderer.qty_max = hi
-        print(f"Auto-range: {self._range_str()}")
+        self._msg(f"Auto-range: {self._range_str()}")
 
     def _set_colormap(self, name):
         if name not in self._colormap_textures:
@@ -142,7 +153,7 @@ class DataFlyerApp:
     def _cycle_quantity(self, direction=1):
         self._qty_idx = (self._qty_idx + direction) % len(self._quantities)
         self._current_qty = self._quantities[self._qty_idx]
-        print(f"Quantity: {self._current_qty}")
+        self._msg(f"Quantity: {self._current_qty}")
         q = self.data.get_quantity(self._current_qty)
         self.renderer.update_quantity(q)
         self._needs_auto_range = True  # auto-range after next render
@@ -154,7 +165,7 @@ class DataFlyerApp:
     def _cycle_colormap(self, direction=1):
         self._cmap_idx = (self._cmap_idx + direction) % len(AVAILABLE_COLORMAPS)
         name = AVAILABLE_COLORMAPS[self._cmap_idx]
-        print(f"Colormap: {name}")
+        self._msg(f"Colormap: {name}")
         self._set_colormap(name)
 
     def _key_callback(self, window, key, scancode, action, mods):
@@ -179,7 +190,7 @@ class DataFlyerApp:
             if key == nk and i < len(self._quantities):
                 self._qty_idx = i
                 self._current_qty = self._quantities[i]
-                print(f"Quantity: {self._current_qty}")
+                self._msg(f"Quantity: {self._current_qty}")
                 q = self.data.get_quantity(self._current_qty)
                 self.renderer.update_quantity(q)
                 self.renderer.mode = 0 if self._current_qty == "surface_density" else 1
@@ -215,7 +226,7 @@ class DataFlyerApp:
             half *= 0.8  # contract = more contrast
             self.renderer.qty_min = mid - half
             self.renderer.qty_max = mid + half
-            print(f"Range: {self._range_str()}")
+            self._msg(f"Range: {self._range_str()}")
             return
         if key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
             mid = (self.renderer.qty_min + self.renderer.qty_max) / 2
@@ -223,18 +234,18 @@ class DataFlyerApp:
             half *= 1.25  # expand = less contrast
             self.renderer.qty_min = mid - half
             self.renderer.qty_max = mid + half
-            print(f"Range: {self._range_str()}")
+            self._msg(f"Range: {self._range_str()}")
             return
 
         # [/]: adjust LOD pixel threshold (more/less detail)
         if key == glfw.KEY_RIGHT_BRACKET:
             self.renderer.lod_pixels = max(1, self.renderer.lod_pixels // 2)
-            print(f"LOD: {self.renderer.lod_pixels}px (more detail)")
+            self._msg(f"LOD: {self.renderer.lod_pixels}px (more detail)")
             self.renderer.update_visible(self.camera)
             return
         if key == glfw.KEY_LEFT_BRACKET:
             self.renderer.lod_pixels = min(256, self.renderer.lod_pixels * 2)
-            print(f"LOD: {self.renderer.lod_pixels}px (faster)")
+            self._msg(f"LOD: {self.renderer.lod_pixels}px (faster)")
             self.renderer.update_visible(self.camera)
             return
 
@@ -244,7 +255,7 @@ class DataFlyerApp:
                 self.renderer.n_total,
                 int(self.renderer.max_render_particles * 2),
             )
-            print(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
+            self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
             self.renderer.update_visible(self.camera)
             return
         if key == glfw.KEY_COMMA:
@@ -252,7 +263,7 @@ class DataFlyerApp:
                 100_000,
                 self.renderer.max_render_particles // 2,
             )
-            print(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
+            self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
             self.renderer.update_visible(self.camera)
             return
 
@@ -260,13 +271,19 @@ class DataFlyerApp:
         if key == glfw.KEY_L:
             self.renderer.log_scale = 1 - self.renderer.log_scale
             scale_name = "log" if self.renderer.log_scale else "linear"
-            print(f"Scale: {scale_name}")
+            self._msg(f"Scale: {scale_name}")
             self._needs_auto_range = True
             return
 
         # P: screenshot
         if key == glfw.KEY_P:
             self._screenshot()
+            return
+
+        # \: toggle dev overlay
+        if key == glfw.KEY_BACKSLASH:
+            self.overlay.enabled = not self.overlay.enabled
+            self._msg(f"Dev overlay: {'on' if self.overlay.enabled else 'off'}")
             return
 
         # H: print help
@@ -320,6 +337,7 @@ class DataFlyerApp:
         print("  R        : Auto-range dynamic range")
         print("  L        : Toggle log/linear scale")
         print("  P        : Screenshot")
+        print("  \\        : Toggle dev overlay")
         print("  H        : Print this help")
         print("  ESC      : Quit")
         print(f"\n  Quantities:")
@@ -376,12 +394,15 @@ class DataFlyerApp:
             # Update camera
             moved = self.camera.update(dt)
 
-            # Re-cull visible particles, but not every frame (culling is expensive)
+            # Re-cull visible particles when camera moves
+            t_cull = 0.0
             if moved and self.renderer.n_total > self.renderer.max_render_particles:
                 if not hasattr(self, '_last_cull_time'):
                     self._last_cull_time = 0.0
-                if now - self._last_cull_time > 0.5:  # re-cull at most every 500ms
+                if now - self._last_cull_time > 0.5:
+                    t0 = time.perf_counter()
                     self.renderer.update_visible(self.camera)
+                    t_cull = time.perf_counter() - t0
                     self._last_cull_time = now
 
             # Get framebuffer size (may differ from window size on retina)
@@ -391,16 +412,44 @@ class DataFlyerApp:
             # Clear and render
             self.ctx.clear(0.0, 0.0, 0.0, 1.0)
             self.ctx.screen.use()
+            t0 = time.perf_counter()
             self.renderer.render(self.camera, fb_width, fb_height)
+            t_render = time.perf_counter() - t0
 
             # Deferred auto-range: read back actual pixel values after first render
             if self._needs_auto_range:
                 self._auto_range_from_framebuffer()
-                # Re-render with the correct range
                 self.ctx.clear(0.0, 0.0, 0.0, 1.0)
                 self.ctx.screen.use()
                 self.renderer.render(self.camera, fb_width, fb_height)
                 self._needs_auto_range = False
+
+            # Update timing stats (exponential moving average)
+            alpha = 0.2
+            if t_cull > 0:
+                self._timings["cull"] = self._timings["cull"] * (1 - alpha) + t_cull * alpha
+            self._timings["render"] = self._timings["render"] * (1 - alpha) + t_render * alpha
+
+            # Dev overlay
+            if self.overlay.enabled:
+                n_vis = self.renderer.n_particles
+                n_tot = self.renderer.n_total
+                scale = "log" if self.renderer.log_scale else "linear"
+                lines = [
+                    f"FPS: {self._fps:.0f}",
+                    f"Particles: {n_vis:,} / {n_tot:,}",
+                    f"LOD: {self.renderer.lod_pixels}px  Budget: {self.renderer.max_render_particles/1e6:.1f}M",
+                    f"Cull: {self._timings['cull']*1000:.0f}ms  Render: {self._timings['render']*1000:.0f}ms",
+                    f"Quantity: {self._current_qty}  Scale: {scale}",
+                    f"Range: {self._range_str()}",
+                    f"Colormap: {AVAILABLE_COLORMAPS[self._cmap_idx]}",
+                    f"Pos: ({self.camera.position[0]:.2f}, {self.camera.position[1]:.2f}, {self.camera.position[2]:.2f})",
+                    f"Speed: {self.camera.speed:.3g}",
+                    f"",
+                    self._last_message,
+                ]
+                self.overlay.update(lines, fb_width, fb_height)
+                self.overlay.render()
 
             glfw.swap_buffers(self.window)
 
@@ -424,6 +473,7 @@ class DataFlyerApp:
         self._cleanup()
 
     def _cleanup(self):
+        self.overlay.release()
         self.renderer.release()
         self.data.close()
         glfw.terminate()
