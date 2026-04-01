@@ -369,9 +369,10 @@ class SpatialGrid:
         visible = in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
         has_mass = lv["mass"] > 0
 
-        safe_depths = np.maximum(depths, 0.01)
+        dist = np.sqrt(depths**2 + rights**2 + ups**2)
+        safe_dist = np.maximum(dist, 0.01)
         # Opening criterion: does the summary h subtend > lod_pixels?
-        h_pix = lv["hsml"] / safe_depths * pix_per_rad
+        h_pix = lv["hsml"] / safe_dist * pix_per_rad
 
         summary_mask = visible & has_mass & (h_pix <= lod_pixels)
         refine_mask = visible & has_mass & (h_pix > lod_pixels)
@@ -418,8 +419,9 @@ class SpatialGrid:
             lim_v = (depths + hd) * half_tan + hd
             vis = in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
 
-            safe_depths = np.maximum(depths, 0.01)
-            h_pix = lv["hsml"][child_flat] / safe_depths * pix_per_rad
+            dist = np.sqrt(depths**2 + rights**2 + ups**2)
+            safe_dist = np.maximum(dist, 0.01)
+            h_pix = lv["hsml"][child_flat] / safe_dist * pix_per_rad
 
             small = vis & (h_pix <= lod_pixels)
             large = vis & (h_pix > lod_pixels)
@@ -438,7 +440,7 @@ class SpatialGrid:
                     budget = max(max_particles - n_summaries, max_particles // 2)
                     if importance_sampling:
                         # Use cell depths and summary h for per-cell weighting
-                        vis_depths = safe_depths[large].astype(np.float64)
+                        vis_depths = safe_dist[large].astype(np.float64)
                         vis_cell_h = lv["hsml"][child_flat[large]].astype(np.float64)
                         real_pos, real_hsml, real_mass, real_qty, n_visible_real = \
                             _gather_importance_sampled(
