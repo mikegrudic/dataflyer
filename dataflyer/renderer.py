@@ -3,8 +3,61 @@
 import numpy as np
 import moderngl
 from pathlib import Path
+from numba import njit, prange
 
 SHADER_DIR = Path(__file__).parent / "shaders"
+
+
+@njit(parallel=True, cache=True)
+def _gather_subsampled(cell_start, sort_order, vis_cells, budget):
+    """Gather particle indices from visible cells, subsampling within each cell.
+
+    Instead of gathering all visible particles then striding, we compute
+    the stride per-cell and only gather the particles we'll keep.
+    Returns (indices, n_visible_total) where indices are into the original arrays.
+    """
+    n_cells = len(vis_cells)
+
+    # First pass: count total visible particles
+    total = np.int64(0)
+    for i in range(n_cells):
+        c = vis_cells[i]
+        total += cell_start[c + 1] - cell_start[c]
+
+    # Compute global stride
+    if total <= budget:
+        stride = 1
+    else:
+        stride = max(1, total // budget)
+
+    # Second pass: count how many we'll keep per cell
+    out_counts = np.empty(n_cells, dtype=np.int64)
+    out_total = np.int64(0)
+    for i in range(n_cells):
+        c = vis_cells[i]
+        n = cell_start[c + 1] - cell_start[c]
+        kept = (n + stride - 1) // stride  # ceil division
+        out_counts[i] = kept
+        out_total += kept
+
+    # Third pass: parallel gather with stride
+    out_offsets = np.empty(n_cells, dtype=np.int64)
+    out_offsets[0] = 0
+    for i in range(1, n_cells):
+        out_offsets[i] = out_offsets[i - 1] + out_counts[i - 1]
+
+    result = np.empty(out_total, dtype=np.int64)
+    for i in prange(n_cells):
+        c = vis_cells[i]
+        start = cell_start[c]
+        end = cell_start[c + 1]
+        out_start = out_offsets[i]
+        j = 0
+        for k in range(start, end, stride):
+            result[out_start + j] = sort_order[k]
+            j += 1
+
+    return result, total
 
 # Maximum particles to render per frame for interactive performance
 MAX_RENDER_PARTICLES = 4_000_000
@@ -189,7 +242,8 @@ class SpatialGrid:
 
         finest = self.levels[0]
         summary_parts = []
-        all_real = np.array([], dtype=np.intp)
+        all_real = np.array([], dtype=np.int64)
+        n_visible_real = 0
 
         # Start from coarsest level
         coarsest = self.levels[-1]
@@ -271,29 +325,21 @@ class SpatialGrid:
                 # Finest level: real particles for large cells
                 vis_cells = child_flat[large]
                 if len(vis_cells) > 0:
-                    starts = finest["cell_start"][vis_cells]
-                    ends = finest["cell_start"][vis_cells + 1]
-                    counts = (ends - starts).astype(np.intp)
-                    total = int(counts.sum())
-                    if total > 0:
-                        off = np.repeat(starts, counts)
-                        within = np.arange(total, dtype=np.int64) - np.repeat(
-                            np.concatenate([[0], np.cumsum(counts[:-1])]), counts
-                        )
-                        all_real = finest["sort_order"][(off + within).astype(np.intp)]
+                    n_summaries = sum(p[0].shape[0] for p in summary_parts) if summary_parts else 0
+                    budget = max(max_particles - n_summaries, max_particles // 2)
+                    all_real, n_visible_real = _gather_subsampled(
+                        finest["cell_start"], finest["sort_order"],
+                        vis_cells.astype(np.int64), budget,
+                    )
             else:
                 refine_cells = child_flat[large]
 
-        # Budget: subsample real particles if needed, with mass/h rescaling
-        n_summaries = sum(p[0].shape[0] for p in summary_parts) if summary_parts else 0
-        n_visible_real = len(all_real)
-        budget = max(max_particles - n_summaries, max_particles // 2)
+        # Compute mass/h rescaling from subsampling ratio
+        n_visible_real = int(n_visible_real)
 
         mass_scale = 1.0
         h_scale = 1.0
-        if n_visible_real > budget:
-            step = max(1, n_visible_real // budget)
-            all_real = all_real[::step]
+        if len(all_real) > 0 and n_visible_real > len(all_real):
             ratio = n_visible_real / len(all_real)
             mass_scale = ratio
             h_scale = ratio ** (1.0 / 3.0)
