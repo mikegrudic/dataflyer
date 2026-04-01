@@ -184,6 +184,7 @@ class SplatRenderer:
 
         self.prog_additive["u_view"].write(view.tobytes())
         self.prog_additive["u_proj"].write(proj.tobytes())
+        self.prog_additive["u_viewport_size"].value = (float(width), float(height))
 
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = (moderngl.ONE, moderngl.ONE)  # pure additive
