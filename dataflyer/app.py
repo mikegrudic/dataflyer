@@ -286,6 +286,29 @@ class DataFlyerApp:
             self._msg(f"Dev overlay: {'on' if self.overlay.enabled else 'off'}")
             return
 
+        # I: toggle importance-weighted subsampling
+        if key == glfw.KEY_I:
+            self.renderer.use_importance_sampling = not self.renderer.use_importance_sampling
+            state = "on" if self.renderer.use_importance_sampling else "off"
+            self._msg(f"Importance sampling: {state}")
+            self.renderer.update_visible(self.camera)
+            return
+
+        # T: toggle tree
+        if key == glfw.KEY_T:
+            self.renderer.use_tree = not self.renderer.use_tree
+            state = "on" if self.renderer.use_tree else "off"
+            self._msg(f"Tree: {state}")
+            # Rebuild or discard the grid
+            if self.renderer.use_tree and self.renderer._grid is None:
+                q = self.data.get_quantity(self._current_qty)
+                self.renderer.set_particles(
+                    self.data.positions, self.data.hsml, self.data.masses, q)
+            elif not self.renderer.use_tree:
+                self.renderer._grid = None
+            self.renderer.update_visible(self.camera)
+            return
+
         # H: print help
         if key == glfw.KEY_H:
             self._print_help()
@@ -436,10 +459,13 @@ class DataFlyerApp:
                 n_vis = self.renderer.n_particles
                 n_tot = self.renderer.n_total
                 scale = "log" if self.renderer.log_scale else "linear"
+                imp = "on" if self.renderer.use_importance_sampling else "off"
+                tree = "on" if self.renderer.use_tree else "off"
                 lines = [
                     f"FPS: {self._fps:.0f}",
                     f"Particles: {n_vis:,} / {n_tot:,}",
                     f"LOD: {self.renderer.lod_pixels}px  Budget: {self.renderer.max_render_particles/1e6:.1f}M",
+                    f"Tree: {tree}  Importance: {imp}",
                     f"Cull: {self._timings['cull']*1000:.0f}ms  Render: {self._timings['render']*1000:.0f}ms",
                     f"Quantity: {self._current_qty}  Scale: {scale}",
                     f"Range: {self._range_str()}",
