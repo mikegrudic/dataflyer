@@ -14,62 +14,94 @@ def _load_shader(name):
     return (SHADER_DIR / name).read_text()
 
 
-def _frustum_cull_and_lod(positions, hsml, camera, max_particles):
-    """Select visible particles with LOD. Returns index array.
+class SpatialGrid:
+    """Uniform grid spatial index for fast frustum queries."""
 
-    Strategy:
-    1. Frustum cull: discard particles behind camera or outside FOV
-    2. If still too many, subsample distant particles (LOD)
-    """
-    N = len(positions)
-    cam_pos = camera.position
-    cam_fwd = camera.forward
-    cam_right = camera.right
-    cam_up = camera.up
+    def __init__(self, positions, n_cells=64):
+        self.n_cells = n_cells
+        self.pmin = positions.min(axis=0)
+        self.pmax = positions.max(axis=0)
+        self.cell_size = (self.pmax - self.pmin) / n_cells
+        self.cell_size[self.cell_size == 0] = 1.0  # avoid division by zero
 
-    # Camera-space coordinates
-    rel = positions - cam_pos
-    depths = rel @ cam_fwd    # distance along viewing direction
-    rights = rel @ cam_right  # horizontal offset
-    ups = rel @ cam_up        # vertical offset
+        # Assign each particle to a cell
+        cell_idx = np.clip(
+            ((positions - self.pmin) / self.cell_size).astype(np.int32),
+            0, n_cells - 1
+        )
+        # Flatten 3D cell index to 1D
+        self.cell_id = cell_idx[:, 0] * n_cells * n_cells + cell_idx[:, 1] * n_cells + cell_idx[:, 2]
 
-    # Cull behind camera (with smoothing length margin)
-    in_front = depths > -hsml
+        # Sort particles by cell for cache-friendly access
+        self.sort_order = np.argsort(self.cell_id)
+        self.sorted_cell_id = self.cell_id[self.sort_order]
 
-    # Frustum cull: for FOV, tan(fov/2) gives the half-width at depth=1
-    half_tan = np.tan(np.radians(camera.fov) / 2)
-    # At each particle's depth, the visible half-width is depth * half_tan
-    # Include margin for particle size (hsml)
-    vis_depth = np.abs(depths) * half_tan + hsml
-    in_frustum = in_front & (np.abs(rights) < vis_depth * camera.aspect) & (np.abs(ups) < vis_depth)
+        # Build cell start/end lookup
+        n_total_cells = n_cells ** 3
+        self.cell_start = np.zeros(n_total_cells + 1, dtype=np.int64)
+        # Count particles per cell
+        unique_cells, counts = np.unique(self.sorted_cell_id, return_counts=True)
+        self.cell_start[unique_cells + 1] = counts
+        np.cumsum(self.cell_start, out=self.cell_start)
 
-    visible_idx = np.where(in_frustum)[0]
+    def query_frustum(self, camera, max_particles):
+        """Return indices of particles visible in the camera frustum."""
+        nc = self.n_cells
+        cs = self.cell_size
 
-    if len(visible_idx) <= max_particles:
+        # Cell center positions
+        cx = np.arange(nc) * cs[0] + self.pmin[0] + cs[0] * 0.5
+        cy = np.arange(nc) * cs[1] + self.pmin[1] + cs[1] * 0.5
+        cz = np.arange(nc) * cs[2] + self.pmin[2] + cs[2] * 0.5
+        gx, gy, gz = np.meshgrid(cx, cy, cz, indexing='ij')
+        cell_centers = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1).astype(np.float32)
+
+        # Camera-space dot products on cell centers (n_cells^3 is small, e.g. 262K)
+        cam_pos = camera.position
+        cam_fwd = camera.forward
+        cam_right = camera.right
+        cam_up = camera.up
+
+        depths = cell_centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
+        rights = cell_centers @ cam_right - np.dot(cam_pos, cam_right)
+        ups = cell_centers @ cam_up - np.dot(cam_pos, cam_up)
+
+        # Cell half-diagonal for conservative test
+        half_diag = np.linalg.norm(cs) * 0.5
+
+        # Frustum test on cells (wide: 2x FOV)
+        half_tan = np.tan(np.radians(min(camera.fov, 120)) / 2) * 2.0
+        in_front = depths > -half_diag
+        limit_h = (depths + half_diag) * half_tan * camera.aspect + half_diag
+        limit_v = (depths + half_diag) * half_tan + half_diag
+
+        visible_cells = np.where(
+            in_front & (np.abs(rights) < limit_h) & (np.abs(ups) < limit_v)
+        )[0]
+
+        # Gather particle indices from visible cells
+        idx_parts = []
+        total = 0
+        for c in visible_cells:
+            start = self.cell_start[c]
+            end = self.cell_start[c + 1]
+            n = end - start
+            if n == 0:
+                continue
+            idx_parts.append(self.sort_order[start:end])
+            total += n
+
+        if len(idx_parts) == 0:
+            return np.array([], dtype=np.int64)
+
+        visible_idx = np.concatenate(idx_parts)
+
+        # LOD subsample if over budget
+        if len(visible_idx) > max_particles:
+            step = max(1, len(visible_idx) // max_particles)
+            visible_idx = visible_idx[::step]
+
         return visible_idx
-
-    # LOD: subsample. Keep all close particles, subsample distant ones.
-    vis_depths = depths[visible_idx]
-    median_depth = np.median(vis_depths[vis_depths > 0]) if (vis_depths > 0).any() else 1.0
-
-    # Split into near (within 1 median depth) and far
-    near_mask = vis_depths < median_depth
-    near_idx = visible_idx[near_mask]
-    far_idx = visible_idx[~near_mask]
-
-    # How many far particles can we afford?
-    budget = max_particles - len(near_idx)
-    if budget <= 0:
-        # Even near particles exceed budget -- uniform subsample
-        step = max(1, len(visible_idx) // max_particles)
-        return visible_idx[::step]
-
-    if len(far_idx) > budget:
-        # Random subsample of far particles
-        rng = np.random.default_rng(42)
-        far_idx = rng.choice(far_idx, budget, replace=False)
-
-    return np.concatenate([near_idx, far_idx])
 
 
 class SplatRenderer:
@@ -161,14 +193,24 @@ class SplatRenderer:
         self._all_qty = quantity.astype(np.float32)
         self.n_total = len(masses)
 
+        # Build spatial grid for fast frustum queries on large datasets
+        if self.n_total > self.max_render_particles:
+            import time
+            t0 = time.perf_counter()
+            self._grid = SpatialGrid(self._all_pos)
+            print(f"  Spatial grid built in {time.perf_counter()-t0:.1f}s")
+        else:
+            self._grid = None
+
     def update_visible(self, camera):
         """Cull and upload only visible particles for this frame."""
         if self._all_pos is None:
             return
 
-        idx = _frustum_cull_and_lod(
-            self._all_pos, self._all_hsml, camera, self.max_render_particles
-        )
+        if self._grid is not None:
+            idx = self._grid.query_frustum(camera, self.max_render_particles)
+        else:
+            idx = np.arange(self.n_total)
 
         self._upload_subset(idx)
 
