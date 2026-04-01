@@ -67,11 +67,13 @@ class DataFlyerApp:
         self._qty_idx = 0
         self._current_qty = self._quantities[0]
 
-        # Upload particles
+        # Store particles and upload (with culling for large datasets)
         quantity = self.data.get_quantity(self._current_qty)
-        self.renderer.upload_particles(
+        self.renderer.set_particles(
             self.data.positions, self.data.hsml, self.data.masses, quantity,
         )
+        self.renderer.update_visible(self.camera)
+        print(f"  Rendering {self.renderer.n_particles:,} / {self.renderer.n_total:,} visible particles")
 
         # Upload star particles
         if self.data.n_stars > 0:
@@ -107,9 +109,10 @@ class DataFlyerApp:
         self._current_qty = self._quantities[self._qty_idx]
 
         q = self.data.get_quantity(self._current_qty)
-        self.renderer.upload_particles(
+        self.renderer.set_particles(
             self.data.positions, self.data.hsml, self.data.masses, q,
         )
+        self.renderer.update_visible(self.camera)
         self.renderer.mode = 0 if self._current_qty == "surface_density" else 1
 
         if self.data.n_stars > 0:
@@ -295,7 +298,10 @@ class DataFlyerApp:
         print(f"  Opacity  : {self.renderer.alpha_scale:.4f}")
         print(f"  Scale    : {scale}")
         print(f"  Range    : {self._range_str()}")
-        print(f"  Gas      : {self.renderer.n_particles:,}")
+        if self.renderer.n_total > self.renderer.n_particles:
+            print(f"  Gas      : {self.renderer.n_particles:,} / {self.renderer.n_total:,} visible")
+        else:
+            print(f"  Gas      : {self.renderer.n_particles:,}")
         if self.renderer.n_stars > 0:
             print(f"  Stars    : {self.renderer.n_stars}")
         if len(self._snap_list) > 1:
@@ -323,16 +329,23 @@ class DataFlyerApp:
                 snap_info = ""
                 if len(self._snap_list) > 1:
                     snap_info = f" | snap {self._snap_idx + 1}/{len(self._snap_list)}"
+                n_vis = self.renderer.n_particles
+                n_tot = self.renderer.n_total
+                count = f"{n_vis/1e6:.1f}M/{n_tot/1e6:.1f}M" if n_tot > n_vis else f"{n_tot/1e6:.1f}M"
                 glfw.set_window_title(
                     self.window,
-                    f"DataFlyer | {self._fps:.0f} fps | {self._current_qty} | "
+                    f"DataFlyer | {self._fps:.0f} fps | {count} | {self._current_qty} | "
                     f"{AVAILABLE_COLORMAPS[self._cmap_idx]} | t={self.data.time:.4g}{snap_info}"
                 )
 
             glfw.poll_events()
 
             # Update camera
-            self.camera.update(dt)
+            moved = self.camera.update(dt)
+
+            # Re-cull visible particles when camera moves
+            if moved and self.renderer.n_total > self.renderer.max_render_particles:
+                self.renderer.update_visible(self.camera)
 
             # Get framebuffer size (may differ from window size on retina)
             fb_width, fb_height = glfw.get_framebuffer_size(self.window)

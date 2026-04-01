@@ -6,15 +6,77 @@ from pathlib import Path
 
 SHADER_DIR = Path(__file__).parent / "shaders"
 
+# Maximum particles to render per frame for interactive performance
+MAX_RENDER_PARTICLES = 4_000_000
+
 
 def _load_shader(name):
     return (SHADER_DIR / name).read_text()
+
+
+def _frustum_cull_and_lod(positions, hsml, camera, max_particles):
+    """Select visible particles with LOD. Returns index array.
+
+    Strategy:
+    1. Frustum cull: discard particles behind camera or outside FOV
+    2. If still too many, subsample distant particles (LOD)
+    """
+    N = len(positions)
+    cam_pos = camera.position
+    cam_fwd = camera.forward
+    cam_right = camera.right
+    cam_up = camera.up
+
+    # Camera-space coordinates
+    rel = positions - cam_pos
+    depths = rel @ cam_fwd    # distance along viewing direction
+    rights = rel @ cam_right  # horizontal offset
+    ups = rel @ cam_up        # vertical offset
+
+    # Cull behind camera (with smoothing length margin)
+    in_front = depths > -hsml
+
+    # Frustum cull: for FOV, tan(fov/2) gives the half-width at depth=1
+    half_tan = np.tan(np.radians(camera.fov) / 2)
+    # At each particle's depth, the visible half-width is depth * half_tan
+    # Include margin for particle size (hsml)
+    vis_depth = np.abs(depths) * half_tan + hsml
+    in_frustum = in_front & (np.abs(rights) < vis_depth * camera.aspect) & (np.abs(ups) < vis_depth)
+
+    visible_idx = np.where(in_frustum)[0]
+
+    if len(visible_idx) <= max_particles:
+        return visible_idx
+
+    # LOD: subsample. Keep all close particles, subsample distant ones.
+    vis_depths = depths[visible_idx]
+    median_depth = np.median(vis_depths[vis_depths > 0]) if (vis_depths > 0).any() else 1.0
+
+    # Split into near (within 1 median depth) and far
+    near_mask = vis_depths < median_depth
+    near_idx = visible_idx[near_mask]
+    far_idx = visible_idx[~near_mask]
+
+    # How many far particles can we afford?
+    budget = max_particles - len(near_idx)
+    if budget <= 0:
+        # Even near particles exceed budget -- uniform subsample
+        step = max(1, len(visible_idx) // max_particles)
+        return visible_idx[::step]
+
+    if len(far_idx) > budget:
+        # Random subsample of far particles
+        rng = np.random.default_rng(42)
+        far_idx = rng.choice(far_idx, budget, replace=False)
+
+    return np.concatenate([near_idx, far_idx])
 
 
 class SplatRenderer:
     def __init__(self, ctx):
         self.ctx = ctx
         self.n_particles = 0
+        self.n_total = 0  # total particles in dataset
 
         # Compile shader programs
         self.prog_additive = ctx.program(
@@ -46,12 +108,18 @@ class SplatRenderer:
         fs_quad = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype=np.float32)
         self.fs_quad_vbo = ctx.buffer(fs_quad.tobytes())
 
-        # Particle buffers (set by upload_particles)
+        # Particle buffers (set by upload_visible)
         self.pos_vbo = None
         self.hsml_vbo = None
         self.mass_vbo = None
         self.qty_vbo = None
         self.vao_additive = None
+
+        # Full dataset stored on CPU for culling
+        self._all_pos = None
+        self._all_hsml = None
+        self._all_mass = None
+        self._all_qty = None
 
         # FBO for accumulation (2 float textures: numerator + denominator)
         self._accum_fbo = None
@@ -70,7 +138,7 @@ class SplatRenderer:
         self.star_mass_vbo = None
         self.vao_star = None
         self.n_stars = 0
-        self.star_point_size = 50.0  # base point size in pixels
+        self.star_point_size = 50.0
 
         # Colormap texture (set externally)
         self.colormap_tex = None
@@ -81,10 +149,32 @@ class SplatRenderer:
         self.qty_max = 3.0
         self.mode = 0       # 0: surface density, 1: weighted quantity
         self.log_scale = 1  # 1: log10, 0: linear
+        self.max_render_particles = MAX_RENDER_PARTICLES
 
-    def upload_particles(self, positions, hsml, masses, quantity=None):
-        """Upload particle data to GPU buffers."""
-        self.n_particles = len(masses)
+    def set_particles(self, positions, hsml, masses, quantity=None):
+        """Store particle data on CPU. Call update_visible() to upload a subset."""
+        self._all_pos = positions.astype(np.float32)
+        self._all_hsml = hsml.astype(np.float32)
+        self._all_mass = masses.astype(np.float32)
+        if quantity is None:
+            quantity = masses
+        self._all_qty = quantity.astype(np.float32)
+        self.n_total = len(masses)
+
+    def update_visible(self, camera):
+        """Cull and upload only visible particles for this frame."""
+        if self._all_pos is None:
+            return
+
+        idx = _frustum_cull_and_lod(
+            self._all_pos, self._all_hsml, camera, self.max_render_particles
+        )
+
+        self._upload_subset(idx)
+
+    def _upload_subset(self, idx):
+        """Upload a subset of particles to GPU."""
+        self.n_particles = len(idx)
 
         # Release old buffers
         for attr in ("pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo"):
@@ -92,14 +182,38 @@ class SplatRenderer:
             if old is not None:
                 old.release()
 
-        self.pos_vbo = self.ctx.buffer(positions.astype(np.float32).tobytes())
-        self.hsml_vbo = self.ctx.buffer(hsml.astype(np.float32).tobytes())
-        self.mass_vbo = self.ctx.buffer(masses.astype(np.float32).tobytes())
+        self.pos_vbo = self.ctx.buffer(self._all_pos[idx].tobytes())
+        self.hsml_vbo = self.ctx.buffer(self._all_hsml[idx].tobytes())
+        self.mass_vbo = self.ctx.buffer(self._all_mass[idx].tobytes())
+        self.qty_vbo = self.ctx.buffer(self._all_qty[idx].tobytes())
 
-        if quantity is None:
-            quantity = masses
-        self.qty_vbo = self.ctx.buffer(quantity.astype(np.float32).tobytes())
+        self._build_vao()
 
+    def upload_particles(self, positions, hsml, masses, quantity=None):
+        """Upload all particles directly (for small datasets)."""
+        self.set_particles(positions, hsml, masses, quantity)
+        self.n_particles = self.n_total
+
+        for attr in ("pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo"):
+            old = getattr(self, attr, None)
+            if old is not None:
+                old.release()
+
+        self.pos_vbo = self.ctx.buffer(self._all_pos.tobytes())
+        self.hsml_vbo = self.ctx.buffer(self._all_hsml.tobytes())
+        self.mass_vbo = self.ctx.buffer(self._all_mass.tobytes())
+        self.qty_vbo = self.ctx.buffer(self._all_qty.tobytes())
+
+        self._build_vao()
+
+    def update_quantity(self, quantity):
+        """Update just the quantity data."""
+        self._all_qty = quantity.astype(np.float32)
+        # If we have a subset uploaded, re-upload is deferred to next update_visible()
+        # For now, re-upload all
+        if self.qty_vbo is not None:
+            self.qty_vbo.release()
+        self.qty_vbo = self.ctx.buffer(self._all_qty.tobytes())
         self._build_vao()
 
     def upload_stars(self, positions, masses):
@@ -126,17 +240,13 @@ class SplatRenderer:
             ],
         )
 
-    def update_quantity(self, quantity):
-        """Update just the quantity buffer."""
-        if self.qty_vbo is not None:
-            self.qty_vbo.release()
-        self.qty_vbo = self.ctx.buffer(quantity.astype(np.float32).tobytes())
-        self._build_vao()
-
     def _build_vao(self):
         """(Re)build vertex array object after buffer changes."""
         if self.vao_additive is not None:
             self.vao_additive.release()
+
+        if self.pos_vbo is None:
+            return
 
         content = [
             (self.quad_vbo, "2f", "in_corner"),
