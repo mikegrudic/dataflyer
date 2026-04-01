@@ -174,7 +174,10 @@ class Camera:
         else:
             center = ((pmin + pmax) / 2).astype(np.float32)
 
-        self.position = center.copy()
+        # Start at top of box looking down -z
+        self.position = np.array([center[0], center[1], pmax[2] + extent * 0.1], dtype=np.float32)
+        self._forward = np.array([0, 0, -1], dtype=np.float32)
+        self._up = np.array([0, 1, 0], dtype=np.float32)
         self.speed = extent / 10
         self.near = extent * 1e-6
         self.far = extent * 10
