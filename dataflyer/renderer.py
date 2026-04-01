@@ -96,7 +96,7 @@ class SpatialGrid:
             cell_mx2[ne_idx] = mp2_ne
             cell_mh2[ne_idx] = mh2_ne
             h_ne = np.sqrt(np.maximum(var_ne + mh2_ne / safe, 0))
-            cell_hsml[ne_idx] = np.maximum(h_ne, np.linalg.norm(cs) * 0.5)
+            cell_hsml[ne_idx] = np.maximum(h_ne, np.linalg.norm(cs))
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
@@ -146,7 +146,7 @@ class SpatialGrid:
         cell_qty = cell_mq / safe
         var = (cell_mx2 / safe[:, None] - cell_com ** 2).sum(axis=1)
         h = np.sqrt(np.maximum(var + cell_mh2 / safe, 0))
-        cell_hsml = np.maximum(h, np.linalg.norm(cs) * 0.5)
+        cell_hsml = np.maximum(h, np.linalg.norm(cs))
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
