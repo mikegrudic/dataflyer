@@ -95,9 +95,14 @@ class SpatialGrid:
             cell_qty[ne_idx] = mq_ne / safe
             cell_mx2[ne_idx] = mp2_ne
             cell_mh2[ne_idx] = mh2_ne
-            # h set to match mass-weighted spatial variance of cell contents
-            # No artificial floor -- let the variance speak for itself
-            cell_hsml[ne_idx] = np.sqrt(np.maximum(var_ne + mh2_ne / safe, 1e-30))
+            # h set so the cubic spline kernel has equivalent total variance to
+            # the convolution of the spatial distribution with the mean particle kernel.
+            # Cubic spline 2D: per-dim variance = h^2 / 12.65
+            # Spatial variance (3D, isotropic): per-dim = var_3d / 3
+            # Projected 2D: per-dim stays var_3d / 3
+            # Target: h^2/12.65 = var_3d/3 + mean(h^2)/12.65
+            # => h = sqrt(12.65/3 * var_3d + mean(h^2)) = sqrt(4.22 * var_3d + mean(h^2))
+            cell_hsml[ne_idx] = np.sqrt(np.maximum(4.22 * var_ne + mh2_ne / safe, 1e-30))
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
@@ -146,7 +151,7 @@ class SpatialGrid:
         cell_com = cell_mp / safe[:, None]
         cell_qty = cell_mq / safe
         var = (cell_mx2 / safe[:, None] - cell_com ** 2).sum(axis=1)
-        cell_hsml = np.sqrt(np.maximum(var + cell_mh2 / safe, 1e-30))
+        cell_hsml = np.sqrt(np.maximum(4.22 * var + cell_mh2 / safe, 1e-30))
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
         cy = np.arange(nc, dtype=np.float32) * cs[1] + self.pmin[1] + cs[1] * 0.5
