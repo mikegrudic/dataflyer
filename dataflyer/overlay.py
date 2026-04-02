@@ -17,6 +17,9 @@ TOGGLE_ON_COLOR = (0, 200, 0, 255)
 TOGGLE_OFF_COLOR = (150, 50, 50, 255)
 DROPDOWN_BG = (40, 40, 40, 255)
 DROPDOWN_HOVER = (80, 80, 120, 255)
+SLIDER_BG = (50, 50, 50, 255)
+SLIDER_FG = (0, 150, 200, 255)
+SLIDER_BTN = (80, 80, 80, 255)
 
 
 def _load_shader(name):
@@ -100,11 +103,16 @@ class DevOverlay:
         items.append(("toggle", "Importance Sampling", renderer.use_importance_sampling, "importance"))
         items.append(("toggle", "Hybrid Rendering", renderer.use_hybrid_rendering, "hybrid"))
         items.append(("toggle", "Quad Rendering", renderer.use_quad_rendering, "quad"))
+        items.append(("toggle", "Aniso Summaries", renderer.use_aniso_summaries, "aniso"))
         items.append(("text", ""))
 
         # Dropdown
         items.append(("dropdown", "Kernel", renderer.kernel, renderer.KERNELS, "kernel"))
         items.append(("text", ""))
+
+        # Slider
+        items.append(("slider", "Summary Scale", renderer.summary_scale, 0.1, 10.0, "summary_scale"))
+        items.append(("text", f"Aniso splats: {renderer.n_aniso:,}"))
 
         if message:
             items.append(("text", message))
@@ -127,6 +135,9 @@ class DevOverlay:
             elif item[0] == "dropdown":
                 bbox = draw.textbbox((0, 0), f"{item[1]}: {item[2]}", font=self._font)
                 max_w = max(max_w, bbox[2] - bbox[0] + MARGIN * 4 + 20)
+            elif item[0] == "slider":
+                bbox = draw.textbbox((0, 0), f"[-] {item[1]}: {item[2]:.2f} [+]", font=self._font)
+                max_w = max(max_w, bbox[2] - bbox[0] + MARGIN * 4)
 
         # Count lines including dropdown expansion
         n_lines = len(items)
@@ -175,6 +186,24 @@ class DevOverlay:
                         draw.text((MARGIN + 15, y), opt, fill=TEXT_COLOR, font=self._font)
                         self._widgets.append((y, y + LINE_H, "dropdown_item", key, opt))
                         y += LINE_H
+
+            elif item[0] == "slider":
+                _, label, value, vmin, vmax, key = item
+                # Draw: [-] Label: value [+]
+                btn_w = 25
+                text = f"{label}: {value:.2f}"
+                # Left button
+                draw.rectangle([(MARGIN, y), (MARGIN + btn_w, y + LINE_H - 1)], fill=SLIDER_BTN)
+                draw.text((MARGIN + 5, y), "-", fill=TEXT_COLOR, font=self._font)
+                self._widgets.append((y, y + LINE_H, "slider_dec", key, vmin, vmax))
+                # Label + value
+                draw.text((MARGIN + btn_w + 5, y), text, fill=TEXT_COLOR, font=self._font)
+                # Right button
+                rx = tw - MARGIN - btn_w
+                draw.rectangle([(rx, y), (tw - MARGIN, y + LINE_H - 1)], fill=SLIDER_BTN)
+                draw.text((rx + 5, y), "+", fill=TEXT_COLOR, font=self._font)
+                self._widgets.append((y, y + LINE_H, "slider_inc", key, vmin, vmax))
+                y += LINE_H
 
         # Upload texture
         self._panel_w = tw
@@ -245,6 +274,8 @@ class DevOverlay:
                     renderer.use_hybrid_rendering = not renderer.use_hybrid_rendering
                 elif key == "quad":
                     renderer.use_quad_rendering = not renderer.use_quad_rendering
+                elif key == "aniso":
+                    renderer.use_aniso_summaries = not renderer.use_aniso_summaries
                 return True
 
             elif wtype == "dropdown_header":
@@ -262,6 +293,24 @@ class DevOverlay:
                     renderer.kernel = value
                 self._dropdown_open = None
                 return True
+
+            elif wtype == "slider_dec":
+                # Only respond if click is in left third
+                if lx < self._panel_w // 3:
+                    key = widget[3]
+                    vmin = widget[4]
+                    cur = max(vmin, getattr(renderer, key, 1.0) / 1.25)
+                    setattr(renderer, key, cur)
+                    return True
+
+            elif wtype == "slider_inc":
+                # Only respond if click is in right third
+                if lx > self._panel_w * 2 // 3:
+                    key = widget[3]
+                    vmax = widget[5]
+                    cur = min(vmax, getattr(renderer, key, 1.0) * 1.25)
+                    setattr(renderer, key, cur)
+                    return True
 
         return True  # clicked inside panel but not on a widget
 

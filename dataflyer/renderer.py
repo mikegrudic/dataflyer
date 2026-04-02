@@ -228,9 +228,12 @@ class SpatialGrid:
         cell_com = np.zeros((nc3, 3), dtype=np.float32)
         cell_hsml = np.zeros(nc3, dtype=np.float32)
         cell_qty = np.zeros(nc3, dtype=np.float32)
-        # Also store mass-weighted x^2 sums for variance computation at coarser levels
-        cell_mx2 = np.zeros((nc3, 3), dtype=np.float32)
+        # Mass-weighted second moments for variance/covariance at coarser levels
+        # mxx[i] stores: (xx, xy, xz, yy, yz, zz) = upper triangle of m*x*x^T
+        cell_mxx = np.zeros((nc3, 6), dtype=np.float32)
         cell_mh2 = np.zeros(nc3, dtype=np.float32)
+        # 3D covariance upper triangle: (cov_xx, cov_xy, cov_xz, cov_yy, cov_yz, cov_zz)
+        cell_cov = np.zeros((nc3, 6), dtype=np.float32)
 
         if len(reduce_at) > 0:
             mass_ne = np.add.reduceat(s_m, reduce_at)
@@ -238,20 +241,38 @@ class SpatialGrid:
             mp_ne = np.add.reduceat(s_p * s_m[:, None], reduce_at)
             mq_ne = np.add.reduceat(s_m * s_q, reduce_at)
             mh2_ne = np.add.reduceat(s_m * s_h**2, reduce_at)
-            mp2_ne = np.add.reduceat(s_p**2 * s_m[:, None], reduce_at)
+
+            # Mass-weighted outer products: xx, xy, xz, yy, yz, zz
+            mxx_ne = np.column_stack([
+                np.add.reduceat(s_m * s_p[:, 0] * s_p[:, 0], reduce_at),
+                np.add.reduceat(s_m * s_p[:, 0] * s_p[:, 1], reduce_at),
+                np.add.reduceat(s_m * s_p[:, 0] * s_p[:, 2], reduce_at),
+                np.add.reduceat(s_m * s_p[:, 1] * s_p[:, 1], reduce_at),
+                np.add.reduceat(s_m * s_p[:, 1] * s_p[:, 2], reduce_at),
+                np.add.reduceat(s_m * s_p[:, 2] * s_p[:, 2], reduce_at),
+            ])
 
             com_ne = mp_ne / safe[:, None]
-            var_ne = (mp2_ne / safe[:, None] - com_ne**2).sum(axis=1)
+
+            # Covariance = <xx> - <x><x>, etc.
+            cov_ne = np.column_stack([
+                mxx_ne[:, 0] / safe - com_ne[:, 0] * com_ne[:, 0],  # xx
+                mxx_ne[:, 1] / safe - com_ne[:, 0] * com_ne[:, 1],  # xy
+                mxx_ne[:, 2] / safe - com_ne[:, 0] * com_ne[:, 2],  # xz
+                mxx_ne[:, 3] / safe - com_ne[:, 1] * com_ne[:, 1],  # yy
+                mxx_ne[:, 4] / safe - com_ne[:, 1] * com_ne[:, 2],  # yz
+                mxx_ne[:, 5] / safe - com_ne[:, 2] * com_ne[:, 2],  # zz
+            ])
+
+            var_ne = cov_ne[:, 0] + cov_ne[:, 3] + cov_ne[:, 5]  # trace = total variance
 
             cell_mass[ne_idx] = mass_ne
             cell_com[ne_idx] = com_ne
             cell_qty[ne_idx] = mq_ne / safe
-            cell_mx2[ne_idx] = mp2_ne
+            cell_mxx[ne_idx] = mxx_ne
             cell_mh2[ne_idx] = mh2_ne
-            # 3D variance matching using exact kernel <r^2>_3D = 0.225 * h^2:
-            #   0.225 * h_summary^2 = V_3d + 0.225 * <h^2>
-            #   h_summary = sqrt(V_3d / 0.225 + <h^2>)
-            #             = sqrt(4.44 * V_3d + <h^2>)
+            cell_cov[ne_idx] = cov_ne
+            # Isotropic h from 3D variance matching (still used for LOD opening criterion)
             h_var = np.sqrt(np.maximum((1.0 / 0.225) * var_ne + mh2_ne / safe, 1e-30))
             cell_hsml[ne_idx] = h_var
 
@@ -268,8 +289,9 @@ class SpatialGrid:
             "com": cell_com,
             "hsml": cell_hsml,
             "qty": cell_qty,
-            "mx2": cell_mx2,
+            "mxx": cell_mxx,
             "mh2": cell_mh2,  # for coarsening
+            "cov": cell_cov,
             "cell_start": self.cell_start,
             "sort_order": self.sort_order,
             "centers": centers,
@@ -294,20 +316,32 @@ class SpatialGrid:
         cell_mass = np.zeros(nc3, dtype=np.float32)
         cell_mp = np.zeros((nc3, 3), dtype=np.float32)
         cell_mq = np.zeros(nc3, dtype=np.float32)
-        cell_mx2 = np.zeros((nc3, 3), dtype=np.float32)
+        cell_mxx = np.zeros((nc3, 6), dtype=np.float32)
         cell_mh2 = np.zeros(nc3, dtype=np.float32)
 
         np.add.at(cell_mass, parent_id, child["mass"])
         for d in range(3):
             np.add.at(cell_mp[:, d], parent_id, child["mass"] * child["com"][:, d])
-            np.add.at(cell_mx2[:, d], parent_id, child["mx2"][:, d])
+        for d in range(6):
+            np.add.at(cell_mxx[:, d], parent_id, child["mxx"][:, d])
         np.add.at(cell_mq, parent_id, child["mass"] * child["qty"])
         np.add.at(cell_mh2, parent_id, child["mh2"])
 
         safe = np.maximum(cell_mass, 1e-30)
         cell_com = cell_mp / safe[:, None]
         cell_qty = cell_mq / safe
-        var = (cell_mx2 / safe[:, None] - cell_com**2).sum(axis=1)
+
+        # Full covariance: cov_ij = <x_i x_j> - <x_i><x_j>
+        cell_cov = np.column_stack([
+            cell_mxx[:, 0] / safe - cell_com[:, 0] * cell_com[:, 0],  # xx
+            cell_mxx[:, 1] / safe - cell_com[:, 0] * cell_com[:, 1],  # xy
+            cell_mxx[:, 2] / safe - cell_com[:, 0] * cell_com[:, 2],  # xz
+            cell_mxx[:, 3] / safe - cell_com[:, 1] * cell_com[:, 1],  # yy
+            cell_mxx[:, 4] / safe - cell_com[:, 1] * cell_com[:, 2],  # yz
+            cell_mxx[:, 5] / safe - cell_com[:, 2] * cell_com[:, 2],  # zz
+        ])
+
+        var = cell_cov[:, 0] + cell_cov[:, 3] + cell_cov[:, 5]  # trace
         h_var = np.sqrt(np.maximum((1.0 / 0.225) * var + cell_mh2 / safe, 1e-30))
         cell_hsml = h_var
 
@@ -324,8 +358,9 @@ class SpatialGrid:
             "com": cell_com,
             "hsml": cell_hsml,
             "qty": cell_qty,
-            "mx2": cell_mx2,
+            "mxx": cell_mxx,
             "mh2": cell_mh2,
+            "cov": cell_cov,
             "centers": centers,
             "half_diag": float(np.linalg.norm(cs) * 0.5),
         }
@@ -452,7 +487,7 @@ class SpatialGrid:
 
         s_idx = np.where(summary_mask)[0]
         if len(s_idx) > 0:
-            summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx], lv["qty"][s_idx]))
+            summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx], lv["qty"][s_idx], lv["cov"][s_idx], lv["mh2"][s_idx] / np.maximum(lv["mass"][s_idx], 1e-30)))
 
         refine_cells = np.where(refine_mask)[0]
 
@@ -500,7 +535,7 @@ class SpatialGrid:
             # Summary splats for small cells
             s_idx = child_flat[small]
             if len(s_idx) > 0:
-                summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx], lv["qty"][s_idx]))
+                summary_parts.append((lv["com"][s_idx], lv["hsml"][s_idx], lv["mass"][s_idx], lv["qty"][s_idx], lv["cov"][s_idx], lv["mh2"][s_idx] / np.maximum(lv["mass"][s_idx], 1e-30)))
 
             if li == 0:
                 # Finest level: real particles for large cells
@@ -545,34 +580,41 @@ class SpatialGrid:
             real_mass = real_mass * ratio
             real_hsml = real_hsml * (ratio ** (1.0 / 3.0))
 
-        # Assemble output
-        parts_pos = []
-        parts_hsml = []
-        parts_mass = []
-        parts_qty = []
-
+        # Assemble real particle output
+        real_parts = []
         if n_sampled > 0:
-            parts_pos.append(real_pos)
-            parts_hsml.append(real_hsml)
-            parts_mass.append(real_mass)
-            parts_qty.append(real_qty)
+            real_parts.append((real_pos, real_hsml, real_mass, real_qty))
 
-        for sp_com, sp_h, sp_m, sp_q in summary_parts:
-            parts_pos.append(sp_com)
-            parts_hsml.append(sp_h)
-            parts_mass.append(sp_m)
-            parts_qty.append(sp_q)
+        z3 = np.zeros((0, 3), dtype=np.float32)
+        z1 = np.zeros(0, dtype=np.float32)
 
-        if not parts_pos:
-            z3 = np.zeros((0, 3), dtype=np.float32)
-            z1 = np.zeros(0, dtype=np.float32)
-            return z3, z1, z1, z1
+        if real_parts:
+            r_pos = np.concatenate([p[0] for p in real_parts]).astype(np.float32)
+            r_hsml = np.concatenate([p[1] for p in real_parts]).astype(np.float32)
+            r_mass = np.concatenate([p[2] for p in real_parts]).astype(np.float32)
+            r_qty = np.concatenate([p[3] for p in real_parts]).astype(np.float32)
+        else:
+            r_pos, r_hsml, r_mass, r_qty = z3, z1, z1, z1
+
+        # Assemble summary output with anisotropic covariance
+        z6 = np.zeros((0, 6), dtype=np.float32)
+        if summary_parts:
+            s_pos = np.concatenate([p[0] for p in summary_parts]).astype(np.float32)
+            s_hsml = np.concatenate([p[1] for p in summary_parts]).astype(np.float32)
+            s_mass = np.concatenate([p[2] for p in summary_parts]).astype(np.float32)
+            s_qty = np.concatenate([p[3] for p in summary_parts]).astype(np.float32)
+            s_cov = np.concatenate([p[4] for p in summary_parts]).astype(np.float32)
+            s_mean_h2 = np.concatenate([p[5] for p in summary_parts]).astype(np.float32)
+            # Add kernel smoothing to covariance: Σ_eff = Σ_spatial + 0.225*<h²>*I
+            s_cov[:, 0] += 0.225 * s_mean_h2  # xx
+            s_cov[:, 3] += 0.225 * s_mean_h2  # yy
+            s_cov[:, 5] += 0.225 * s_mean_h2  # zz
+        else:
+            s_pos, s_hsml, s_mass, s_qty, s_cov = z3, z1, z1, z1, z6
 
         return (
-            np.concatenate(parts_pos).astype(np.float32),
-            np.concatenate(parts_hsml).astype(np.float32),
-            np.concatenate(parts_mass).astype(np.float32),
-            np.concatenate(parts_qty).astype(np.float32),
+            r_pos, r_hsml, r_mass, r_qty,
+            s_pos, s_hsml, s_mass, s_qty, s_cov,
         )
 
 
@@ -599,6 +641,10 @@ class SplatRenderer:
             vertex_shader=_load_shader("star.vert"),
             fragment_shader=_load_shader("star.frag"),
         )
+        self.prog_aniso = ctx.program(  # anisotropic Gaussian summary splats
+            vertex_shader=_load_shader("splat_aniso.vert"),
+            fragment_shader=_load_shader("splat_aniso.frag"),
+        )
 
         # Billboard quad for instanced rendering of large particles
         quad_corners = np.array([-1, -1, 1, -1, -1, 1, 1, 1], dtype=np.float32)
@@ -622,6 +668,14 @@ class SplatRenderer:
         self.big_qty_vbo = None
         self.vao_quad = None  # instanced quads
         self.n_big = 0
+
+        # Anisotropic summary splat buffers
+        self.aniso_pos_vbo = None
+        self.aniso_mass_vbo = None
+        self.aniso_qty_vbo = None
+        self.aniso_cov_vbo = None  # 6 floats per instance: upper triangle of 3D covariance
+        self.vao_aniso = None
+        self.n_aniso = 0
 
         # Full dataset stored on CPU for culling
         self._all_pos = None
@@ -666,6 +720,8 @@ class SplatRenderer:
         self.kernel = "cubic_spline"
         self.use_hybrid_rendering = True  # use quads for >64px particles
         self.use_quad_rendering = False  # True = all quads (pre-optimization path)
+        self.summary_scale = 1.0  # scaling factor applied to summary splats
+        self.use_aniso_summaries = True  # False = isotropic spherical summaries
 
     def set_particles(self, positions, hsml, masses, quantity=None):
         """Store particle data on CPU. Call update_visible() to upload a subset."""
@@ -677,8 +733,8 @@ class SplatRenderer:
         self._all_qty = quantity.astype(np.float32)
         self.n_total = len(masses)
 
-        # Build spatial grid for fast frustum queries on large datasets
-        if self.use_tree and self.n_total > self.max_render_particles:
+        # Build spatial grid for frustum culling and LOD
+        if self.use_tree:
             import time
 
             t0 = time.perf_counter()
@@ -693,14 +749,38 @@ class SplatRenderer:
             return
 
         if self._grid is not None:
-            pos, hsml, mass, qty = self._grid.query_frustum_lod(
+            result = self._grid.query_frustum_lod(
                 camera,
                 self.max_render_particles,
                 lod_pixels=self.lod_pixels,
                 importance_sampling=self.use_importance_sampling,
                 viewport_width=self._viewport_width,
             )
-            self._upload_arrays(pos, hsml, mass, qty, camera)
+            if len(result) == 9:
+                # LOD path: real particles + anisotropic summaries
+                r_pos, r_hsml, r_mass, r_qty, s_pos, s_hsml, s_mass, s_qty, s_cov = result
+                if self.use_aniso_summaries:
+                    # Real particles to isotropic, summaries to anisotropic
+                    self._upload_arrays(r_pos, r_hsml, r_mass, r_qty, camera)
+                    self._upload_aniso_summaries(s_pos, s_mass, s_qty, s_cov)
+                else:
+                    # Combine into isotropic path (old behavior)
+                    pos = np.concatenate([r_pos, s_pos]) if len(r_pos) + len(s_pos) > 0 else r_pos
+                    hsml = np.concatenate([r_hsml, s_hsml]) if len(r_hsml) + len(s_hsml) > 0 else r_hsml
+                    mass = np.concatenate([r_mass, s_mass]) if len(r_mass) + len(s_mass) > 0 else r_mass
+                    qty = np.concatenate([r_qty, s_qty]) if len(r_qty) + len(s_qty) > 0 else r_qty
+                    self._upload_arrays(pos, hsml, mass, qty, camera)
+                    self._upload_aniso_summaries(
+                        np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                        np.zeros(0, np.float32), np.zeros((0, 6), np.float32),
+                    )
+            else:
+                pos, hsml, mass, qty = result
+                self._upload_arrays(pos, hsml, mass, qty, camera)
+                self._upload_aniso_summaries(
+                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                    np.zeros(0, np.float32), np.zeros((0, 6), np.float32),
+                )
         else:
             # No tree: simple numpy frustum cull + subsample
             cam_fwd = camera.forward
@@ -805,6 +885,41 @@ class SplatRenderer:
 
         self.n_particles = n_small  # points count
         self._build_vao()
+
+    def _upload_aniso_summaries(self, pos, mass, qty, cov):
+        """Upload anisotropic summary splats (separate from regular particles)."""
+        for attr in ("aniso_pos_vbo", "aniso_mass_vbo", "aniso_qty_vbo", "aniso_cov_vbo"):
+            old = getattr(self, attr, None)
+            if old is not None:
+                old.release()
+        if self.vao_aniso is not None:
+            self.vao_aniso.release()
+            self.vao_aniso = None
+
+        self.n_aniso = len(mass)
+        if self.n_aniso == 0:
+            self.aniso_pos_vbo = None
+            self.aniso_mass_vbo = None
+            self.aniso_qty_vbo = None
+            self.aniso_cov_vbo = None
+            return
+
+        self.aniso_pos_vbo = self.ctx.buffer(pos.tobytes())
+        self.aniso_mass_vbo = self.ctx.buffer(mass.tobytes())
+        self.aniso_qty_vbo = self.ctx.buffer(qty.tobytes())
+        self.aniso_cov_vbo = self.ctx.buffer(cov.tobytes())
+
+        self.vao_aniso = self.ctx.vertex_array(
+            self.prog_aniso,
+            [
+                (self.quad_vbo, "2f", "in_corner"),
+                (self.aniso_pos_vbo, "3f/i", "in_position"),
+                (self.aniso_mass_vbo, "f/i", "in_mass"),
+                (self.aniso_qty_vbo, "f/i", "in_quantity"),
+                (self.aniso_cov_vbo, "3f 3f/i", "in_cov_a", "in_cov_b"),
+            ],
+            index_buffer=self.quad_ibo,
+        )
 
     def _upload_subset(self, idx):
         """Upload a subset of particles by index."""
@@ -957,6 +1072,13 @@ class SplatRenderer:
             self.prog_quad["u_kernel"].value = kernel_id
             self.vao_quad.render(moderngl.TRIANGLES, instances=self.n_big)
 
+        # Draw anisotropic summary splats
+        if self.vao_aniso is not None and self.n_aniso > 0:
+            self.prog_aniso["u_view"].write(view.tobytes())
+            self.prog_aniso["u_proj"].write(proj.tobytes())
+            self.prog_aniso["u_cov_scale"].value = self.summary_scale
+            self.vao_aniso.render(moderngl.TRIANGLES, instances=self.n_aniso)
+
         # Pass 2: resolve to screen
         self.ctx.screen.use()
         self.ctx.disable(moderngl.BLEND)
@@ -1049,12 +1171,18 @@ class SplatRenderer:
             "fs_quad_vbo",
             "star_pos_vbo",
             "star_mass_vbo",
+            "aniso_pos_vbo",
+            "aniso_mass_vbo",
+            "aniso_qty_vbo",
+            "aniso_cov_vbo",
             "vao_additive",
             "vao_quad",
+            "vao_aniso",
             "vao_resolve",
             "vao_star",
             "prog_additive",
             "prog_quad",
+            "prog_aniso",
             "prog_resolve",
             "prog_star",
             "_accum_fbo",
