@@ -325,6 +325,16 @@ class DataFlyerApp:
         self.camera.on_key(key, action)
 
     def _mouse_button_callback(self, window, button, action, mods):
+        if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS and self.overlay.enabled:
+            xpos, ypos = glfw.get_cursor_pos(window)
+            # Convert window coords to framebuffer coords (retina scaling)
+            fb_w, fb_h = glfw.get_framebuffer_size(window)
+            win_w, win_h = glfw.get_window_size(window)
+            fx = xpos * fb_w / win_w
+            fy = ypos * fb_h / win_h
+            if self.overlay.on_click(fx, fy, self.renderer):
+                self.renderer.update_visible(self.camera)
+                return
         self.camera.on_mouse_button(button, action)
 
     def _cursor_callback(self, window, xpos, ypos):
@@ -464,26 +474,12 @@ class DataFlyerApp:
 
             # Dev overlay
             if self.overlay.enabled:
-                n_vis = self.renderer.n_particles
-                n_tot = self.renderer.n_total
-                scale = "log" if self.renderer.log_scale else "linear"
-                imp = "on" if self.renderer.use_importance_sampling else "off"
-                tree = "on" if self.renderer.use_tree else "off"
-                lines = [
-                    f"FPS: {self._fps:.0f}",
-                    f"Particles: {n_vis:,} / {n_tot:,}",
-                    f"LOD: {self.renderer.lod_pixels}px  Budget: {self.renderer.max_render_particles/1e6:.1f}M",
-                    f"Tree: {tree}  Importance: {imp}  Kernel: {self.renderer.kernel}",
-                    f"Cull: {self._timings['cull']*1000:.0f}ms  Render: {self._timings['render']*1000:.0f}ms",
-                    f"Quantity: {self._current_qty}  Scale: {scale}",
-                    f"Range: {self._range_str()}",
-                    f"Colormap: {AVAILABLE_COLORMAPS[self._cmap_idx]}",
-                    f"Pos: ({self.camera.position[0]:.2f}, {self.camera.position[1]:.2f}, {self.camera.position[2]:.2f})",
-                    f"Speed: {self.camera.speed:.3g}",
-                    f"",
-                    self._last_message,
-                ]
-                self.overlay.update(lines, fb_width, fb_height)
+                self.overlay.set_framebuffer_size(fb_width, fb_height)
+                self.overlay.update(
+                    self.renderer, self.camera, self._fps,
+                    self._current_qty, AVAILABLE_COLORMAPS[self._cmap_idx],
+                    self._timings, self._last_message,
+                )
                 self.overlay.render()
 
             glfw.swap_buffers(self.window)

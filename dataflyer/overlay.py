@@ -1,10 +1,22 @@
-"""Dev overlay: renders text HUD in the top-right corner."""
+"""Dev overlay: renders text HUD with interactive toggles and dropdowns."""
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 
 SHADER_DIR = Path(__file__).parent / "shaders"
+
+# Layout constants
+MARGIN = 8
+LINE_H = 20
+FONT_SIZE = 14
+BG_COLOR = (0, 0, 0, 200)
+TEXT_COLOR = (0, 255, 0, 255)
+HIGHLIGHT_COLOR = (80, 80, 80, 255)
+TOGGLE_ON_COLOR = (0, 200, 0, 255)
+TOGGLE_OFF_COLOR = (150, 50, 50, 255)
+DROPDOWN_BG = (40, 40, 40, 255)
+DROPDOWN_HOVER = (80, 80, 120, 255)
 
 
 def _load_shader(name):
@@ -16,18 +28,28 @@ class DevOverlay:
         self.ctx = ctx
         self.enabled = False
         self._tex = None
-        self._vao = None
         self._prog = ctx.program(
             vertex_shader=_load_shader("text.vert"),
             fragment_shader=_load_shader("text.frag"),
         )
-        # Quad VBO: position + UV, will be updated per frame
-        self._vbo = ctx.buffer(reserve=6 * 4 * 4)  # 6 verts * 4 floats * 4 bytes
+        self._vbo = ctx.buffer(reserve=6 * 4 * 4)
         self._vao = ctx.vertex_array(
             self._prog,
             [(self._vbo, "2f 2f", "in_position", "in_uv")],
         )
-        self._font = self._get_font(14)
+        self._font = self._get_font(FONT_SIZE)
+
+        # Interactive state
+        self._widgets = []  # list of (y_start, y_end, type, callback, state_key)
+        self._dropdown_open = None  # key of currently open dropdown
+        self._dropdown_items = {}  # key -> list of options
+        self._fb_width = 1
+        self._fb_height = 1
+        self._panel_x = 0  # pixel x of panel left edge
+        self._panel_y = 0  # pixel y of panel top edge
+        self._panel_w = 0
+        self._panel_h = 0
+        self._last_message = ""
 
     def _get_font(self, size):
         try:
@@ -42,40 +64,137 @@ class DevOverlay:
         except TypeError:
             return ImageFont.load_default()
 
-    def update(self, lines, fb_width, fb_height):
-        """Render text lines to a texture and position it in the top-right."""
-        if not self.enabled or not lines:
+    def update(self, renderer, camera, fps, current_qty, cmap_name, timings, message):
+        """Build the overlay image with interactive widgets."""
+        if not self.enabled:
             return
 
-        # Render text to PIL image
-        text = "\n".join(lines)
+        self._last_message = message
+
+        # Collect display items
+        items = []  # list of (type, label, ...) tuples
+        self._widgets = []
+
+        n_vis = renderer.n_particles + renderer.n_big
+        n_tot = renderer.n_total
+        scale = "log" if renderer.log_scale else "linear"
+
+        # Info lines (non-interactive)
+        items.append(("text", f"FPS: {fps:.0f}"))
+        items.append(("text", f"Particles: {n_vis:,} / {n_tot:,}"))
+        items.append(("text", f"LOD: {renderer.lod_pixels}px  Budget: {renderer.max_render_particles/1e6:.1f}M"))
+        items.append(("text", f"Cull: {timings.get('cull',0)*1000:.0f}ms  Render: {timings.get('render',0)*1000:.0f}ms"))
+        if renderer.log_scale:
+            range_str = f"10^{renderer.qty_min:.2f} .. 10^{renderer.qty_max:.2f}"
+        else:
+            range_str = f"{renderer.qty_min:.3g} .. {renderer.qty_max:.3g}"
+        items.append(("text", f"Quantity: {current_qty}  Scale: {scale}"))
+        items.append(("text", f"Range: {range_str}"))
+        items.append(("text", f"Colormap: {cmap_name}"))
+        items.append(("text", f"Pos: ({camera.position[0]:.2f}, {camera.position[1]:.2f}, {camera.position[2]:.2f})"))
+        items.append(("text", f"Speed: {camera.speed:.3g}"))
+        items.append(("text", ""))
+
+        # Toggles
+        items.append(("toggle", "Tree", renderer.use_tree, "tree"))
+        items.append(("toggle", "Importance Sampling", renderer.use_importance_sampling, "importance"))
+        items.append(("text", ""))
+
+        # Dropdown
+        items.append(("dropdown", "Kernel", renderer.kernel, renderer.KERNELS, "kernel"))
+        items.append(("text", ""))
+
+        if message:
+            items.append(("text", message))
+
+        # Render to image
+        self._render_items(items)
+
+    def _render_items(self, items):
+        # Measure width
         dummy = Image.new("RGBA", (1, 1))
         draw = ImageDraw.Draw(dummy)
-        bbox = draw.multiline_textbbox((0, 0), text, font=self._font)
-        tw = bbox[2] - bbox[0] + 16
-        th = bbox[3] - bbox[1] + 12
+        max_w = 200
+        for item in items:
+            if item[0] == "text":
+                bbox = draw.textbbox((0, 0), item[1], font=self._font)
+                max_w = max(max_w, bbox[2] - bbox[0] + MARGIN * 4)
+            elif item[0] == "toggle":
+                bbox = draw.textbbox((0, 0), f"[ ] {item[1]}", font=self._font)
+                max_w = max(max_w, bbox[2] - bbox[0] + MARGIN * 4)
+            elif item[0] == "dropdown":
+                bbox = draw.textbbox((0, 0), f"{item[1]}: {item[2]}", font=self._font)
+                max_w = max(max_w, bbox[2] - bbox[0] + MARGIN * 4 + 20)
 
-        img = Image.new("RGBA", (tw, th), (0, 0, 0, 180))
+        # Count lines including dropdown expansion
+        n_lines = len(items)
+        dropdown_extra = 0
+        if self._dropdown_open:
+            for item in items:
+                if item[0] == "dropdown" and item[4] == self._dropdown_open:
+                    dropdown_extra = len(item[3])
+
+        tw = max_w + MARGIN * 2
+        th = (n_lines + dropdown_extra) * LINE_H + MARGIN * 2
+
+        img = Image.new("RGBA", (tw, th), BG_COLOR)
         draw = ImageDraw.Draw(img)
-        draw.multiline_text((8, 6), text, fill=(0, 255, 0, 255), font=self._font)
 
-        # Upload as texture
+        y = MARGIN
+        self._widgets = []
+
+        for item in items:
+            if item[0] == "text":
+                draw.text((MARGIN, y), item[1], fill=TEXT_COLOR, font=self._font)
+                y += LINE_H
+
+            elif item[0] == "toggle":
+                _, label, state, key = item
+                indicator = "[x]" if state else "[ ]"
+                color = TOGGLE_ON_COLOR if state else TOGGLE_OFF_COLOR
+                draw.text((MARGIN, y), indicator, fill=color, font=self._font)
+                draw.text((MARGIN + 35, y), label, fill=TEXT_COLOR, font=self._font)
+                self._widgets.append((y, y + LINE_H, "toggle", key))
+                y += LINE_H
+
+            elif item[0] == "dropdown":
+                _, label, current, options, key = item
+                is_open = self._dropdown_open == key
+                arrow = "v" if is_open else ">"
+                text = f"{arrow} {label}: {current}"
+                draw.text((MARGIN, y), text, fill=TEXT_COLOR, font=self._font)
+                self._widgets.append((y, y + LINE_H, "dropdown_header", key))
+                y += LINE_H
+
+                if is_open:
+                    for opt in options:
+                        bg = DROPDOWN_HOVER if opt == current else DROPDOWN_BG
+                        draw.rectangle([(MARGIN + 10, y), (tw - MARGIN, y + LINE_H - 1)], fill=bg)
+                        draw.text((MARGIN + 15, y), opt, fill=TEXT_COLOR, font=self._font)
+                        self._widgets.append((y, y + LINE_H, "dropdown_item", key, opt))
+                        y += LINE_H
+
+        # Upload texture
+        self._panel_w = tw
+        self._panel_h = th
         data = img.tobytes()
         if self._tex is not None:
             self._tex.release()
         self._tex = self.ctx.texture((tw, th), 4, data=data)
-        self._tex.filter = (0x2601, 0x2601)  # GL_LINEAR
+        self._tex.filter = (0x2601, 0x2601)
 
-        # Position quad in top-right corner (NDC coordinates)
-        # NDC: x in [-1, 1], y in [-1, 1], top-right is (1, 1)
-        px_w = tw / fb_width * 2  # width in NDC
-        px_h = th / fb_height * 2  # height in NDC
-        x1 = 1.0 - px_w - 0.01  # small margin from right edge
+        # Position in top-right
+        fb_w, fb_h = self._fb_width, self._fb_height
+        self._panel_x = fb_w - tw - 10
+        self._panel_y = 10
+
+        px_w = tw / fb_w * 2
+        px_h = th / fb_h * 2
+        x1 = 1.0 - px_w - 0.01
         x2 = 1.0 - 0.01
-        y1 = 1.0 - px_h - 0.01  # small margin from top
+        y1 = 1.0 - px_h - 0.01
         y2 = 1.0 - 0.01
 
-        # Two triangles, UV flipped vertically (PIL origin is top-left)
         verts = np.array([
             x1, y1, 0, 1,
             x2, y1, 1, 1,
@@ -86,11 +205,65 @@ class DevOverlay:
         ], dtype=np.float32)
         self._vbo.write(verts.tobytes())
 
+    def set_framebuffer_size(self, w, h):
+        self._fb_width = w
+        self._fb_height = h
+
+    def on_click(self, x, y, renderer):
+        """Handle mouse click. x, y in framebuffer pixels from top-left.
+        Returns True if the click was consumed by the overlay."""
+        if not self.enabled:
+            return False
+
+        # Convert to panel-local coordinates
+        lx = x - self._panel_x
+        ly = y - self._panel_y
+
+        if lx < 0 or lx > self._panel_w or ly < 0 or ly > self._panel_h:
+            # Click outside panel -- close any open dropdown
+            if self._dropdown_open:
+                self._dropdown_open = None
+                return True
+            return False
+
+        for widget in self._widgets:
+            wy_start, wy_end = widget[0], widget[1]
+            if ly < wy_start or ly >= wy_end:
+                continue
+
+            wtype = widget[2]
+
+            if wtype == "toggle":
+                key = widget[3]
+                if key == "tree":
+                    renderer.use_tree = not renderer.use_tree
+                elif key == "importance":
+                    renderer.use_importance_sampling = not renderer.use_importance_sampling
+                return True
+
+            elif wtype == "dropdown_header":
+                key = widget[3]
+                if self._dropdown_open == key:
+                    self._dropdown_open = None
+                else:
+                    self._dropdown_open = key
+                return True
+
+            elif wtype == "dropdown_item":
+                key = widget[3]
+                value = widget[4]
+                if key == "kernel":
+                    renderer.kernel = value
+                self._dropdown_open = None
+                return True
+
+        return True  # clicked inside panel but not on a widget
+
     def render(self):
         if not self.enabled or self._tex is None:
             return
-        self.ctx.enable(0x0BE2)  # GL_BLEND
-        self.ctx.blend_func = (0x0302, 0x0303)  # SRC_ALPHA, ONE_MINUS_SRC_ALPHA
+        self.ctx.enable(0x0BE2)
+        self.ctx.blend_func = (0x0302, 0x0303)
         self._tex.use(location=0)
         self._prog["u_texture"].value = 0
         self._vao.render(vertices=6)
