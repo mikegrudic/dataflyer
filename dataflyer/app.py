@@ -74,10 +74,17 @@ class DataFlyerApp:
 
         # Weight fields and render mode
         self._sd_fields = self.data.available_fields()
+        self._vector_fields = self.data.available_vector_fields()
         self._sd_field = "Masses"
         self._sd_field2 = "None"  # optional second field
         self._sd_op = "*"  # operation between field1 and field2
         self._SD_OPS = ["*", "+", "-", "/", "min", "max"]
+        self._RENDER_MODES = ["SurfaceDensity", "WeightedAverage"]
+        self._render_mode_name = "SurfaceDensity"
+        self._wa_data_field = "Masses"  # data field for WeightedAverage
+        self._VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
+        self._vector_projection = "LOS"  # active projection for vector data fields
+        self._los_camera_fwd = None  # camera forward at last LOS recompute
         self._render_mode = RenderMode.surface_density("Masses")
 
         # Store particles and upload (with culling for large datasets)
@@ -126,15 +133,21 @@ class DataFlyerApp:
         print(f"  {self.data.n_particles:,} gas, {self.data.n_stars} stars, t={self.data.time:.4g}")
 
         self._sd_fields = self.data.available_fields()
+        self._vector_fields = self.data.available_vector_fields()
         if self._sd_field not in self._sd_fields:
             self._sd_field = "Masses"
         if self._sd_field2 != "None" and self._sd_field2 not in self._sd_fields:
             self._sd_field2 = "None"
+        if self._wa_data_field not in self._sd_fields and self._wa_data_field not in self._vector_fields:
+            self._wa_data_field = "Masses"
+        self._los_camera_fwd = None
 
-        weights = self._compute_weights()
+        weights = self.data.get_field(self._sd_field) if self._render_mode_name == "WeightedAverage" else self._compute_weights()
+        qty = self._compute_data_field() if self._render_mode_name == "WeightedAverage" else None
         self.renderer.set_particles(
-            self.data.positions, self.data.hsml, weights,
+            self.data.positions, self.data.hsml, weights, qty,
         )
+        self.renderer.resolve_mode = self._render_mode.resolve_mode
         self.renderer.update_visible(self.camera)
 
         if self.data.n_stars > 0:
@@ -165,12 +178,28 @@ class DataFlyerApp:
             self._colormap_textures[name] = create_colormap_texture_safe(self.ctx, name)
         self.renderer.colormap_tex = self._colormap_textures[name]
 
+    def _project_field(self, field_name):
+        """Load a field and project to scalar if it's a vector field."""
+        import numpy as np
+        if field_name in self._vector_fields:
+            vec = self.data.get_vector_field(field_name)
+            proj = self._vector_projection
+            if proj == "LOS":
+                fwd = self.camera.forward
+                self._los_camera_fwd = fwd.copy()
+                return (vec @ fwd).astype(np.float32)
+            elif proj == "|v|":
+                return np.linalg.norm(vec, axis=1).astype(np.float32)
+            else:  # |v|^2
+                return (vec * vec).sum(axis=1).astype(np.float32)
+        return self.data.get_field(field_name)
+
     def _compute_weights(self):
         """Compute the final weight array from field1, op, and field2."""
         import numpy as np
-        w = self.data.get_field(self._sd_field)
+        w = self._project_field(self._sd_field)
         if self._sd_field2 != "None":
-            w2 = self.data.get_field(self._sd_field2)
+            w2 = self._project_field(self._sd_field2)
             op = self._sd_op
             if op == "*":
                 w = w * w2
@@ -186,19 +215,52 @@ class DataFlyerApp:
                 w = np.maximum(w, w2)
         return w
 
-    def _rebuild_sd_weights(self):
-        """Recompute weights from current field settings, re-weight grid (fast)."""
-        weights = self._compute_weights()
-        self._render_mode = RenderMode.surface_density(self._sd_field)
+    def _uses_vector_field(self):
+        """Check if any active field is a vector field."""
+        if self._render_mode_name == "WeightedAverage":
+            if self._wa_data_field in self._vector_fields:
+                return True
+        if self._sd_field in self._vector_fields:
+            return True
+        if self._sd_field2 != "None" and self._sd_field2 in self._vector_fields:
+            return True
+        return False
+
+    def _is_los_stale(self):
+        """Check if the LOS projection needs recomputing due to camera rotation."""
+        if not self._uses_vector_field():
+            return False
+        if self._vector_projection != "LOS":
+            return False
+        if self._los_camera_fwd is None:
+            return True
+        import numpy as np
+        # Recompute if camera direction changed by more than ~1 degree
+        dot = float(np.dot(self._los_camera_fwd, self.camera.forward))
+        return dot < 0.9998  # cos(1 degree) ~ 0.99985
+
+    def _apply_render_mode(self):
+        """Rebuild render mode from current settings and re-weight the grid."""
+        if self._render_mode_name == "WeightedAverage":
+            weights = self._project_field(self._sd_field)
+            qty = self._project_field(self._wa_data_field)
+            label = self._wa_data_field
+            if self._wa_data_field in self._vector_fields:
+                label = f"{self._wa_data_field} ({self._vector_projection})"
+            self._render_mode = RenderMode.mass_weighted_average(label, self._sd_field)
+        else:
+            weights = self._compute_weights()
+            qty = None
+            self._render_mode = RenderMode.surface_density(self._sd_field)
         self.renderer.resolve_mode = self._render_mode.resolve_mode
-        self.renderer.update_weights(weights)
+        self.renderer.update_weights(weights, qty)
         self.renderer.update_visible(self.camera)
         self._needs_auto_range = True
 
     def _set_sd_field(self, field_name):
         """Change the primary surface density weight field."""
         self._sd_field = field_name
-        self._rebuild_sd_weights()
+        self._apply_render_mode()
 
     def _cycle_colormap(self, direction=1):
         self._cmap_idx = (self._cmap_idx + direction) % len(AVAILABLE_COLORMAPS)
@@ -465,6 +527,9 @@ class DataFlyerApp:
                 self._still_frames += 1
                 # Progressive refinement: relax LOD and budget when stationary
                 if self._still_frames >= 2 and self._refinement_level < 3:
+                    # Recompute LOS projection if camera rotated since last compute
+                    if self._refinement_level == 0 and self._is_los_stale():
+                        self._apply_render_mode()
                     saved_lod = self.renderer.lod_pixels
                     saved_budget = self.renderer.max_render_particles
                     if self._refinement_level == 0:
@@ -524,6 +589,11 @@ class DataFlyerApp:
                 AVAILABLE_COLORMAPS[self._cmap_idx], AVAILABLE_COLORMAPS,
                 sd_fields=self._sd_fields, sd_field=self._sd_field,
                 sd_field2=self._sd_field2, sd_op=self._sd_op, sd_ops=self._SD_OPS,
+                render_modes=self._RENDER_MODES, render_mode_name=self._render_mode_name,
+                wa_data_field=self._wa_data_field,
+                vector_fields=self._vector_fields,
+                vector_projection=self._vector_projection,
+                vector_projections=self._VECTOR_PROJECTIONS,
             )
             self.user_menu.render()
 
@@ -640,6 +710,11 @@ class DataFlyerApp:
                 AVAILABLE_COLORMAPS[self._cmap_idx], AVAILABLE_COLORMAPS,
                 sd_fields=self._sd_fields, sd_field=self._sd_field,
                 sd_field2=self._sd_field2, sd_op=self._sd_op, sd_ops=self._SD_OPS,
+                render_modes=self._RENDER_MODES, render_mode_name=self._render_mode_name,
+                wa_data_field=self._wa_data_field,
+                vector_fields=self._vector_fields,
+                vector_projection=self._vector_projection,
+                vector_projections=self._VECTOR_PROJECTIONS,
             )
             self.user_menu.render()
 

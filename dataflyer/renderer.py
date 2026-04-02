@@ -629,7 +629,8 @@ class SplatRenderer:
         if self.resolve_mode == 1:
             num_data = np.frombuffer(self._accum_tex_num.read(), dtype=np.float32)
             mask = den_data > 1e-30
-            vals = np.where(mask, num_data / den_data, 0)
+            with np.errstate(invalid="ignore"):
+                vals = np.where(mask, num_data / den_data, 0)
             vals = vals[mask]
         else:
             vals = den_data[den_data > 1e-30]
@@ -637,20 +638,31 @@ class SplatRenderer:
         if len(vals) == 0:
             return self.qty_min, self.qty_max
 
-        sorted_vals = np.sort(vals)
-        cdf = sorted_vals.cumsum() / sorted_vals.sum()
-        lim_lo = float(np.interp(0.01, cdf, sorted_vals))
-        lim_hi = float(np.interp(0.99, cdf, sorted_vals))
+        has_negative = (vals < 0).any()
 
-        if self.log_scale:
+        if has_negative:
+            # Negative values: use simple percentiles
+            lim_lo = float(np.percentile(vals, 1))
+            lim_hi = float(np.percentile(vals, 99))
+        else:
+            # All positive: mass-weighted CDF for signal-aware limits
+            sorted_vals = np.sort(vals)
+            cdf = sorted_vals.cumsum() / sorted_vals.sum()
+            lim_lo = float(np.interp(0.01, cdf, sorted_vals))
+            lim_hi = float(np.interp(0.99, cdf, sorted_vals))
+
+        if self.log_scale and not has_negative:
             if lim_lo <= 0:
-                lim_lo = float(sorted_vals[sorted_vals > 0].min()) if (sorted_vals > 0).any() else 1e-10
+                lim_lo = float(vals[vals > 0].min()) if (vals > 0).any() else 1e-10
             lo = float(np.log10(max(lim_lo, 1e-30)))
             hi = float(np.log10(max(lim_hi, 1e-30)))
             if hi - lo < 0.1:
                 mid = (hi + lo) / 2
                 lo, hi = mid - 1, mid + 1
         else:
+            # Linear scale (or forced linear when negative)
+            if self.log_scale and has_negative:
+                self.log_scale = 0  # auto-switch to linear for negative data
             lo, hi = lim_lo, lim_hi
             if hi - lo < 1e-30:
                 mid = (hi + lo) / 2

@@ -513,13 +513,36 @@ class UserMenu(Panel):
 
     def update(self, renderer, cmap_name, colormaps,
                sd_fields=None, sd_field="Masses",
-               sd_field2="None", sd_op="*", sd_ops=None):
+               sd_field2="None", sd_op="*", sd_ops=None,
+               render_modes=None, render_mode_name="SurfaceDensity",
+               wa_data_field="Masses",
+               vector_fields=None, vector_projection="LOS", vector_projections=None):
         items = []
 
-        if sd_fields and len(sd_fields) > 1:
-            items.append(("dropdown", "Field", sd_field, sd_fields, "sd_field"))
-            items.append(("dropdown", "Op", sd_op, sd_ops or ["*"], "sd_op"))
-            items.append(("dropdown", "Field 2", sd_field2, ["None"] + sd_fields, "sd_field2"))
+        # All field dropdowns include vector field names
+        vf_set = set(vector_fields or [])
+        all_fields = list(sd_fields or [])
+        for vf in (vector_fields or []):
+            if vf not in all_fields:
+                all_fields.append(vf)
+
+        if render_modes and len(render_modes) > 1:
+            items.append(("dropdown", "Mode", render_mode_name, render_modes, "render_mode"))
+        if all_fields and len(all_fields) > 1:
+            items.append(("dropdown", "Weight", sd_field, all_fields, "sd_field"))
+            if render_mode_name == "SurfaceDensity":
+                items.append(("dropdown", "Op", sd_op, sd_ops or ["*"], "sd_op"))
+                items.append(("dropdown", "Field 2", sd_field2, ["None"] + all_fields, "sd_field2"))
+            else:
+                items.append(("dropdown", "Data", wa_data_field, all_fields, "wa_data_field"))
+
+        # Show projection dropdown if any active field is a vector
+        uses_vector = (sd_field in vf_set
+                       or (render_mode_name == "SurfaceDensity" and sd_field2 in vf_set)
+                       or (render_mode_name == "WeightedAverage" and wa_data_field in vf_set))
+        if uses_vector:
+            items.append(("dropdown", "Proj", vector_projection,
+                          vector_projections or ["LOS", "|v|", "|v|^2"], "vector_projection"))
         items.append(("dropdown", "Cmap", cmap_name, colormaps, "colormap"))
 
         if self._editing == "min":
@@ -643,15 +666,26 @@ class UserMenu(Panel):
 
         if wtype == "dropdown_item":
             key, value = widget[3], widget[4]
-            if key == "sd_field":
+            if key == "render_mode":
+                app._render_mode_name = value
+                app._apply_render_mode()
+            elif key == "sd_field":
                 app._set_sd_field(value)
             elif key == "sd_field2":
                 app._sd_field2 = value
-                app._rebuild_sd_weights()
+                app._apply_render_mode()
             elif key == "sd_op":
                 app._sd_op = value
                 if app._sd_field2 != "None":
-                    app._rebuild_sd_weights()
+                    app._apply_render_mode()
+            elif key == "wa_data_field":
+                app._wa_data_field = value
+                app._los_camera_fwd = None  # force LOS recompute
+                app._apply_render_mode()
+            elif key == "vector_projection":
+                app._vector_projection = value
+                app._los_camera_fwd = None
+                app._apply_render_mode()
             elif key == "colormap":
                 from .colormaps import AVAILABLE_COLORMAPS
                 idx = AVAILABLE_COLORMAPS.index(value) if value in AVAILABLE_COLORMAPS else 0
