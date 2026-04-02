@@ -335,9 +335,9 @@ class DataFlyerApp:
     def _screenshot(self, path=None):
         from PIL import Image
         fb_w, fb_h = glfw.get_framebuffer_size(self.window)
-        data = self.ctx.screen.read(components=3)
-        img = Image.frombytes("RGB", (fb_w, fb_h), data)
-        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        data = self.ctx.screen.read(components=4, alignment=1)
+        img = Image.frombytes("RGBA", (fb_w, fb_h), data)
+        img = img.transpose(Image.FLIP_TOP_BOTTOM).convert("RGB")
         if path is None:
             path = f"dataflyer_{int(time.time())}.png"
         img.save(path)
