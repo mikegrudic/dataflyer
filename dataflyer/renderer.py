@@ -351,8 +351,6 @@ class SpatialGrid:
         cam_up = camera.up
         fov_rad = np.radians(camera.fov)
         pix_per_rad = 1024.0 / (2.0 * np.tan(fov_rad / 2))
-        half_tan = np.tan(fov_rad / 2) * 2.0  # wide frustum
-
         finest = self.levels[0]
         summary_parts = []
         real_pos = None
@@ -371,10 +369,9 @@ class SpatialGrid:
         rights = centers @ cam_right - np.dot(cam_pos, cam_right)
         ups = centers @ cam_up - np.dot(cam_pos, cam_up)
 
-        in_front = depths > -hd
-        lim_h = (depths + hd) * half_tan * camera.aspect + hd
-        lim_v = (depths + hd) * half_tan + hd
-        visible = in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
+        # Only cull behind camera. No side frustum -- GPU clips off-screen
+        # fragments anyway, and tight frustum culling drops edge particles.
+        visible = depths > -hd
         has_mass = lv["mass"] > 0
 
         dist = np.sqrt(depths**2 + rights**2 + ups**2)
@@ -421,10 +418,7 @@ class SpatialGrid:
             rights = centers @ cam_right - np.dot(cam_pos, cam_right)
             ups = centers @ cam_up - np.dot(cam_pos, cam_up)
 
-            in_front = depths > -hd
-            lim_h = (depths + hd) * half_tan * camera.aspect + hd
-            lim_v = (depths + hd) * half_tan + hd
-            vis = in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
+            vis = depths > -hd  # only cull behind camera
 
             dist = np.sqrt(depths**2 + rights**2 + ups**2)
             safe_dist = np.maximum(dist, 0.01)
