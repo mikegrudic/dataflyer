@@ -1,6 +1,7 @@
 # DataFlyer
 
-Real-time 3D fly-through explorer for SPH simulation data. Loads HDF5 snapshots from GIZMO/Gadget simulations and renders interactive surface density maps, mass-weighted averages, velocity dispersions, and composite CoolMap visualizations at 60+ FPS.
+
+Real-time 3D fly-through explorer for unstructured simulation data. Loads HDF5 snapshots from GIZMO/Gadget simulations and renders interactive surface density maps, mass-weighted averages, velocity dispersions, and composite CoolMap visualizations at 60+ FPS.
 
 ## Installation
 
@@ -55,7 +56,7 @@ dataflyer snapshot.hdf5 [--width 1920] [--height 1080] [--fov 90]
 **Advanced:**
 - `\` - Toggle dev overlay
 - `I` - Toggle importance sampling
-- `K` - Cycle SPH kernel
+- `K` - Cycle kernel
 - `T` - Toggle spatial tree
 - `H` - Print help
 - `Esc` - Quit

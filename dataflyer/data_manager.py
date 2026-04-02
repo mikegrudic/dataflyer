@@ -1,4 +1,4 @@
-"""Load SPH simulation snapshots via h5py with lazy field loading."""
+"""Load mesh-free simulation snapshots via h5py with lazy field loading."""
 
 import os
 import re

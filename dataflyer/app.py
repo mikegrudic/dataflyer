@@ -680,6 +680,17 @@ class DataFlyerApp:
                     self._refine_saved_budget = None
                 self._refine_budget = 0
 
+                if not self._was_moving:
+                    # Just started moving after being stopped — immediately
+                    # switch to low-quality cull for responsive first frame
+                    self.renderer.lod_pixels = max(self._user_lod, 4)
+                    self.renderer.max_render_particles = min(self._user_budget, 4_000_000)
+                    if not self._composite:
+                        t0 = time.perf_counter()
+                        self.renderer.update_visible(self.camera)
+                        t_cull = time.perf_counter() - t0
+                    self._last_cull_time = now
+
                 # Smoothed frame time (EMA, only while moving)
                 if dt > 0:
                     if not self._was_moving:
@@ -954,7 +965,7 @@ class DataFlyerApp:
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="DataFlyer - Real-time SPH data explorer")
+    parser = argparse.ArgumentParser(description="DataFlyer - Real-time mesh-free data explorer")
     parser.add_argument("snapshot", help="Path to HDF5 snapshot file")
     parser.add_argument("--width", type=int, default=1920, help="Window width")
     parser.add_argument("--height", type=int, default=1080, help="Window height")
