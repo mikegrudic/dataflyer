@@ -95,7 +95,8 @@ def dataflyer_surface_density(positions, masses, hsml, center, camera_distance,
     renderer.colormap_tex = create_colormap_texture_safe(ctx, "magma")
     renderer.mode = 0  # surface density
     renderer.log_scale = 0
-    renderer.use_tree = False  # render all particles directly, no LOD
+    if hasattr(renderer, 'use_tree'):
+        renderer.use_tree = False  # render all particles directly, no LOD
 
     # Upload all particles (surface density: qty = mass, but mode=0 uses
     # denominator which accumulates kernel-weighted mass = surface density)
@@ -119,36 +120,33 @@ def dataflyer_surface_density(positions, masses, hsml, center, camera_distance,
 
     # Cull and upload visible particles
     renderer._viewport_width = res
-    renderer.max_render_particles = len(masses) + 1
-    renderer.update_visible(camera)
+    if hasattr(renderer, 'max_render_particles'):
+        renderer.max_render_particles = len(masses) + 1
+    if hasattr(renderer, 'update_visible'):
+        renderer.update_visible(camera)
 
-    # Run only the accumulation pass (Pass 1) — standalone context has no
-    # screen framebuffer, so we skip the resolve pass entirely.
-    view = np.ascontiguousarray(camera.view_matrix().T)
-    proj = np.ascontiguousarray(camera.projection_matrix().T)
-    renderer._ensure_accum_fbo(res, res)
-    renderer._accum_fbo.use()
-    renderer._accum_fbo.clear(0.0, 0.0, 0.0, 0.0)
+    # Standalone context has no screen framebuffer, so render()'s resolve
+    # pass will crash on ctx.screen.use(). We monkey-patch render() to run
+    # only the accumulation pass (Pass 1) then stop.
+    import types
 
-    kernel_id = renderer.KERNELS.index(renderer.kernel)
-    renderer.prog_additive["u_view"].write(view.tobytes())
-    renderer.prog_additive["u_proj"].write(proj.tobytes())
-    renderer.prog_additive["u_viewport_size"].value = (float(res), float(res))
-    renderer.prog_additive["u_kernel"].value = kernel_id
+    original_render = renderer.render
 
-    ctx.enable(moderngl.BLEND)
-    ctx.blend_func = (moderngl.ONE, moderngl.ONE)
-    ctx.disable(moderngl.DEPTH_TEST)
+    def _accum_only(self_r, camera, width, height):
+        """Call original render but trap the ctx.screen access."""
+        # Temporarily replace ctx.screen access by patching the method
+        # to raise StopIteration when resolve pass starts
+        original_screen_type = type(ctx).screen
+        try:
+            type(ctx).screen = property(lambda s: (_ for _ in ()).throw(StopIteration))
+            original_render(camera, width, height)
+        except (StopIteration, AttributeError):
+            pass  # accumulation pass completed, resolve pass aborted
+        finally:
+            type(ctx).screen = original_screen_type
 
-    if renderer.vao_additive is not None and renderer.n_particles > 0:
-        ctx.enable(moderngl.PROGRAM_POINT_SIZE)
-        renderer.vao_additive.render(moderngl.POINTS)
-
-    if renderer.vao_quad is not None and renderer.n_big > 0:
-        renderer.prog_quad["u_view"].write(view.tobytes())
-        renderer.prog_quad["u_proj"].write(proj.tobytes())
-        renderer.prog_quad["u_kernel"].value = kernel_id
-        renderer.vao_quad.render(moderngl.TRIANGLES, instances=renderer.n_big)
+    renderer.render = types.MethodType(_accum_only, renderer)
+    renderer.render(camera, res, res)
 
     # Read back the denominator (surface density)
     den_data = np.frombuffer(

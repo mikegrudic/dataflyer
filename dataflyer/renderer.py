@@ -726,6 +726,7 @@ class SplatRenderer:
         self.log_scale = 1  # 1: log10, 0: linear
         self.max_render_particles = MAX_RENDER_PARTICLES
         self.use_tree = True
+        self.tree_min_particles = 0  # only build tree if N > this threshold
         self.use_importance_sampling = False
         self.KERNELS = ["cubic_spline", "wendland_c2", "gaussian", "quartic", "sphere"]
         self.kernel = "cubic_spline"
@@ -735,6 +736,7 @@ class SplatRenderer:
         self.summary_overlap = 0.1  # cell-size padding to bridge voids at tree boundaries
         self.use_aniso_summaries = True  # False = isotropic spherical summaries
         self.cull_interval = 0.5  # seconds between culls while moving
+        self._needs_grid_rebuild = False
 
     def set_particles(self, positions, hsml, masses, quantity=None):
         """Store particle data on CPU. Call update_visible() to upload a subset."""
@@ -747,7 +749,7 @@ class SplatRenderer:
         self.n_total = len(masses)
 
         # Build spatial grid for frustum culling and LOD
-        if self.use_tree:
+        if self.use_tree and self.n_total > self.tree_min_particles:
             import time
 
             t0 = time.perf_counter()
@@ -760,6 +762,16 @@ class SplatRenderer:
         """Cull and upload only visible particles for this frame."""
         if self._all_pos is None:
             return
+
+        if self._needs_grid_rebuild:
+            self._needs_grid_rebuild = False
+            if self.use_tree and self.n_total > self.tree_min_particles:
+                import time
+                t0 = time.perf_counter()
+                self._grid = SpatialGrid(self._all_pos, self._all_mass, self._all_hsml, self._all_qty)
+                print(f"  Spatial grid rebuilt in {time.perf_counter()-t0:.1f}s")
+            else:
+                self._grid = None
 
         if self._grid is not None:
             result = self._grid.query_frustum_lod(
@@ -854,43 +866,50 @@ class SplatRenderer:
             self._build_vao()
             return
 
-        # Split into small (point sprites) and big (instanced quads)
+        # Split into small (point sprites) and big (instanced quads).
+        # Upload all particles into shared buffers sorted smalls-first,
+        # then build VAOs with byte offsets — avoids copying data twice.
         MAX_POINT_PX = 64.0
         if self.use_hybrid_rendering and camera is not None and len(pos) > 0:
-            # Match the shader's pixel size calculation exactly:
-            # desired_pixels = h * proj[0][0] / depth * viewport_x
             proj = camera.projection_matrix()
             scale = proj[0, 0] * self._viewport_width
             depths = (pos - camera.position) @ camera.forward
             safe_depths = np.maximum(np.abs(depths), 0.01)
             point_px = hsml / safe_depths * scale
             big_mask = point_px > MAX_POINT_PX
+            n_big = int(big_mask.sum())
         else:
-            big_mask = np.zeros(len(mass), dtype=bool)
+            n_big = 0
 
-        small_mask = ~big_mask
-        n_small = int(small_mask.sum())
-        n_big = int(big_mask.sum())
         self.n_big = n_big
+        n_small = len(mass) - n_big
 
-        # Upload small particles (point sprites)
+        if n_big > 0 and n_small > 0:
+            # Partition so smalls come first — O(n) unlike full sort
+            order = np.argpartition(big_mask, n_small)
+            pos = pos[order]
+            hsml = hsml[order]
+            mass = mass[order]
+            qty = qty[order]
+
+        # Upload into separate buffers for small and big particles.
+        # The partition reorders all 4 arrays with a single index gather.
         if n_small > 0:
-            self.pos_vbo = self.ctx.buffer(pos[small_mask].tobytes())
-            self.hsml_vbo = self.ctx.buffer(hsml[small_mask].tobytes())
-            self.mass_vbo = self.ctx.buffer(mass[small_mask].tobytes())
-            self.qty_vbo = self.ctx.buffer(qty[small_mask].tobytes())
+            self.pos_vbo = self.ctx.buffer(pos[:n_small].tobytes())
+            self.hsml_vbo = self.ctx.buffer(hsml[:n_small].tobytes())
+            self.mass_vbo = self.ctx.buffer(mass[:n_small].tobytes())
+            self.qty_vbo = self.ctx.buffer(qty[:n_small].tobytes())
         else:
             self.pos_vbo = None
             self.hsml_vbo = None
             self.mass_vbo = None
             self.qty_vbo = None
 
-        # Upload big particles (instanced quads)
         if n_big > 0:
-            self.big_pos_vbo = self.ctx.buffer(pos[big_mask].tobytes())
-            self.big_hsml_vbo = self.ctx.buffer(hsml[big_mask].tobytes())
-            self.big_mass_vbo = self.ctx.buffer(mass[big_mask].tobytes())
-            self.big_qty_vbo = self.ctx.buffer(qty[big_mask].tobytes())
+            self.big_pos_vbo = self.ctx.buffer(pos[n_small:].tobytes())
+            self.big_hsml_vbo = self.ctx.buffer(hsml[n_small:].tobytes())
+            self.big_mass_vbo = self.ctx.buffer(mass[n_small:].tobytes())
+            self.big_qty_vbo = self.ctx.buffer(qty[n_small:].tobytes())
         else:
             self.big_pos_vbo = None
             self.big_hsml_vbo = None

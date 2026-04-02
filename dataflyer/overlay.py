@@ -114,6 +114,7 @@ class DevOverlay:
         # Sliders
         items.append(("slider", "Summary Scale", renderer.summary_scale, 0.1, 10.0, "summary_scale"))
         items.append(("slider", "Summary Overlap", renderer.summary_overlap, 0.0, 1.0, "summary_overlap"))
+        items.append(("slider", "Tree Min N", renderer.tree_min_particles, 0, 1e7, "tree_min_particles"))
         items.append(("slider", "Cull Interval", renderer.cull_interval, 0.0, 5.0, "cull_interval"))
         items.append(("text", f"Aniso splats: {renderer.n_aniso:,}"))
 
@@ -304,6 +305,8 @@ class DevOverlay:
                     cur = getattr(renderer, key, 1.0)
                     step = max((vmax - vmin) / 20, 0.01)
                     setattr(renderer, key, max(vmin, cur - step))
+                    if key == "tree_min_particles":
+                        renderer._needs_grid_rebuild = True
                     return True
 
             elif wtype == "slider_inc":
@@ -313,6 +316,8 @@ class DevOverlay:
                     cur = getattr(renderer, key, 1.0)
                     step = max((vmax - vmin) / 20, 0.01)
                     setattr(renderer, key, min(vmax, cur + step))
+                    if key == "tree_min_particles":
+                        renderer._needs_grid_rebuild = True
                     return True
 
         return True  # clicked inside panel but not on a widget
