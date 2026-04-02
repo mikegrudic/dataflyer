@@ -511,6 +511,7 @@ class UserMenu(Panel):
         s = app._slot[slot_idx]
         if field_key == "mode":
             s["mode"] = value
+            s["resolve"] = {"SurfaceDensity": 0, "WeightedAverage": 1, "WeightedVariance": 2}[value]
         elif field_key == "weight":
             s["weight"] = value
         elif field_key == "weight2":

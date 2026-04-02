@@ -367,14 +367,14 @@ class DataFlyerApp:
         r._ensure_fbo(fb_width, fb_height, which=1)
         r._ensure_fbo(fb_width, fb_height, which=2)
 
-        # Slot 0 (lightness): load weights/qty, cull, render into FBO1
+        # Slot 0 (lightness): full update_weights + cull + render into FBO1
         s0 = self._slot[0]
         w0, q0 = self._compute_slot(s0)
         r.update_weights(w0, q0)
         r.update_visible(self.camera)
         r._render_accum(self.camera, fb_width, fb_height, r._accum_fbo)
 
-        # Slot 1 (color): load weights/qty, cull, render into FBO2
+        # Slot 1 (color): full update_weights + cull + render into FBO2
         s1 = self._slot[1]
         w1, q1 = self._compute_slot(s1)
         r.update_weights(w1, q1)
