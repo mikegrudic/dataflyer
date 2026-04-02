@@ -1,5 +1,6 @@
 """Dev overlay: renders text HUD with interactive toggles and dropdowns."""
 
+import moderngl
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
@@ -318,12 +319,12 @@ class DevOverlay:
     def render(self):
         if not self.enabled or self._tex is None:
             return
-        self.ctx.enable(0x0BE2)
-        self.ctx.blend_func = (0x0302, 0x0303)
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
         self._tex.use(location=0)
         self._prog["u_texture"].value = 0
         self._vao.render(vertices=6)
-        self.ctx.disable(0x0BE2)
+        self.ctx.disable(moderngl.BLEND)
 
     def release(self):
         for attr in ("_tex", "_vbo", "_vao", "_prog"):
@@ -339,7 +340,7 @@ class DevOverlay:
 UM_FONT_SIZE = 42
 UM_LINE_H = 56
 UM_MARGIN = 20
-UM_BG = (0, 0, 0, 180)
+UM_BG = (15, 15, 25, 100)
 UM_TEXT = (220, 220, 220, 255)
 UM_ACCENT = (100, 180, 255, 255)
 UM_FIELD_BG = (30, 30, 30, 255)
@@ -352,7 +353,6 @@ class UserMenu:
 
     def __init__(self, ctx):
         self.ctx = ctx
-        # Menu panel texture/quad
         self._tex = None
         self._prog = ctx.program(
             vertex_shader=_load_shader("text.vert"),
@@ -362,13 +362,6 @@ class UserMenu:
         self._vao = ctx.vertex_array(
             self._prog,
             [(self._vbo, "2f 2f", "in_position", "in_uv")],
-        )
-        # Colorbar texture/quad (separate, centered on left edge)
-        self._cbar_tex = None
-        self._cbar_vbo = ctx.buffer(reserve=6 * 4 * 4)
-        self._cbar_vao = ctx.vertex_array(
-            self._prog,
-            [(self._cbar_vbo, "2f 2f", "in_position", "in_uv")],
         )
         self._font = DevOverlay._get_font(None, UM_FONT_SIZE)
 
@@ -472,8 +465,6 @@ class UserMenu:
         self._hi_str = hi_display.rstrip("_")
         self._renderer = renderer
         self._render_menu(items)
-        if self.show_colorbar:
-            self._render_colorbar()
 
     def _render_menu(self, items):
         M = UM_MARGIN
@@ -553,6 +544,53 @@ class UserMenu:
                         self._widgets.append((y, y + LH, "dropdown_item", key, opt))
                         y += LH
 
+        # Draw colorbar to the right of menu items if enabled
+        if self.show_colorbar:
+            fb_h = self._fb_height
+            cbar_h = max(fb_h // 4, 100)
+            cbar_w = 30
+            cbar_x = tw + M
+            label_pad = 10
+
+            # Measure label width
+            hi_bbox = draw.textbbox((0, 0), self._hi_str, font=self._font)
+            lo_bbox = draw.textbbox((0, 0), self._lo_str, font=self._font)
+            max_label_w = max(hi_bbox[2] - hi_bbox[0], lo_bbox[2] - lo_bbox[0])
+
+            new_tw = cbar_x + cbar_w + label_pad + max_label_w + M
+            new_th = max(th, cbar_h + LH * 2)
+
+            new_img = Image.new("RGBA", (new_tw, new_th), UM_BG)
+            new_img.paste(img, (0, new_th - th))  # align menu to bottom
+            draw = ImageDraw.Draw(new_img)
+
+            # Gradient
+            cbar_top = M
+            try:
+                import matplotlib.cm as cm
+                cmap = cm.get_cmap(self._cmap_name)
+                for j in range(cbar_h):
+                    t = 1.0 - j / max(cbar_h - 1, 1)
+                    rgba = cmap(t)
+                    c = tuple(int(v * 255) for v in rgba[:3]) + (255,)
+                    draw.rectangle([(cbar_x, cbar_top + j), (cbar_x + cbar_w, cbar_top + j)], fill=c)
+            except Exception:
+                draw.rectangle([(cbar_x, cbar_top), (cbar_x + cbar_w, cbar_top + cbar_h)],
+                               fill=(128, 128, 128, 255))
+            draw.rectangle([(cbar_x, cbar_top), (cbar_x + cbar_w, cbar_top + cbar_h)], outline=UM_TEXT)
+
+            # Labels
+            label_x = cbar_x + cbar_w + label_pad
+            draw.text((label_x, cbar_top), self._hi_str, fill=UM_TEXT, font=self._font)
+            draw.text((label_x, cbar_top + cbar_h - LH), self._lo_str, fill=UM_TEXT, font=self._font)
+
+            img = new_img
+            tw = new_tw
+            th = new_th
+            # Adjust widget y coordinates (menu was shifted down)
+            offset = new_th - (n_lines + dropdown_extra) * LH - M * 2
+            self._widgets = [(wy + offset, we + offset, *rest) for wy, we, *rest in self._widgets]
+
         self._panel_w = tw
         self._panel_h = th
         data = img.tobytes()
@@ -578,63 +616,6 @@ class UserMenu:
             x2, y1, 1, 1,  x2, y2, 1, 0,  x1, y2, 0, 0,
         ], dtype=np.float32)
         self._vbo.write(verts.tobytes())
-
-    def _render_colorbar(self):
-        """Render colorbar centered on left side, 1/4 window height."""
-        fb_w, fb_h = self._fb_width, self._fb_height
-        cbar_h = fb_h // 4
-        cbar_w = 40
-        label_w = 200
-        total_w = cbar_w + label_w + 20
-        total_h = cbar_h + UM_LINE_H * 2  # room for top/bottom labels
-
-        img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-
-        # Draw gradient
-        try:
-            import matplotlib.cm as cm
-            cmap = cm.get_cmap(self._cmap_name)
-            for j in range(cbar_h):
-                t = 1.0 - j / max(cbar_h - 1, 1)
-                rgba = cmap(t)
-                c = tuple(int(v * 255) for v in rgba[:3]) + (255,)
-                draw.rectangle([(0, UM_LINE_H + j), (cbar_w, UM_LINE_H + j)], fill=c)
-        except Exception:
-            draw.rectangle([(0, UM_LINE_H), (cbar_w, UM_LINE_H + cbar_h)],
-                           fill=(128, 128, 128, 255))
-
-        # Border
-        draw.rectangle([(0, UM_LINE_H), (cbar_w, UM_LINE_H + cbar_h)], outline=UM_TEXT)
-
-        # Labels
-        draw.text((cbar_w + 8, 0), self._hi_str, fill=UM_TEXT, font=self._font)
-        draw.text((cbar_w + 8, UM_LINE_H + cbar_h - 10), self._lo_str, fill=UM_TEXT, font=self._font)
-
-        # Premultiply alpha to avoid dark fringes with bilinear filtering
-        arr = np.array(img)
-        alpha = arr[:, :, 3:4].astype(np.float32) / 255.0
-        arr[:, :, :3] = (arr[:, :, :3].astype(np.float32) * alpha).astype(np.uint8)
-        data = arr.tobytes()
-        if self._cbar_tex is not None:
-            self._cbar_tex.release()
-        self._cbar_tex = self.ctx.texture((total_w, total_h), 4, data=data)
-        self._cbar_tex.filter = (0x2601, 0x2601)
-
-        # Position: centered vertically on the left edge
-        px_w = total_w / fb_w * 2
-        px_h = total_h / fb_h * 2
-        x1 = -1.0 + 0.01
-        x2 = x1 + px_w
-        y_center = 0.0  # NDC center
-        y1 = y_center - px_h / 2
-        y2 = y_center + px_h / 2
-
-        verts = np.array([
-            x1, y1, 0, 1,  x2, y1, 1, 1,  x1, y2, 0, 0,
-            x2, y1, 1, 1,  x2, y2, 1, 0,  x1, y2, 0, 0,
-        ], dtype=np.float32)
-        self._cbar_vbo.write(verts.tobytes())
 
     def on_click(self, x, y, app):
         """Handle click. Returns True if consumed."""
@@ -710,21 +691,15 @@ class UserMenu:
     def render(self):
         if self._tex is None:
             return
-        self.ctx.enable(0x0BE2)
-        self.ctx.blend_func = (0x0302, 0x0303)
+        self.ctx.enable(moderngl.BLEND)  # GL_BLEND
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)  # SRC_ALPHA, ONE_MINUS_SRC_ALPHA
         self._tex.use(location=0)
         self._prog["u_texture"].value = 0
         self._vao.render(vertices=6)
-        # Colorbar (premultiplied alpha)
-        if self.show_colorbar and self._cbar_tex is not None:
-            self.ctx.blend_func = (0x0001, 0x0303)  # GL_ONE, GL_ONE_MINUS_SRC_ALPHA
-            self._cbar_tex.use(location=0)
-            self._prog["u_texture"].value = 0
-            self._cbar_vao.render(vertices=6)
-        self.ctx.disable(0x0BE2)
+        self.ctx.disable(moderngl.BLEND)
 
     def release(self):
-        for attr in ("_tex", "_cbar_tex", "_vbo", "_cbar_vbo", "_vao", "_cbar_vao", "_prog"):
+        for attr in ("_tex", "_vbo", "_vao", "_prog"):
             obj = getattr(self, attr, None)
             if obj is not None:
                 try:
