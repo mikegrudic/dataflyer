@@ -381,6 +381,7 @@ class UserMenu:
 
         self._widgets = []
         self._dropdown_open = None
+        self._dropdown_scroll = {}  # key -> scroll offset (index of first visible item)
         self._fb_width = 1
         self._fb_height = 1
         self._panel_x = 0
@@ -446,11 +447,17 @@ class UserMenu:
         self._editing = None
         self._edit_buffer = ""
 
-    def update(self, renderer, quantities, current_qty, cmap_name, colormaps):
+    def update(self, renderer, quantities, current_qty, cmap_name, colormaps,
+               sd_fields=None, sd_field="Masses",
+               sd_field2="None", sd_op="*", sd_ops=None):
         items = []
         self._widgets = []
 
         items.append(("dropdown", "Map", current_qty, quantities, "quantity"))
+        if current_qty == "surface_density" and sd_fields and len(sd_fields) > 1:
+            items.append(("dropdown", "Field", sd_field, sd_fields, "sd_field"))
+            items.append(("dropdown", "Op", sd_op, sd_ops or ["*"], "sd_op"))
+            items.append(("dropdown", "Field 2", sd_field2, ["None"] + sd_fields, "sd_field2"))
         items.append(("dropdown", "Cmap", cmap_name, colormaps, "colormap"))
 
         # Editable range fields
@@ -499,10 +506,16 @@ class UserMenu:
 
         n_lines = len(items)
         dropdown_extra = 0
+        # Max dropdown items that fit on screen (leave room for other menu items)
+        max_dd_visible = max(4, (self._fb_height // LH) - n_lines - 4)
         if self._dropdown_open:
             for item in items:
                 if item[0] == "dropdown" and item[4] == self._dropdown_open:
-                    dropdown_extra = len(item[3])
+                    n_opts = len(item[3])
+                    dropdown_extra = min(n_opts, max_dd_visible)
+                    # Add room for scroll arrows if needed
+                    if n_opts > max_dd_visible:
+                        dropdown_extra += 2  # top/bottom scroll indicators
 
         tw = max_w + M * 2
         th = (n_lines + dropdown_extra) * LH + M * 2
@@ -551,11 +564,30 @@ class UserMenu:
                 self._widgets.append((y, y + LH, "dropdown_header", key))
                 y += LH
                 if is_open:
-                    for opt in options:
+                    n_opts = len(options)
+                    scrollable = n_opts > max_dd_visible
+                    scroll = self._dropdown_scroll.get(key, 0)
+                    if scrollable:
+                        scroll = max(0, min(scroll, n_opts - max_dd_visible))
+                        self._dropdown_scroll[key] = scroll
+                        # Up arrow
+                        arrow_color = UM_ACCENT if scroll > 0 else (80, 80, 80, 255)
+                        draw.text((M + 30, y), f"^ ({scroll} more)", fill=arrow_color, font=self._font)
+                        self._widgets.append((y, y + LH, "dropdown_scroll", key, -3))
+                        y += LH
+                    vis_start = scroll if scrollable else 0
+                    vis_end = min(vis_start + max_dd_visible, n_opts)
+                    for opt in options[vis_start:vis_end]:
                         bg = UM_BTN_HOVER if opt == current else UM_FIELD_BG
                         draw.rectangle([(M + 20, y), (tw - M, y + LH - 2)], fill=bg)
                         draw.text((M + 30, y), opt, fill=UM_TEXT, font=self._font)
                         self._widgets.append((y, y + LH, "dropdown_item", key, opt))
+                        y += LH
+                    if scrollable:
+                        remaining = n_opts - vis_end
+                        arrow_color = UM_ACCENT if remaining > 0 else (80, 80, 80, 255)
+                        draw.text((M + 30, y), f"v ({remaining} more)", fill=arrow_color, font=self._font)
+                        self._widgets.append((y, y + LH, "dropdown_scroll", key, 3))
                         y += LH
 
         # Build separate colorbar overlay if enabled
@@ -688,6 +720,7 @@ class UserMenu:
                     self._dropdown_open = None
                 else:
                     self._dropdown_open = key
+                    self._dropdown_scroll[key] = 0
                 return True
 
             elif wtype == "dropdown_item":
@@ -701,6 +734,17 @@ class UserMenu:
                     app.renderer.update_quantity(q)
                     app.renderer.mode = 0 if value == "surface_density" else 1
                     app._needs_auto_range = True
+                    if value == "surface_density" and app._sd_field != "Masses":
+                        app._set_sd_field(app._sd_field)
+                elif key == "sd_field":
+                    app._set_sd_field(value)
+                elif key == "sd_field2":
+                    app._sd_field2 = value
+                    app._rebuild_sd_weights()
+                elif key == "sd_op":
+                    app._sd_op = value
+                    if app._sd_field2 != "None":
+                        app._rebuild_sd_weights()
                 elif key == "colormap":
                     from .colormaps import AVAILABLE_COLORMAPS
                     idx = AVAILABLE_COLORMAPS.index(value) if value in AVAILABLE_COLORMAPS else 0
@@ -709,6 +753,23 @@ class UserMenu:
                 self._dropdown_open = None
                 return True
 
+            elif wtype == "dropdown_scroll":
+                key = widget[3]
+                delta = widget[4]  # negative = scroll up, positive = scroll down
+                cur = self._dropdown_scroll.get(key, 0)
+                self._dropdown_scroll[key] = max(0, cur + delta)
+                return True
+
+        return True
+
+    def on_scroll(self, yoffset):
+        """Handle mouse wheel scroll. Returns True if consumed by an open dropdown."""
+        if not self._dropdown_open:
+            return False
+        key = self._dropdown_open
+        cur = self._dropdown_scroll.get(key, 0)
+        delta = -int(round(yoffset)) * 3  # scroll 3 items per tick
+        self._dropdown_scroll[key] = max(0, cur + delta)
         return True
 
     def render(self):

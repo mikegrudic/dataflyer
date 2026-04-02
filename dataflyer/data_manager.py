@@ -151,6 +151,50 @@ class SnapshotData:
             result.append("internal_energy")
         return result
 
+    # Fields to exclude from the surface density weight dropdown
+    _SKIP_FIELDS = {
+        "Coordinates",
+        "Velocities",
+        "ParticleIDs",
+        "ParticleChildIDsNumber",
+        "ParticleIDGenerationNumber",
+        "PhotonFluxDensity",
+    }
+
+    def available_fields(self):
+        """List PartType0 fields suitable as surface density weights.
+
+        Scalar fields appear as-is. Multi-column fields (e.g. shape (N,5))
+        are expanded to Name[0], Name[1], etc.
+        """
+        fields = ["Masses"]
+        grp = self._file.get("PartType0", {})
+        for name in grp:
+            if name == "Masses" or name in self._SKIP_FIELDS:
+                continue
+            ds = grp[name]
+            if not hasattr(ds, 'shape') or ds.shape[0] != self.n_particles:
+                continue
+            if ds.ndim == 1:
+                fields.append(name)
+            elif ds.ndim == 2:
+                for i in range(ds.shape[1]):
+                    fields.append(f"{name}[{i}]")
+        return fields
+
+    def get_field(self, name):
+        """Load a raw PartType0 field by name. Returns (N,) float32 array.
+
+        Supports indexed names like 'PhotonEnergy[3]' for multi-column fields.
+        """
+        # Parse optional column index: "FieldName[i]"
+        if "[" in name and name.endswith("]"):
+            base, idx_str = name[:-1].split("[", 1)
+            col = int(idx_str)
+            data = self._read_field("PartType0", base)
+            return data[:, col].astype(np.float32)
+        return self._read_field("PartType0", name).astype(np.float32)
+
     def close(self):
         self._file.close()
         self._cache.clear()

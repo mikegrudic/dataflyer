@@ -77,6 +77,13 @@ class DataFlyerApp:
         self._qty_idx = 0
         self._current_qty = self._quantities[0]
 
+        # Surface density weight field (any scalar PartType0 field)
+        self._sd_fields = self.data.available_fields()
+        self._sd_field = "Masses"
+        self._sd_field2 = "None"  # optional second field
+        self._sd_op = "*"  # operation between field1 and field2
+        self._SD_OPS = ["*", "+", "-", "/", "min", "max"]
+
         # Store particles and upload (with culling for large datasets)
         quantity = self.data.get_quantity(self._current_qty)
         self.renderer.set_particles(
@@ -119,10 +126,16 @@ class DataFlyerApp:
         self._quantities = self.data.available_quantities()
         self._qty_idx = min(self._qty_idx, len(self._quantities) - 1)
         self._current_qty = self._quantities[self._qty_idx]
+        self._sd_fields = self.data.available_fields()
+        if self._sd_field not in self._sd_fields:
+            self._sd_field = "Masses"
+        if self._sd_field2 != "None" and self._sd_field2 not in self._sd_fields:
+            self._sd_field2 = "None"
 
+        weights = self._compute_weights()
         q = self.data.get_quantity(self._current_qty)
         self.renderer.set_particles(
-            self.data.positions, self.data.hsml, self.data.masses, q,
+            self.data.positions, self.data.hsml, weights, q,
         )
         self.renderer.update_visible(self.camera)
         self.renderer.mode = 0 if self._current_qty == "surface_density" else 1
@@ -155,6 +168,42 @@ class DataFlyerApp:
             self._colormap_textures[name] = create_colormap_texture_safe(self.ctx, name)
         self.renderer.colormap_tex = self._colormap_textures[name]
 
+    def _compute_weights(self):
+        """Compute the final weight array from field1, op, and field2."""
+        import numpy as np
+        w = self.data.get_field(self._sd_field)
+        if self._sd_field2 != "None":
+            w2 = self.data.get_field(self._sd_field2)
+            op = self._sd_op
+            if op == "*":
+                w = w * w2
+            elif op == "+":
+                w = w + w2
+            elif op == "-":
+                w = w - w2
+            elif op == "/":
+                w = w / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
+            elif op == "min":
+                w = np.minimum(w, w2)
+            elif op == "max":
+                w = np.maximum(w, w2)
+        return w
+
+    def _rebuild_sd_weights(self):
+        """Recompute weights from current field settings and rebuild."""
+        weights = self._compute_weights()
+        quantity = self.data.get_quantity(self._current_qty)
+        self.renderer.set_particles(
+            self.data.positions, self.data.hsml, weights, quantity,
+        )
+        self.renderer.update_visible(self.camera)
+        self._needs_auto_range = True
+
+    def _set_sd_field(self, field_name):
+        """Change the primary surface density weight field."""
+        self._sd_field = field_name
+        self._rebuild_sd_weights()
+
     def _cycle_quantity(self, direction=1):
         self._qty_idx = (self._qty_idx + direction) % len(self._quantities)
         self._current_qty = self._quantities[self._qty_idx]
@@ -164,6 +213,8 @@ class DataFlyerApp:
         self._needs_auto_range = True  # auto-range after next render
         if self._current_qty == "surface_density":
             self.renderer.mode = 0
+            if self._sd_field != "Masses":
+                self._set_sd_field(self._sd_field)
         else:
             self.renderer.mode = 1
 
@@ -360,6 +411,8 @@ class DataFlyerApp:
             return
 
     def _scroll_callback(self, window, xoffset, yoffset):
+        if self.user_menu.on_scroll(yoffset):
+            return
         self.camera.on_scroll(yoffset)
 
     def _resize_callback(self, window, width, height):
@@ -531,6 +584,8 @@ class DataFlyerApp:
             self.user_menu.update(
                 self.renderer, self._quantities, self._current_qty,
                 AVAILABLE_COLORMAPS[self._cmap_idx], AVAILABLE_COLORMAPS,
+                sd_fields=self._sd_fields, sd_field=self._sd_field,
+                sd_field2=self._sd_field2, sd_op=self._sd_op, sd_ops=self._SD_OPS,
             )
             self.user_menu.render()
 
