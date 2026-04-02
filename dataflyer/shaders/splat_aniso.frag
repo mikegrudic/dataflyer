@@ -10,6 +10,7 @@ in float v_gauss_norm;  // 1/(2π √det(Σ_2D)), already includes cov_scale
 
 layout(location = 0) out float out_numerator;
 layout(location = 1) out float out_denominator;
+layout(location = 2) out float out_sq;
 
 void main() {
     float r2 = dot(v_offset, v_offset);
@@ -21,4 +22,5 @@ void main() {
 
     out_numerator = sigma * v_quantity;
     out_denominator = sigma;
+    out_sq = sigma * v_quantity * v_quantity;
 }

@@ -539,7 +539,7 @@ class UserMenu(Panel):
         # Show projection dropdown if any active field is a vector
         uses_vector = (sd_field in vf_set
                        or (render_mode_name == "SurfaceDensity" and sd_field2 in vf_set)
-                       or (render_mode_name == "WeightedAverage" and wa_data_field in vf_set))
+                       or (render_mode_name != "SurfaceDensity" and wa_data_field in vf_set))
         if uses_vector:
             items.append(("dropdown", "Proj", vector_projection,
                           vector_projections or ["LOS", "|v|", "|v|^2"], "vector_projection"))

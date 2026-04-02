@@ -58,6 +58,16 @@ class RenderMode:
             resolve_mode=1,
         )
 
+    @staticmethod
+    def weighted_variance(qty_field, weight_field="Masses"):
+        """Create a weighted variance render mode: sqrt(<f^2> - <f>^2)."""
+        return RenderMode(
+            name=f"sigma({qty_field})",
+            weight_field=weight_field,
+            qty_field=qty_field,
+            resolve_mode=2,
+        )
+
 
 # Maximum particles to render per frame for interactive performance
 MAX_RENDER_PARTICLES = 4_000_000
@@ -239,10 +249,11 @@ class SplatRenderer:
         self._all_mass = None
         self._all_qty = None
 
-        # FBO for accumulation (2 float textures: numerator + denominator)
+        # FBO for accumulation (3 float textures: numerator, denominator, squared)
         self._accum_fbo = None
         self._accum_tex_num = None
         self._accum_tex_den = None
+        self._accum_tex_sq = None
         self._fbo_size = (0, 0)
         self._viewport_width = 1024  # updated each frame in render()
 
@@ -545,15 +556,16 @@ class SplatRenderer:
         if self._fbo_size == (width, height) and self._accum_fbo is not None:
             return
 
-        for attr in ("_accum_fbo", "_accum_tex_num", "_accum_tex_den"):
+        for attr in ("_accum_fbo", "_accum_tex_num", "_accum_tex_den", "_accum_tex_sq"):
             old = getattr(self, attr, None)
             if old is not None:
                 old.release()
 
         self._accum_tex_num = self.ctx.texture((width, height), 1, dtype="f4")
         self._accum_tex_den = self.ctx.texture((width, height), 1, dtype="f4")
+        self._accum_tex_sq = self.ctx.texture((width, height), 1, dtype="f4")
         self._accum_fbo = self.ctx.framebuffer(
-            color_attachments=[self._accum_tex_num, self._accum_tex_den],
+            color_attachments=[self._accum_tex_num, self._accum_tex_den, self._accum_tex_sq],
         )
         self._fbo_size = (width, height)
 
@@ -605,11 +617,13 @@ class SplatRenderer:
 
         self._accum_tex_num.use(location=0)
         self._accum_tex_den.use(location=1)
-        self.colormap_tex.use(location=2)
+        self._accum_tex_sq.use(location=2)
+        self.colormap_tex.use(location=3)
 
         self.prog_resolve["u_numerator"].value = 0
         self.prog_resolve["u_denominator"].value = 1
-        self.prog_resolve["u_colormap"].value = 2
+        self.prog_resolve["u_sq"].value = 2
+        self.prog_resolve["u_colormap"].value = 3
         self.prog_resolve["u_qty_min"].value = self.qty_min
         self.prog_resolve["u_qty_max"].value = self.qty_max
         self.prog_resolve["u_mode"].value = self.resolve_mode
@@ -626,7 +640,16 @@ class SplatRenderer:
             return self.qty_min, self.qty_max
 
         den_data = np.frombuffer(self._accum_tex_den.read(), dtype=np.float32)
-        if self.resolve_mode == 1:
+        if self.resolve_mode == 2:
+            # Variance: sqrt(<f²> - <f>²)
+            num_data = np.frombuffer(self._accum_tex_num.read(), dtype=np.float32)
+            sq_data = np.frombuffer(self._accum_tex_sq.read(), dtype=np.float32)
+            mask = den_data > 1e-30
+            with np.errstate(invalid="ignore"):
+                mean = np.where(mask, num_data / den_data, 0)
+                mean_sq = np.where(mask, sq_data / den_data, 0)
+            vals = np.sqrt(np.maximum(mean_sq - mean * mean, 0))[mask]
+        elif self.resolve_mode == 1:
             num_data = np.frombuffer(self._accum_tex_num.read(), dtype=np.float32)
             mask = den_data > 1e-30
             with np.errstate(invalid="ignore"):
@@ -679,7 +702,7 @@ class SplatRenderer:
             "aniso_pos_vbo", "aniso_mass_vbo", "aniso_qty_vbo", "aniso_cov_vbo",
             "vao_additive", "vao_quad", "vao_aniso", "vao_resolve",
             "prog_additive", "prog_quad", "prog_aniso", "prog_resolve", "prog_star",
-            "_accum_fbo", "_accum_tex_num", "_accum_tex_den",
+            "_accum_fbo", "_accum_tex_num", "_accum_tex_den", "_accum_tex_sq",
         ):
             obj = getattr(self, attr, None)
             if obj is not None:

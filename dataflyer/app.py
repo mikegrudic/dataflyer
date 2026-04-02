@@ -79,7 +79,7 @@ class DataFlyerApp:
         self._sd_field2 = "None"  # optional second field
         self._sd_op = "*"  # operation between field1 and field2
         self._SD_OPS = ["*", "+", "-", "/", "min", "max"]
-        self._RENDER_MODES = ["SurfaceDensity", "WeightedAverage"]
+        self._RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance"]
         self._render_mode_name = "SurfaceDensity"
         self._wa_data_field = "Masses"  # data field for WeightedAverage
         self._VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
@@ -239,15 +239,18 @@ class DataFlyerApp:
         dot = float(np.dot(self._los_camera_fwd, self.camera.forward))
         return dot < 0.9998  # cos(1 degree) ~ 0.99985
 
-    def _apply_render_mode(self):
+    def _apply_render_mode(self, auto_range=True):
         """Rebuild render mode from current settings and re-weight the grid."""
-        if self._render_mode_name == "WeightedAverage":
+        if self._render_mode_name in ("WeightedAverage", "WeightedVariance"):
             weights = self._project_field(self._sd_field)
             qty = self._project_field(self._wa_data_field)
             label = self._wa_data_field
             if self._wa_data_field in self._vector_fields:
                 label = f"{self._wa_data_field} ({self._vector_projection})"
-            self._render_mode = RenderMode.mass_weighted_average(label, self._sd_field)
+            if self._render_mode_name == "WeightedVariance":
+                self._render_mode = RenderMode.weighted_variance(label, self._sd_field)
+            else:
+                self._render_mode = RenderMode.mass_weighted_average(label, self._sd_field)
         else:
             weights = self._compute_weights()
             qty = None
@@ -255,7 +258,8 @@ class DataFlyerApp:
         self.renderer.resolve_mode = self._render_mode.resolve_mode
         self.renderer.update_weights(weights, qty)
         self.renderer.update_visible(self.camera)
-        self._needs_auto_range = True
+        if auto_range:
+            self._needs_auto_range = True
 
     def _set_sd_field(self, field_name):
         """Change the primary surface density weight field."""
@@ -529,7 +533,7 @@ class DataFlyerApp:
                 if self._still_frames >= 2 and self._refinement_level < 3:
                     # Recompute LOS projection if camera rotated since last compute
                     if self._refinement_level == 0 and self._is_los_stale():
-                        self._apply_render_mode()
+                        self._apply_render_mode(auto_range=False)
                     saved_lod = self.renderer.lod_pixels
                     saved_budget = self.renderer.max_render_particles
                     if self._refinement_level == 0:

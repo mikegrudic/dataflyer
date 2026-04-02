@@ -7,6 +7,7 @@ in float v_quantity;
 
 layout(location = 0) out float out_numerator;
 layout(location = 1) out float out_denominator;
+layout(location = 2) out float out_sq;
 
 uniform int u_kernel;  // 0: cubic spline, 1: Wendland C2, 2: Gaussian, 3: quartic, 4: sphere
 
@@ -46,4 +47,5 @@ void main() {
 
     out_numerator = sigma * v_quantity;
     out_denominator = sigma;
+    out_sq = sigma * v_quantity * v_quantity;
 }
