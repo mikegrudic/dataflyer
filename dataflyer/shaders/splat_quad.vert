@@ -18,9 +18,12 @@ out float v_quantity;
 
 void main() {
     vec4 view_center = u_view * vec4(in_position, 1.0);
-    vec4 view_pos = view_center;
-    view_pos.xy += in_corner * in_hsml;
-    gl_Position = u_proj * view_pos;
+    vec4 clip_center = u_proj * view_center;
+
+    // Offset in clip space so the quad is a screen-space square
+    // (avoids perspective distortion of off-axis particles)
+    gl_Position = clip_center;
+    gl_Position.xy += in_corner * in_hsml * vec2(u_proj[0][0], u_proj[1][1]);
 
     v_offset = in_corner;
     v_mass = in_mass;
