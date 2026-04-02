@@ -114,6 +114,9 @@ class DataFlyerApp:
         self._gpu_query = self.ctx.query(time=True)
         self._gpu_render_ns = 0  # last completed query result in nanoseconds
 
+        # Key action table
+        self._key_actions = self._build_key_actions()
+
     def _load_snapshot(self, path):
         """Load a new snapshot, keeping the current camera position."""
         import os
@@ -205,149 +208,124 @@ class DataFlyerApp:
         self._msg(f"Colormap: {name}")
         self._set_colormap(name)
 
+    def _contract_range(self):
+        mid = (self.renderer.qty_min + self.renderer.qty_max) / 2
+        half = (self.renderer.qty_max - self.renderer.qty_min) / 2 * 0.8
+        self.renderer.qty_min = mid - half
+        self.renderer.qty_max = mid + half
+        self._msg(f"Range: {self._range_str()}")
+
+    def _expand_range(self):
+        mid = (self.renderer.qty_min + self.renderer.qty_max) / 2
+        half = (self.renderer.qty_max - self.renderer.qty_min) / 2 * 1.25
+        self.renderer.qty_min = mid - half
+        self.renderer.qty_max = mid + half
+        self._msg(f"Range: {self._range_str()}")
+
+    def _increase_lod(self):
+        self.renderer.lod_pixels = max(1, self.renderer.lod_pixels // 2)
+        self._msg(f"LOD: {self.renderer.lod_pixels}px (more detail)")
+        self._refinement_level = 0
+        self.renderer.update_visible(self.camera)
+
+    def _decrease_lod(self):
+        self.renderer.lod_pixels = min(256, self.renderer.lod_pixels * 2)
+        self._msg(f"LOD: {self.renderer.lod_pixels}px (faster)")
+        self._refinement_level = 0
+        self.renderer.update_visible(self.camera)
+
+    def _increase_budget(self):
+        self.renderer.max_render_particles = min(
+            self.renderer.n_total, int(self.renderer.max_render_particles * 2))
+        self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
+        self._refinement_level = 0
+        self.renderer.update_visible(self.camera)
+
+    def _decrease_budget(self):
+        self.renderer.max_render_particles = max(
+            100_000, self.renderer.max_render_particles // 2)
+        self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
+        self._refinement_level = 0
+        self.renderer.update_visible(self.camera)
+
+    def _toggle_log_scale(self):
+        self.renderer.log_scale = 1 - self.renderer.log_scale
+        self._msg(f"Scale: {'log' if self.renderer.log_scale else 'linear'}")
+        self._needs_auto_range = True
+
+    def _toggle_overlay(self):
+        self.overlay.enabled = not self.overlay.enabled
+        self._msg(f"Dev overlay: {'on' if self.overlay.enabled else 'off'}")
+
+    def _toggle_importance_sampling(self):
+        self.renderer.use_importance_sampling = not self.renderer.use_importance_sampling
+        self._msg(f"Importance sampling: {'on' if self.renderer.use_importance_sampling else 'off'}")
+        self.renderer.update_visible(self.camera)
+
+    def _cycle_kernel(self):
+        kernels = self.renderer.KERNELS
+        idx = (kernels.index(self.renderer.kernel) + 1) % len(kernels)
+        self.renderer.kernel = kernels[idx]
+        self._msg(f"Kernel: {self.renderer.kernel}")
+
+    def _toggle_tree(self):
+        self.renderer.use_tree = not self.renderer.use_tree
+        self._msg(f"Tree: {'on' if self.renderer.use_tree else 'off'}")
+        if self.renderer.use_tree and self.renderer._grid is None:
+            weights = self._compute_weights()
+            self.renderer.set_particles(self.data.positions, self.data.hsml, weights)
+        elif not self.renderer.use_tree:
+            self.renderer._grid = None
+        self.renderer.update_visible(self.camera)
+
+    def _next_snapshot(self):
+        if len(self._snap_list) > 1:
+            self._snap_idx = min(self._snap_idx + 1, len(self._snap_list) - 1)
+            self._load_snapshot(self._snap_list[self._snap_idx])
+
+    def _prev_snapshot(self):
+        if len(self._snap_list) > 1:
+            self._snap_idx = max(self._snap_idx - 1, 0)
+            self._load_snapshot(self._snap_list[self._snap_idx])
+
+    def _build_key_actions(self):
+        """Build the key -> (handler, description) action table."""
+        return {
+            glfw.KEY_C:             (self._cycle_colormap,          "Next colormap"),
+            glfw.KEY_RIGHT:         (self._next_snapshot,           "Next snapshot"),
+            glfw.KEY_LEFT:          (self._prev_snapshot,           "Previous snapshot"),
+            glfw.KEY_R:             (self._auto_range_from_framebuffer, "Auto-range"),
+            glfw.KEY_EQUAL:         (self._contract_range,          "Contract range"),
+            glfw.KEY_KP_ADD:        (self._contract_range,          None),
+            glfw.KEY_MINUS:         (self._expand_range,            "Expand range"),
+            glfw.KEY_KP_SUBTRACT:   (self._expand_range,            None),
+            glfw.KEY_RIGHT_BRACKET: (self._increase_lod,            "More LOD detail"),
+            glfw.KEY_LEFT_BRACKET:  (self._decrease_lod,            "Less LOD detail"),
+            glfw.KEY_PERIOD:        (self._increase_budget,         "More particles"),
+            glfw.KEY_COMMA:         (self._decrease_budget,         "Fewer particles"),
+            glfw.KEY_L:             (self._toggle_log_scale,        "Toggle log/linear"),
+            glfw.KEY_P:             (self._screenshot,              "Screenshot"),
+            glfw.KEY_BACKSLASH:     (self._toggle_overlay,          "Toggle dev overlay"),
+            glfw.KEY_I:             (self._toggle_importance_sampling, "Toggle importance sampling"),
+            glfw.KEY_K:             (self._cycle_kernel,            "Cycle kernel"),
+            glfw.KEY_T:             (self._toggle_tree,             "Toggle tree"),
+            glfw.KEY_H:             (self._print_help,              "Print help"),
+        }
+
     def _key_callback(self, window, key, scancode, action, mods):
-        # User menu editable fields consume keys first
         if self.user_menu.on_key(key, action):
             return
-
         if action != glfw.PRESS:
             self.camera.on_key(key, action)
             return
-
         if key == glfw.KEY_ESCAPE:
             glfw.set_window_should_close(window, True)
             return
-
-        # C: cycle colormap
-        if key == glfw.KEY_C:
-            self._cycle_colormap(1)
-            return
-
-        # Left/Right: navigate snapshots
-        if key == glfw.KEY_RIGHT and len(self._snap_list) > 1:
-            step = 1
-            self._snap_idx = min(self._snap_idx + step, len(self._snap_list) - 1)
-            self._load_snapshot(self._snap_list[self._snap_idx])
-            return
-        if key == glfw.KEY_LEFT and len(self._snap_list) > 1:
-            step = 1
-            self._snap_idx = max(self._snap_idx - step, 0)
-            self._load_snapshot(self._snap_list[self._snap_idx])
-            return
-
-        # R: auto-range from rendered image
-        if key == glfw.KEY_R:
-            self._auto_range_from_framebuffer()
-            return
-
-        # +/-: expand/contract dynamic range
-        if key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
-            mid = (self.renderer.qty_min + self.renderer.qty_max) / 2
-            half = (self.renderer.qty_max - self.renderer.qty_min) / 2
-            half *= 0.8  # contract = more contrast
-            self.renderer.qty_min = mid - half
-            self.renderer.qty_max = mid + half
-            self._msg(f"Range: {self._range_str()}")
-            return
-        if key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
-            mid = (self.renderer.qty_min + self.renderer.qty_max) / 2
-            half = (self.renderer.qty_max - self.renderer.qty_min) / 2
-            half *= 1.25  # expand = less contrast
-            self.renderer.qty_min = mid - half
-            self.renderer.qty_max = mid + half
-            self._msg(f"Range: {self._range_str()}")
-            return
-
-        # [/]: adjust LOD pixel threshold (more/less detail)
-        if key == glfw.KEY_RIGHT_BRACKET:
-            self.renderer.lod_pixels = max(1, self.renderer.lod_pixels // 2)
-            self._msg(f"LOD: {self.renderer.lod_pixels}px (more detail)")
-            self._refinement_level = 0
-            self.renderer.update_visible(self.camera)
-            return
-        if key == glfw.KEY_LEFT_BRACKET:
-            self.renderer.lod_pixels = min(256, self.renderer.lod_pixels * 2)
-            self._msg(f"LOD: {self.renderer.lod_pixels}px (faster)")
-            self._refinement_level = 0
-            self.renderer.update_visible(self.camera)
-            return
-
-        # </>: adjust max particle budget (subsampling level)
-        if key == glfw.KEY_PERIOD:
-            self.renderer.max_render_particles = min(
-                self.renderer.n_total,
-                int(self.renderer.max_render_particles * 2),
-            )
-            self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
-            self._refinement_level = 0
-            self.renderer.update_visible(self.camera)
-            return
-        if key == glfw.KEY_COMMA:
-            self.renderer.max_render_particles = max(
-                100_000,
-                self.renderer.max_render_particles // 2,
-            )
-            self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
-            self._refinement_level = 0
-            self.renderer.update_visible(self.camera)
-            return
-
-        # L: toggle log/linear scale
-        if key == glfw.KEY_L:
-            self.renderer.log_scale = 1 - self.renderer.log_scale
-            scale_name = "log" if self.renderer.log_scale else "linear"
-            self._msg(f"Scale: {scale_name}")
-            self._needs_auto_range = True
-            return
-
-        # P: screenshot
-        if key == glfw.KEY_P:
-            self._screenshot()
-            return
-
-        # \: toggle dev overlay
-        if key == glfw.KEY_BACKSLASH:
-            self.overlay.enabled = not self.overlay.enabled
-            self._msg(f"Dev overlay: {'on' if self.overlay.enabled else 'off'}")
-            return
-
-        # I: toggle importance-weighted subsampling
-        if key == glfw.KEY_I:
-            self.renderer.use_importance_sampling = not self.renderer.use_importance_sampling
-            state = "on" if self.renderer.use_importance_sampling else "off"
-            self._msg(f"Importance sampling: {state}")
-            self.renderer.update_visible(self.camera)
-            return
-
-        # K: cycle kernel
-        if key == glfw.KEY_K:
-            kernels = self.renderer.KERNELS
-            idx = (kernels.index(self.renderer.kernel) + 1) % len(kernels)
-            self.renderer.kernel = kernels[idx]
-            self._msg(f"Kernel: {self.renderer.kernel}")
-            return
-
-        # T: toggle tree
-        if key == glfw.KEY_T:
-            self.renderer.use_tree = not self.renderer.use_tree
-            state = "on" if self.renderer.use_tree else "off"
-            self._msg(f"Tree: {state}")
-            # Rebuild or discard the grid
-            if self.renderer.use_tree and self.renderer._grid is None:
-                weights = self._compute_weights()
-                self.renderer.set_particles(
-                    self.data.positions, self.data.hsml, weights)
-            elif not self.renderer.use_tree:
-                self.renderer._grid = None
-            self.renderer.update_visible(self.camera)
-            return
-
-        # H: print help
-        if key == glfw.KEY_H:
-            self._print_help()
-            return
-
-        self.camera.on_key(key, action)
+        handler = self._key_actions.get(key)
+        if handler is not None:
+            handler[0]()
+        else:
+            self.camera.on_key(key, action)
 
     def _mouse_button_callback(self, window, button, action, mods):
         if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
@@ -396,23 +374,28 @@ class DataFlyerApp:
         print(f"Screenshot saved: {path}")
 
     def _print_help(self):
+        # Key name lookup for readable output
+        _key_names = {
+            glfw.KEY_RIGHT: "Right", glfw.KEY_LEFT: "Left",
+            glfw.KEY_EQUAL: "+", glfw.KEY_MINUS: "-",
+            glfw.KEY_RIGHT_BRACKET: "]", glfw.KEY_LEFT_BRACKET: "[",
+            glfw.KEY_PERIOD: ">", glfw.KEY_COMMA: "<",
+            glfw.KEY_BACKSLASH: "\\",
+        }
         print("\n--- DataFlyer Controls ---")
         print("  LMB+drag : Look around")
         print("  WASD     : Move")
         print("  Z/X      : Up / Down")
         print("  Q/E      : Roll")
         print("  Scroll   : Adjust fly speed")
-        print("  Left/Right: Previous/next snapshot")
-        print("  C        : Next colormap")
-        print("  +/-      : Contract/expand dynamic range")
-        print("  [/]      : More/less LOD detail")
-        print("  </>      : Fewer/more max particles")
-        print("  R        : Auto-range dynamic range")
-        print("  L        : Toggle log/linear scale")
-        print("  P        : Screenshot")
-        print("  \\        : Toggle dev overlay")
-        print("  H        : Print this help")
         print("  ESC      : Quit")
+        seen = set()
+        for key, (_, desc) in self._key_actions.items():
+            if desc is None or desc in seen:
+                continue
+            seen.add(desc)
+            name = _key_names.get(key, chr(key) if 32 < key < 127 else f"key{key}")
+            print(f"  {name:<10s} : {desc}")
         scale = "log" if self.renderer.log_scale else "linear"
         print(f"\n  Render   : {self._render_mode.name}")
         print(f"  Colormap : {AVAILABLE_COLORMAPS[self._cmap_idx]}")
