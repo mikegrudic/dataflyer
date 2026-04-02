@@ -58,6 +58,8 @@ class DataFlyerApp:
 
         # Renderer
         self.renderer = SplatRenderer(self.ctx)
+        fb_w, _ = glfw.get_framebuffer_size(self.window)
+        self.renderer._viewport_width = fb_w
 
         # Dev overlay
         self.overlay = DevOverlay(self.ctx)
@@ -241,11 +243,13 @@ class DataFlyerApp:
         if key == glfw.KEY_RIGHT_BRACKET:
             self.renderer.lod_pixels = max(1, self.renderer.lod_pixels // 2)
             self._msg(f"LOD: {self.renderer.lod_pixels}px (more detail)")
+            self._refinement_level = 0
             self.renderer.update_visible(self.camera)
             return
         if key == glfw.KEY_LEFT_BRACKET:
             self.renderer.lod_pixels = min(256, self.renderer.lod_pixels * 2)
             self._msg(f"LOD: {self.renderer.lod_pixels}px (faster)")
+            self._refinement_level = 0
             self.renderer.update_visible(self.camera)
             return
 
@@ -256,6 +260,7 @@ class DataFlyerApp:
                 int(self.renderer.max_render_particles * 2),
             )
             self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
+            self._refinement_level = 0
             self.renderer.update_visible(self.camera)
             return
         if key == glfw.KEY_COMMA:
@@ -264,6 +269,7 @@ class DataFlyerApp:
                 self.renderer.max_render_particles // 2,
             )
             self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
+            self._refinement_level = 0
             self.renderer.update_visible(self.camera)
             return
 
@@ -435,16 +441,47 @@ class DataFlyerApp:
             # Update camera
             moved = self.camera.update(dt)
 
-            # Re-cull visible particles every frame when camera moves
+            # Re-cull visible particles when camera moves or progressively refine when still
             t_cull = 0.0
             if not hasattr(self, '_was_moving'):
                 self._was_moving = False
-            need_cull = moved or self._was_moving
-            self._was_moving = moved
-            if need_cull and self.renderer.n_total > self.renderer.max_render_particles:
+                self._still_frames = 0
+                self._refinement_level = 0  # 0=moving, 1=stopped, 2=refined, 3=full
+            if moved:
+                self._still_frames = 0
+                if self._refinement_level != 0:
+                    self._refinement_level = 0
                 t0 = time.perf_counter()
                 self.renderer.update_visible(self.camera)
                 t_cull = time.perf_counter() - t0
+            elif self._was_moving or self._refinement_level < 3:
+                self._still_frames += 1
+                # Progressive refinement: relax LOD and budget when stationary
+                if self._still_frames >= 2 and self._refinement_level < 3:
+                    saved_lod = self.renderer.lod_pixels
+                    saved_budget = self.renderer.max_render_particles
+                    if self._refinement_level == 0:
+                        # First refinement: halve LOD threshold
+                        self.renderer.lod_pixels = max(1, saved_lod // 2)
+                        self.renderer.max_render_particles = min(saved_budget * 2, self.renderer.n_total)
+                        self._refinement_level = 1
+                    elif self._refinement_level == 1:
+                        # Second: minimize LOD, double budget again
+                        self.renderer.lod_pixels = 1
+                        self.renderer.max_render_particles = min(saved_budget * 2, self.renderer.n_total)
+                        self._refinement_level = 2
+                    elif self._refinement_level == 2:
+                        # Final: full quality (LOD off, max budget)
+                        self.renderer.lod_pixels = 1
+                        self.renderer.max_render_particles = self.renderer.n_total
+                        self._refinement_level = 3
+                    t0 = time.perf_counter()
+                    self.renderer.update_visible(self.camera)
+                    t_cull = time.perf_counter() - t0
+                    # Restore user settings (renderer uses them next time camera moves)
+                    self.renderer.lod_pixels = saved_lod
+                    self.renderer.max_render_particles = saved_budget
+            self._was_moving = moved
 
             # Get framebuffer size (may differ from window size on retina)
             fb_width, fb_height = glfw.get_framebuffer_size(self.window)

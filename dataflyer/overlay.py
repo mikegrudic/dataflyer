@@ -98,6 +98,8 @@ class DevOverlay:
         # Toggles
         items.append(("toggle", "Tree", renderer.use_tree, "tree"))
         items.append(("toggle", "Importance Sampling", renderer.use_importance_sampling, "importance"))
+        items.append(("toggle", "Hybrid Rendering", renderer.use_hybrid_rendering, "hybrid"))
+        items.append(("toggle", "Quad Rendering", renderer.use_quad_rendering, "quad"))
         items.append(("text", ""))
 
         # Dropdown
@@ -239,6 +241,10 @@ class DevOverlay:
                     renderer.use_tree = not renderer.use_tree
                 elif key == "importance":
                     renderer.use_importance_sampling = not renderer.use_importance_sampling
+                elif key == "hybrid":
+                    renderer.use_hybrid_rendering = not renderer.use_hybrid_rendering
+                elif key == "quad":
+                    renderer.use_quad_rendering = not renderer.use_quad_rendering
                 return True
 
             elif wtype == "dropdown_header":

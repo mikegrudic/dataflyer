@@ -330,7 +330,63 @@ class SpatialGrid:
             "half_diag": float(np.linalg.norm(cs) * 0.5),
         }
 
-    def query_frustum_lod(self, camera, max_particles, lod_pixels=4, importance_sampling=False):
+    def _frustum_cull_finest(self, camera, max_particles, importance_sampling=False):
+        """Fast path: frustum cull directly on finest-level cells, skip tree."""
+        finest = self.levels[0]
+        cam_pos = camera.position
+        cam_fwd = camera.forward
+        cam_right = camera.right
+        cam_up = camera.up
+        fov_rad = np.radians(camera.fov)
+        half_tan = np.tan(fov_rad / 2)
+        hd = finest["half_diag"]
+
+        centers = finest["centers"]
+        depths = centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
+        rights = centers @ cam_right - np.dot(cam_pos, cam_right)
+        ups = centers @ cam_up - np.dot(cam_pos, cam_up)
+
+        front_depth = np.maximum(depths + hd, 0)
+        lim_h = front_depth * half_tan * camera.aspect + hd
+        lim_v = front_depth * half_tan + hd
+        in_front = depths > -(hd + finest["hsml"])
+        has_mass = finest["mass"] > 0
+        visible = has_mass & in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
+
+        vis_cells = np.where(visible)[0]
+        if len(vis_cells) == 0:
+            z3 = np.zeros((0, 3), dtype=np.float32)
+            z1 = np.zeros(0, dtype=np.float32)
+            return z3, z1, z1, z1
+
+        if importance_sampling:
+            dist = np.sqrt(depths[visible] ** 2 + rights[visible] ** 2 + ups[visible] ** 2)
+            safe_dist = np.maximum(dist, 0.01).astype(np.float64)
+            vis_cell_h = finest["hsml"][vis_cells].astype(np.float64)
+            pos, hsml, mass, qty, n_vis = _gather_importance_sampled(
+                finest["cell_start"], vis_cells.astype(np.int64), max_particles,
+                self.sorted_pos, self.sorted_hsml, self.sorted_mass, self.sorted_qty,
+                safe_dist, vis_cell_h,
+            )
+        else:
+            pos, hsml, mass, qty, n_vis = _gather_subsampled_direct(
+                finest["cell_start"], vis_cells.astype(np.int64), max_particles,
+                self.sorted_pos, self.sorted_hsml, self.sorted_mass, self.sorted_qty,
+            )
+
+        n_vis = int(n_vis)
+        n_sampled = len(pos)
+        if not importance_sampling and n_sampled > 0 and n_vis > n_sampled:
+            ratio = n_vis / n_sampled
+            mass = mass * ratio
+            hsml = hsml * (ratio ** (1.0 / 3.0))
+
+        return (
+            pos.astype(np.float32), hsml.astype(np.float32),
+            mass.astype(np.float32), qty.astype(np.float32),
+        )
+
+    def query_frustum_lod(self, camera, max_particles, lod_pixels=4, importance_sampling=False, viewport_width=2048):
         """Top-down multi-level LOD query. Returns (pos, hsml, mass, qty) arrays.
 
         All data comes from pre-sorted arrays built at grid construction time.
@@ -345,12 +401,17 @@ class SpatialGrid:
         with mass and h rescaled to conserve the mass distribution.
         If importance_sampling=True, particles are weighted by angular area.
         """
+        # Fast path: if LOD threshold is very low, skip tree traversal entirely
+        # and frustum-cull directly on the finest level cells.
+        if lod_pixels <= 2:
+            return self._frustum_cull_finest(camera, max_particles, importance_sampling)
+
         cam_pos = camera.position
         cam_fwd = camera.forward
         cam_right = camera.right
         cam_up = camera.up
         fov_rad = np.radians(camera.fov)
-        pix_per_rad = 1024.0 / (2.0 * np.tan(fov_rad / 2))
+        pix_per_rad = viewport_width / (2.0 * np.tan(fov_rad / 2))
         finest = self.levels[0]
         summary_parts = []
         real_pos = None
@@ -573,6 +634,7 @@ class SplatRenderer:
         self._accum_tex_num = None
         self._accum_tex_den = None
         self._fbo_size = (0, 0)
+        self._viewport_width = 1024  # updated each frame in render()
 
         # Resolve VAO
         self.vao_resolve = ctx.vertex_array(
@@ -595,13 +657,15 @@ class SplatRenderer:
         self.qty_min = -1.0
         self.qty_max = 3.0
         self.mode = 0  # 0: surface density, 1: weighted quantity
-        self.lod_pixels = 1  # cells subtending fewer pixels than this get summarized
+        self.lod_pixels = 4  # cells subtending fewer pixels than this get summarized
         self.log_scale = 1  # 1: log10, 0: linear
         self.max_render_particles = MAX_RENDER_PARTICLES
         self.use_tree = True
         self.use_importance_sampling = False
         self.KERNELS = ["cubic_spline", "wendland_c2", "gaussian", "quartic", "sphere"]
         self.kernel = "cubic_spline"
+        self.use_hybrid_rendering = True  # use quads for >64px particles
+        self.use_quad_rendering = False  # True = all quads (pre-optimization path)
 
     def set_particles(self, positions, hsml, masses, quantity=None):
         """Store particle data on CPU. Call update_visible() to upload a subset."""
@@ -634,6 +698,7 @@ class SplatRenderer:
                 self.max_render_particles,
                 lod_pixels=self.lod_pixels,
                 importance_sampling=self.use_importance_sampling,
+                viewport_width=self._viewport_width,
             )
             self._upload_arrays(pos, hsml, mass, qty, camera)
         else:
@@ -653,8 +718,9 @@ class SplatRenderer:
                 qty = self._all_qty[idx]
                 self._upload_arrays(pos, hsml.astype(np.float32), mass.astype(np.float32), qty, camera)
             else:
-                self._upload_arrays(self._all_pos[idx], self._all_hsml[idx],
-                                    self._all_mass[idx], self._all_qty[idx], camera)
+                self._upload_arrays(
+                    self._all_pos[idx], self._all_hsml[idx], self._all_mass[idx], self._all_qty[idx], camera
+                )
 
     def _upload_arrays(self, pos, hsml, mass, qty, camera=None):
         """Upload pre-built arrays to GPU, splitting into points and quads."""
@@ -665,20 +731,45 @@ class SplatRenderer:
             return
 
         # Release old buffers
-        for attr in ("pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo",
-                     "big_pos_vbo", "big_hsml_vbo", "big_mass_vbo", "big_qty_vbo"):
+        for attr in (
+            "pos_vbo",
+            "hsml_vbo",
+            "mass_vbo",
+            "qty_vbo",
+            "big_pos_vbo",
+            "big_hsml_vbo",
+            "big_mass_vbo",
+            "big_qty_vbo",
+        ):
             old = getattr(self, attr, None)
             if old is not None:
                 old.release()
 
+        # Quad-only mode: all particles as instanced quads (pre-optimization path)
+        if self.use_quad_rendering:
+            self.pos_vbo = None
+            self.hsml_vbo = None
+            self.mass_vbo = None
+            self.qty_vbo = None
+            self.big_pos_vbo = self.ctx.buffer(pos.tobytes())
+            self.big_hsml_vbo = self.ctx.buffer(hsml.tobytes())
+            self.big_mass_vbo = self.ctx.buffer(mass.tobytes())
+            self.big_qty_vbo = self.ctx.buffer(qty.tobytes())
+            self.n_particles = 0
+            self.n_big = len(mass)
+            self._build_vao()
+            return
+
         # Split into small (point sprites) and big (instanced quads)
         MAX_POINT_PX = 64.0
-        if camera is not None and len(pos) > 0:
+        if self.use_hybrid_rendering and camera is not None and len(pos) > 0:
+            # Match the shader's pixel size calculation exactly:
+            # desired_pixels = h * proj[0][0] / depth * viewport_x
+            proj = camera.projection_matrix()
+            scale = proj[0, 0] * self._viewport_width
             depths = (pos - camera.position) @ camera.forward
             safe_depths = np.maximum(np.abs(depths), 0.01)
-            # Approximate pixel size: h / depth * proj[0][0] * viewport/2
-            # Use 512 as a conservative viewport half-width
-            point_px = hsml / safe_depths * 512
+            point_px = hsml / safe_depths * scale
             big_mask = point_px > MAX_POINT_PX
         else:
             big_mask = np.zeros(len(mass), dtype=bool)
@@ -787,7 +878,8 @@ class SplatRenderer:
         # Point sprites VAO
         if self.pos_vbo is not None:
             self.vao_additive = self.ctx.vertex_array(
-                self.prog_additive, [
+                self.prog_additive,
+                [
                     (self.pos_vbo, "3f", "in_position"),
                     (self.hsml_vbo, "f", "in_hsml"),
                     (self.mass_vbo, "f", "in_mass"),
@@ -798,7 +890,8 @@ class SplatRenderer:
         # Instanced quads VAO for large particles
         if self.big_pos_vbo is not None:
             self.vao_quad = self.ctx.vertex_array(
-                self.prog_quad, [
+                self.prog_quad,
+                [
                     (self.quad_vbo, "2f", "in_corner"),
                     (self.big_pos_vbo, "3f/i", "in_position"),
                     (self.big_hsml_vbo, "f/i", "in_hsml"),
@@ -827,7 +920,8 @@ class SplatRenderer:
 
     def render(self, camera, width, height):
         """Render particle splats via additive accumulation + resolve."""
-        if self.n_particles == 0 or self.colormap_tex is None:
+        self._viewport_width = width
+        if (self.n_particles == 0 and self.n_big == 0) or self.colormap_tex is None:
             return
 
         # GLSL mat4 is column-major; numpy is row-major
@@ -942,13 +1036,30 @@ class SplatRenderer:
     def release(self):
         """Clean up GPU resources."""
         for attr in (
-            "pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo",
-            "big_pos_vbo", "big_hsml_vbo", "big_mass_vbo", "big_qty_vbo",
-            "quad_vbo", "quad_ibo", "fs_quad_vbo",
-            "star_pos_vbo", "star_mass_vbo",
-            "vao_additive", "vao_quad", "vao_resolve", "vao_star",
-            "prog_additive", "prog_quad", "prog_resolve", "prog_star",
-            "_accum_fbo", "_accum_tex_num", "_accum_tex_den",
+            "pos_vbo",
+            "hsml_vbo",
+            "mass_vbo",
+            "qty_vbo",
+            "big_pos_vbo",
+            "big_hsml_vbo",
+            "big_mass_vbo",
+            "big_qty_vbo",
+            "quad_vbo",
+            "quad_ibo",
+            "fs_quad_vbo",
+            "star_pos_vbo",
+            "star_mass_vbo",
+            "vao_additive",
+            "vao_quad",
+            "vao_resolve",
+            "vao_star",
+            "prog_additive",
+            "prog_quad",
+            "prog_resolve",
+            "prog_star",
+            "_accum_fbo",
+            "_accum_tex_num",
+            "_accum_tex_den",
         ):
             obj = getattr(self, attr, None)
             if obj is not None:
