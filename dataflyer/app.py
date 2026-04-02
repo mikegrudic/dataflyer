@@ -264,9 +264,9 @@ class DataFlyerApp:
     def _apply_render_mode(self, auto_range=True):
         """Rebuild render mode from current settings and re-weight the grid."""
         # Reset progressive refinement so it restarts from the new data
-        self._refinement_level = 0
-        self._saved_lod = None
-        self._saved_budget = None
+        self._refine_budget = 0
+        self._refine_saved_lod = None
+        self._refine_saved_budget = None
         self._composite = (self._render_mode_name == "Composite")
         if self._composite:
             self._render_mode = RenderMode(
@@ -420,12 +420,14 @@ class DataFlyerApp:
 
     def _increase_lod(self):
         self.renderer.lod_pixels = max(1, self.renderer.lod_pixels // 2)
+        self._user_lod = self.renderer.lod_pixels
         self._msg(f"LOD: {self.renderer.lod_pixels}px (more detail)")
         self._refinement_level = 0
         self.renderer.update_visible(self.camera)
 
     def _decrease_lod(self):
         self.renderer.lod_pixels = min(256, self.renderer.lod_pixels * 2)
+        self._user_lod = self.renderer.lod_pixels
         self._msg(f"LOD: {self.renderer.lod_pixels}px (faster)")
         self._refinement_level = 0
         self.renderer.update_visible(self.camera)
@@ -433,6 +435,7 @@ class DataFlyerApp:
     def _increase_budget(self):
         self.renderer.max_render_particles = min(
             self.renderer.n_total, int(self.renderer.max_render_particles * 2))
+        self._user_budget = self.renderer.max_render_particles
         self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
         self._refinement_level = 0
         self.renderer.update_visible(self.camera)
@@ -440,6 +443,7 @@ class DataFlyerApp:
     def _decrease_budget(self):
         self.renderer.max_render_particles = max(
             100_000, self.renderer.max_render_particles // 2)
+        self._user_budget = self.renderer.max_render_particles
         self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
         self._refinement_level = 0
         self.renderer.update_visible(self.camera)
@@ -539,9 +543,13 @@ class DataFlyerApp:
                 return
             # Dev overlay
             if self.overlay.enabled and self.overlay.on_click(fx, fy, self.renderer):
-                self._refinement_level = 0
-                self._saved_lod = None
-                self._saved_budget = None
+                self._refine_budget = 0
+                self._refine_saved_lod = None
+                self._refine_saved_budget = None
+                # When auto-LOD is turned off, snap to user base values
+                if not self.renderer.auto_lod:
+                    self.renderer.lod_pixels = self._user_lod
+                    self.renderer.max_render_particles = self._user_budget
                 self.renderer.update_visible(self.camera)
                 return
         self.camera.on_mouse_button(button, action)
@@ -649,79 +657,92 @@ class DataFlyerApp:
             # Update camera
             moved = self.camera.update(dt)
 
-            # Re-cull visible particles when camera moves or progressively refine when still
+            # --- Cull / progressive refinement / auto-LOD ---
             t_cull = 0.0
             if not hasattr(self, '_was_moving'):
                 self._was_moving = False
-                self._still_frames = 0
-                self._refinement_level = 0  # 0=moving, 1=stopped, 2=refined, 3=full
                 self._last_cull_time = 0.0
-                self._saved_lod = None
-                self._saved_budget = None
+                self._user_lod = self.renderer.lod_pixels
+                self._user_budget = self.renderer.max_render_particles
+                self._smooth_frame_ms = 0.0
+                self._last_lod_adjust = 0.0
+                self._refine_budget = 0
+                self._refine_saved_lod = None
+                self._refine_saved_budget = None
+
             if moved:
-                self._still_frames = 0
-                if self._refinement_level != 0:
-                    self._refinement_level = 0
-                # Auto-LOD: adjust lod_pixels/budget to target 5 FPS (200ms) while moving
-                if self.renderer.auto_lod and dt > 0:
+                # --- MOVING: auto-LOD + throttled cull ---
+                # Restore user base if coming out of refinement
+                if self._refine_saved_lod is not None:
+                    self.renderer.lod_pixels = self._user_lod
+                    self.renderer.max_render_particles = self._user_budget
+                    self._refine_saved_lod = None
+                    self._refine_saved_budget = None
+                self._refine_budget = 0
+
+                # Smoothed frame time (EMA, only while moving)
+                if dt > 0:
+                    if not self._was_moving:
+                        self._smooth_frame_ms = 0.0  # don't seed from idle frame
+                    elif self._smooth_frame_ms == 0.0:
+                        self._smooth_frame_ms = dt * 1000
+                    else:
+                        tau = max(self.renderer.auto_lod_smooth, 0.01)
+                        a = min(dt / tau, 1.0)
+                        self._smooth_frame_ms = (1 - a) * self._smooth_frame_ms + a * dt * 1000
+
+                # Auto-LOD: 2x adjust, at most once per tau
+                tau = max(self.renderer.auto_lod_smooth, 0.01)
+                if self.renderer.auto_lod and self._smooth_frame_ms > 0 and (now - self._last_lod_adjust) >= tau:
                     target_ms = 1000.0 / max(self.renderer.target_fps, 1.0)
-                    frame_ms = dt * 1000
-                    if frame_ms > target_ms * 1.5:
-                        # Too slow: coarsen LOD or reduce budget
+                    if self._smooth_frame_ms > target_ms:
                         self.renderer.lod_pixels = min(256, self.renderer.lod_pixels * 2)
-                        self.renderer.max_render_particles = max(
-                            100_000, self.renderer.max_render_particles // 2)
-                    elif frame_ms > target_ms:
-                        self.renderer.lod_pixels = min(256, self.renderer.lod_pixels + 1)
-                    elif frame_ms < target_ms * 0.5 and self.renderer.lod_pixels > 1:
-                        # Fast enough: increase quality
-                        self.renderer.lod_pixels = max(1, self.renderer.lod_pixels - 1)
-                        self.renderer.max_render_particles = min(
-                            self.renderer.n_total,
-                            int(self.renderer.max_render_particles * 1.5))
-                # Throttle culls: skip if less than cull_interval since last cull
+                        self.renderer.max_render_particles = max(100_000, self.renderer.max_render_particles // 2)
+                        self._last_lod_adjust = now
+                    elif self._smooth_frame_ms < target_ms * 0.5:
+                        self.renderer.lod_pixels = max(1, self.renderer.lod_pixels // 2)
+                        self.renderer.max_render_particles = min(self.renderer.n_total, self.renderer.max_render_particles * 2)
+                        self._last_lod_adjust = now
+
+                # Throttled cull
                 if now - self._last_cull_time >= self.renderer.cull_interval:
                     if not self._composite:
                         t0 = time.perf_counter()
                         self.renderer.update_visible(self.camera)
                         t_cull = time.perf_counter() - t0
                     self._last_cull_time = now
-            elif self._was_moving or self._refinement_level < 3:
-                self._still_frames += 1
-                # Progressive refinement: relax LOD and budget when stationary
-                if self._still_frames >= 2 and self._refinement_level < 3:
-                    # Recompute LOS projection if camera rotated since last compute
-                    if self._refinement_level == 0 and self._is_los_stale():
+
+            elif self._refine_budget < self.renderer.n_total:
+                # --- STOPPED: progressive refinement ---
+                if self._was_moving:
+                    self._smooth_frame_ms = 0.0
+                    # LOS recompute if needed
+                    if self._is_los_stale():
                         self._apply_render_mode(auto_range=False)
-                    if self._saved_lod is None:
-                        self._saved_lod = self.renderer.lod_pixels
-                        self._saved_budget = self.renderer.max_render_particles
-                    if self._refinement_level == 0:
-                        self.renderer.lod_pixels = max(1, self._saved_lod // 2)
-                        self.renderer.max_render_particles = min(self._saved_budget * 2, self.renderer.n_total)
-                        self._refinement_level = 1
-                    elif self._refinement_level == 1:
-                        self.renderer.lod_pixels = 1
-                        self.renderer.max_render_particles = min(self._saved_budget * 2, self.renderer.n_total)
-                        self._refinement_level = 2
-                    elif self._refinement_level == 2:
-                        self.renderer.lod_pixels = 1
-                        self.renderer.max_render_particles = self.renderer.n_total
-                        self._refinement_level = 3
-                    if not self._composite:
-                        # Non-composite: cull now with refined settings, then restore
-                        t0 = time.perf_counter()
-                        self.renderer.update_visible(self.camera)
-                        t_cull = time.perf_counter() - t0
-                        self.renderer.lod_pixels = self._saved_lod
-                        self.renderer.max_render_particles = self._saved_budget
-                    # Composite: leave refined settings active for _render_composite_frame
-            if moved and self._saved_lod is not None:
-                # Camera started moving again — restore user settings
-                self.renderer.lod_pixels = self._saved_lod
-                self.renderer.max_render_particles = self._saved_budget
-                self._saved_lod = None
-                self._saved_budget = None
+                    # Save current settings, start refinement from user base
+                    self._refine_saved_lod = self.renderer.lod_pixels
+                    self._refine_saved_budget = self.renderer.max_render_particles
+                    self._refine_budget = max(self._user_budget, 4_000_000)
+
+                # Ensure base budget is set (handles case where camera never moved)
+                if self._refine_budget == 0:
+                    self._refine_budget = max(self._user_budget, 4_000_000)
+                    self._refine_saved_lod = self.renderer.lod_pixels
+                    self._refine_saved_budget = self.renderer.max_render_particles
+                # Double budget each frame
+                self._refine_budget = min(self._refine_budget * 2, self.renderer.n_total)
+                self.renderer.lod_pixels = 1
+                self.renderer.max_render_particles = self._refine_budget
+
+                if not self._composite:
+                    t0 = time.perf_counter()
+                    self.renderer.update_visible(self.camera)
+                    t_cull = time.perf_counter() - t0
+                    # Restore (render uses the data already uploaded by update_visible)
+                    if self._refine_saved_lod is not None:
+                        self.renderer.lod_pixels = self._refine_saved_lod
+                        self.renderer.max_render_particles = self._refine_saved_budget
+
             self._was_moving = moved
 
             # Get framebuffer size (may differ from window size on retina)
@@ -749,8 +770,12 @@ class DataFlyerApp:
 
             # Update timing stats (exponential moving average)
             alpha = 0.2
-            if t_cull > 0:
-                self._timings["cull"] = self._timings["cull"] * (1 - alpha) + t_cull * alpha
+            r = self.renderer
+            cull_s = getattr(r, '_last_cull_ms', 0) / 1000
+            upload_s = getattr(r, '_last_upload_ms', 0) / 1000
+            if cull_s > 0 or upload_s > 0:
+                self._timings["cull"] = self._timings["cull"] * (1 - alpha) + cull_s * alpha
+                self._timings["upload"] = self._timings["upload"] * (1 - alpha) + upload_s * alpha
             self._timings["render"] = self._timings["render"] * (1 - alpha) + t_render_gpu * alpha
 
             # UI overlays
@@ -772,10 +797,12 @@ class DataFlyerApp:
 
                 if self.overlay.enabled:
                     self.overlay.set_framebuffer_size(fb_width, fb_height)
+                    smooth_fps = 1000.0 / max(self._smooth_frame_ms, 1.0) if self._smooth_frame_ms > 0 else 0.0
                     self.overlay.update(
                         self.renderer, self.camera, self._fps,
                         self._render_mode.name, AVAILABLE_COLORMAPS[self._cmap_idx],
-                        self._timings, self._last_message, self.renderer.cull_interval,
+                        self._timings, self._last_message,
+                        smooth_fps=smooth_fps,
                     )
                     self.overlay.render()
 

@@ -352,7 +352,7 @@ class DevOverlay(Panel):
         self.enabled = False
         self._last_message = ""
 
-    def update(self, renderer, camera, fps, render_mode_name, cmap_name, timings, message, cull_interval=0.5):
+    def update(self, renderer, camera, fps, render_mode_name, cmap_name, timings, message, smooth_fps=0.0):
         if not self.enabled:
             return
         self._last_message = message
@@ -362,10 +362,11 @@ class DevOverlay(Panel):
         n_tot = renderer.n_total
         scale = "log" if renderer.log_scale else "linear"
 
-        items.append(("text", f"FPS: {fps:.0f}"))
+        smooth_str = f"  (smooth: {smooth_fps:.0f})" if smooth_fps > 0 else ""
+        items.append(("text", f"FPS: {fps:.0f}{smooth_str}"))
         items.append(("text", f"Particles: {n_vis:,} / {n_tot:,}"))
         items.append(("text", f"LOD: {renderer.lod_pixels}px  Budget: {renderer.max_render_particles/1e6:.1f}M"))
-        items.append(("text", f"Cull: {timings.get('cull',0)*1000:.0f}ms  Render: {timings.get('render',0)*1000:.0f}ms  Throttle: {cull_interval*1000:.0f}ms"))
+        items.append(("text", f"Cull: {timings.get('cull',0)*1000:.0f}ms  Upload: {timings.get('upload',0)*1000:.0f}ms  Render: {timings.get('render',0)*1000:.0f}ms"))
         if renderer.log_scale:
             range_str = f"10^{renderer.qty_min:.2f} .. 10^{renderer.qty_max:.2f}"
         else:
@@ -382,9 +383,11 @@ class DevOverlay(Panel):
         items.append(("toggle", "Hybrid Rendering", renderer.use_hybrid_rendering, "use_hybrid_rendering"))
         items.append(("toggle", "Quad Rendering", renderer.use_quad_rendering, "use_quad_rendering"))
         items.append(("toggle", "Aniso Summaries", renderer.use_aniso_summaries, "use_aniso_summaries"))
+        items.append(("toggle", "Bypass Cull", renderer.bypass_cull, "bypass_cull"))
         items.append(("toggle", "Auto LOD", renderer.auto_lod, "auto_lod"))
         if renderer.auto_lod:
             items.append(("slider", "Target FPS", renderer.target_fps, 1.0, 60.0, "target_fps"))
+            items.append(("slider", "LOD Smooth (s)", renderer.auto_lod_smooth, 0.1, 5.0, "auto_lod_smooth"))
         items.append(("text", ""))
 
         items.append(("dropdown", "Kernel", renderer.kernel, renderer.KERNELS, "kernel"))

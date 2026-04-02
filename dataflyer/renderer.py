@@ -304,8 +304,10 @@ class SplatRenderer:
         self.summary_scale = 1.0  # scaling factor applied to summary splats
         self.summary_overlap = 0.1  # cell-size padding to bridge voids at tree boundaries
         self.use_aniso_summaries = True  # False = isotropic spherical summaries
+        self.bypass_cull = False  # render all particles without frustum culling
         self.auto_lod = True  # auto-tune LOD to maintain target FPS while moving
         self.target_fps = 15.0  # target FPS for auto-LOD
+        self.auto_lod_smooth = 1.0  # EMA smoothing timescale in seconds
         self.cull_interval = 0.5  # seconds between culls while moving
         self._needs_grid_rebuild = False
 
@@ -348,7 +350,17 @@ class SplatRenderer:
 
     def update_visible(self, camera):
         """Cull and upload only visible particles for this frame."""
+        import time as _time
+        self._last_cull_ms = 0.0
+        self._last_upload_ms = 0.0
+
         if self._all_pos is None:
+            return
+
+        if self.bypass_cull:
+            t0 = _time.perf_counter()
+            self._upload_arrays(self._all_pos, self._all_hsml, self._all_mass, self._all_qty, camera)
+            self._last_upload_ms = (_time.perf_counter() - t0) * 1000
             return
 
         if self._needs_grid_rebuild:
@@ -362,6 +374,7 @@ class SplatRenderer:
                 self._grid = None
 
         if self._grid is not None:
+            t0 = _time.perf_counter()
             result = self._grid.query_frustum_lod(
                 camera,
                 self.max_render_particles,
@@ -370,6 +383,8 @@ class SplatRenderer:
                 viewport_width=self._viewport_width,
                 summary_overlap=self.summary_overlap,
             )
+            self._last_cull_ms = (_time.perf_counter() - t0) * 1000
+            t0 = _time.perf_counter()
             if len(result) == 9:
                 r_pos, r_hsml, r_mass, r_qty, s_pos, s_hsml, s_mass, s_qty, s_cov = result
                 if self.use_aniso_summaries:
@@ -394,6 +409,7 @@ class SplatRenderer:
                 )
         else:
             # No tree: simple numpy frustum cull + subsample
+            t0 = _time.perf_counter()
             cam_fwd = camera.forward
             depths = self._all_pos @ cam_fwd - np.dot(camera.position, cam_fwd)
             in_front = depths > 0
@@ -412,6 +428,7 @@ class SplatRenderer:
                 self._upload_arrays(
                     self._all_pos[idx], self._all_hsml[idx], self._all_mass[idx], self._all_qty[idx], camera
                 )
+        self._last_upload_ms = (_time.perf_counter() - t0) * 1000
 
     def _upload_arrays(self, pos, hsml, mass, qty, camera=None):
         """Upload pre-built arrays to GPU, splitting into points and quads."""
@@ -761,12 +778,22 @@ class SplatRenderer:
         has_negative = (vals < 0).any()
 
         if has_negative:
-            # Negative values: use simple percentiles
-            lim_lo = float(np.percentile(vals, 1))
-            lim_hi = float(np.percentile(vals, 99))
+            # Negative values: O(N) partition for 1st/99th percentiles
+            n = len(vals)
+            k_lo = max(n // 100, 0)
+            k_hi = min(99 * n // 100, n - 1)
+            partitioned = np.partition(vals, (k_lo, k_hi))
+            lim_lo = float(partitioned[k_lo])
+            lim_hi = float(partitioned[k_hi])
         else:
-            # All positive: mass-weighted CDF for signal-aware limits
-            sorted_vals = np.sort(vals)
+            # All positive: mass-weighted CDF for signal-aware limits.
+            # Subsample to cap sort cost at ~100k elements.
+            if len(vals) > 100_000:
+                step = len(vals) // 100_000
+                sub = vals[::step]
+            else:
+                sub = vals
+            sorted_vals = np.sort(sub)
             cdf = sorted_vals.cumsum() / sorted_vals.sum()
             lim_lo = float(np.interp(0.01, cdf, sorted_vals))
             lim_hi = float(np.interp(0.99, cdf, sorted_vals))
