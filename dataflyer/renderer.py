@@ -248,11 +248,11 @@ class SpatialGrid:
             cell_qty[ne_idx] = mq_ne / safe
             cell_mx2[ne_idx] = mp2_ne
             cell_mh2[ne_idx] = mh2_ne
-            # Variance matching using exact kernel <r^2> = 0.1582 * h^2:
-            #   0.1582 * h_summary^2 = 2/3 * V_3d + 0.1582 * <h^2>
-            #   h_summary = sqrt(2/(3*0.1582) * V_3d + <h^2>)
-            #             = sqrt(4.22 * V_3d + <h^2>)
-            h_var = np.sqrt(np.maximum(4.22 * var_ne + mh2_ne / safe, 1e-30))
+            # 3D variance matching using exact kernel <r^2>_3D = 0.225 * h^2:
+            #   0.225 * h_summary^2 = V_3d + 0.225 * <h^2>
+            #   h_summary = sqrt(V_3d / 0.225 + <h^2>)
+            #             = sqrt(4.44 * V_3d + <h^2>)
+            h_var = np.sqrt(np.maximum((1.0 / 0.225) * var_ne + mh2_ne / safe, 1e-30))
             cell_hsml[ne_idx] = h_var
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
@@ -308,7 +308,7 @@ class SpatialGrid:
         cell_com = cell_mp / safe[:, None]
         cell_qty = cell_mq / safe
         var = (cell_mx2 / safe[:, None] - cell_com**2).sum(axis=1)
-        h_var = np.sqrt(np.maximum(4.22 * var + cell_mh2 / safe, 1e-30))
+        h_var = np.sqrt(np.maximum((1.0 / 0.225) * var + cell_mh2 / safe, 1e-30))
         cell_hsml = h_var
 
         cx = np.arange(nc, dtype=np.float32) * cs[0] + self.pmin[0] + cs[0] * 0.5
