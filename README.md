@@ -1,6 +1,6 @@
 # DataFlyer
 
-Real-time 3D fly-through explorer for SPH simulation data.
+Real-time 3D fly-through explorer for unstructured simulation data.
 
 ## Installation
 
