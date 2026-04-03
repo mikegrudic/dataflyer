@@ -440,6 +440,7 @@ class DevOverlay(Panel):
         items.append(("slider", "Summary Scale", renderer.summary_scale, 0.1, 10.0, "summary_scale"))
         items.append(("slider", "Summary Overlap", renderer.summary_overlap, 0.0, 1.0, "summary_overlap"))
         items.append(("slider", "Tree Min N", renderer.tree_min_particles, 0, 1e7, "tree_min_particles"))
+        items.append(("slider", "Tree Cells", renderer.tree_n_cells, 8, 256, "tree_n_cells"))
         items.append(("slider", "Cull Interval", renderer.cull_interval, 0.0, 5.0, "cull_interval"))
         items.append(("text", f"Aniso splats: {renderer.n_aniso:,}"))
 
@@ -480,6 +481,13 @@ class DevOverlay(Panel):
             else:
                 setattr(renderer, key, min(vmax, cur + step))
             if key == "tree_min_particles":
+                renderer._needs_grid_rebuild = True
+            elif key == "tree_n_cells":
+                # Snap to nearest power of 2
+                import math
+                val = getattr(renderer, key)
+                p = max(3, min(8, round(math.log2(max(val, 8)))))  # 8..256
+                setattr(renderer, key, int(2 ** p))
                 renderer._needs_grid_rebuild = True
             return True
 

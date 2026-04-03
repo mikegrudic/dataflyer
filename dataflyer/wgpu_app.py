@@ -475,9 +475,13 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             return
         camera.on_scroll(yoffset)
 
+    def char_callback(win, codepoint):
+        user_menu.on_char(codepoint, app_proxy)
+
     glfw.set_mouse_button_callback(window, mouse_button_callback)
     glfw.set_cursor_pos_callback(window, cursor_callback)
     glfw.set_scroll_callback(window, scroll_callback)
+    glfw.set_char_callback(window, char_callback)
 
     needs_auto_range = True
     ui_hidden = False

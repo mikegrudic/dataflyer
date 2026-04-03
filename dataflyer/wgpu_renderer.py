@@ -65,11 +65,12 @@ class WGPURenderer:
         self.qty_min = -1.0
         self.qty_max = 3.0
         self.resolve_mode = 0
-        self.lod_pixels = 4
+        self.lod_pixels = 16
         self.log_scale = 1
         self.max_render_particles = 4_000_000
         self.use_tree = True
         self.tree_min_particles = 0
+        self.tree_n_cells = 64
         self.use_importance_sampling = False
         self.kernel = "cubic_spline"
         self.use_hybrid_rendering = True
@@ -79,7 +80,7 @@ class WGPURenderer:
         self.summary_overlap = 0.1
         self.use_aniso_summaries = True
         self.bypass_cull = False
-        self.auto_lod = True
+        self.auto_lod = False
         self.target_fps = 15.0
         self.auto_lod_smooth = 1.0
         self.pid_Kp = 0.5
@@ -136,21 +137,15 @@ class WGPURenderer:
         # Camera uniform buffer (shared by splat and star shaders)
         # struct Camera { view: mat4x4, proj: mat4x4, viewport_size: vec2, kernel_id: u32, _pad: u32 }
         # = 64 + 64 + 8 + 4 + 4 = 144 bytes
-        self._camera_buf = dev.create_buffer(
-            size=144, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
-        )
+        self._camera_buf = dev.create_buffer(size=144, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
         # Aniso params uniform buffer
         # struct AnisoParams { cov_scale: f32, _pad: vec3<f32> } = 16 bytes
-        self._aniso_params_buf = dev.create_buffer(
-            size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
-        )
+        self._aniso_params_buf = dev.create_buffer(size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
         # Star params uniform buffer
         # struct StarParams { point_size: f32, _pad: vec3<f32> } = 16 bytes
-        self._star_params_buf = dev.create_buffer(
-            size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
-        )
+        self._star_params_buf = dev.create_buffer(size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
         # Resolve params uniform buffer
         # struct ResolveParams { qty_min: f32, qty_max: f32, mode: u32, log_scale: u32 } = 16 bytes
@@ -166,62 +161,81 @@ class WGPURenderer:
         # Bind group layouts
 
         # Group 0 for splat: camera uniform
-        self._splat_bgl0 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
-             "buffer": {"type": "uniform"}},
-        ])
+        self._splat_bgl0 = dev.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+            ]
+        )
 
         # Group 1 for splat: particle storage buffers (pos, hsml, mass, qty)
-        self._splat_bgl1 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-        ])
+        self._splat_bgl1 = dev.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+                {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+                {"binding": 2, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+                {"binding": 3, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+            ]
+        )
 
         # Group 0 for aniso: camera + aniso_params
-        self._aniso_bgl0 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
-             "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "uniform"}},
-        ])
+        self._aniso_bgl0 = dev.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+                {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "uniform"}},
+            ]
+        )
 
         # Group 1 for aniso: pos, mass, qty, cov storage buffers
-        self._aniso_bgl1 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-        ])
+        self._aniso_bgl1 = dev.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+                {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+                {"binding": 2, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+                {"binding": 3, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+            ]
+        )
 
         # Group 0 for star: camera + star_params
-        self._star_bgl0 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
-             "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "uniform"}},
-        ])
+        self._star_bgl0 = dev.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+                {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "uniform"}},
+            ]
+        )
 
         # Group 1 for star: pos, mass
-        self._star_bgl1 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-        ])
+        self._star_bgl1 = dev.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+                {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+            ]
+        )
 
         # Group 2 for splat: sort index buffer
-        self._splat_bgl2 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
-        ])
+        self._splat_bgl2 = dev.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX, "buffer": {"type": "read-only-storage"}},
+            ]
+        )
 
         # Pipeline layouts
         self._splat_layout = dev.create_pipeline_layout(
             bind_group_layouts=[self._splat_bgl0, self._splat_bgl1, self._splat_bgl2]
         )
-        self._aniso_layout = dev.create_pipeline_layout(
-            bind_group_layouts=[self._aniso_bgl0, self._aniso_bgl1]
-        )
-        self._star_layout = dev.create_pipeline_layout(
-            bind_group_layouts=[self._star_bgl0, self._star_bgl1]
-        )
+        self._aniso_layout = dev.create_pipeline_layout(bind_group_layouts=[self._aniso_bgl0, self._aniso_bgl1])
+        self._star_layout = dev.create_pipeline_layout(bind_group_layouts=[self._star_bgl0, self._star_bgl1])
 
         # Resolve and composite use "auto" layout (simpler, no storage bufs)
         # We'll create these when we know the texture format.
@@ -325,7 +339,8 @@ class WGPURenderer:
         )
 
         self._colormap_sampler = dev.create_sampler(
-            mag_filter="linear", min_filter="linear",
+            mag_filter="linear",
+            min_filter="linear",
             address_mode_u="clamp-to-edge",
         )
 
@@ -340,14 +355,28 @@ class WGPURenderer:
             return
         dev = self.device
 
-        self._resolve_bgl = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.FRAGMENT, "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "unfilterable-float"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "unfilterable-float"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "unfilterable-float"}},
-            {"binding": 4, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "float"}},
-            {"binding": 5, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {"type": "filtering"}},
-        ])
+        self._resolve_bgl = dev.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": wgpu.ShaderStage.FRAGMENT, "buffer": {"type": "uniform"}},
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {
+                    "binding": 3,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {"binding": 4, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "float"}},
+                {"binding": 5, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {"type": "filtering"}},
+            ]
+        )
 
         resolve_layout = dev.create_pipeline_layout(bind_group_layouts=[self._resolve_bgl])
 
@@ -368,17 +397,43 @@ class WGPURenderer:
             return
         dev = self.device
 
-        self._composite_bgl = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.FRAGMENT, "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "unfilterable-float"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "unfilterable-float"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "unfilterable-float"}},
-            {"binding": 4, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "unfilterable-float"}},
-            {"binding": 5, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "unfilterable-float"}},
-            {"binding": 6, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "unfilterable-float"}},
-            {"binding": 7, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "float"}},
-            {"binding": 8, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {"type": "filtering"}},
-        ])
+        self._composite_bgl = dev.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": wgpu.ShaderStage.FRAGMENT, "buffer": {"type": "uniform"}},
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {
+                    "binding": 3,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {
+                    "binding": 4,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {
+                    "binding": 5,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {
+                    "binding": 6,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {"binding": 7, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "float"}},
+                {"binding": 8, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {"type": "filtering"}},
+            ]
+        )
 
         composite_layout = dev.create_pipeline_layout(bind_group_layouts=[self._composite_bgl])
 
@@ -407,9 +462,14 @@ class WGPURenderer:
         self._all_qty = quantity.astype(np.float32)
         self.n_total = len(masses)
 
+        # Set default LOD from particle count: n^(1/3) / 8
+        self.lod_pixels = max(1.0, self.n_total ** (1.0 / 3.0) / 16.0)
+
         if self.use_tree and self.n_total > self.tree_min_particles:
             t0 = time.perf_counter()
-            self._grid = SpatialGrid(self._all_pos, self._all_mass, self._all_hsml, self._all_qty)
+            self._grid = SpatialGrid(
+                self._all_pos, self._all_mass, self._all_hsml, self._all_qty, n_cells=self.tree_n_cells
+            )
             print(f"  Spatial grid built in {time.perf_counter()-t0:.1f}s")
         else:
             self._grid = None
@@ -443,9 +503,12 @@ class WGPURenderer:
         if self._needs_grid_rebuild:
             self._needs_grid_rebuild = False
             from .spatial_grid import SpatialGrid
+
             if self.use_tree and self.n_total > self.tree_min_particles:
                 t0 = time.perf_counter()
-                self._grid = SpatialGrid(self._all_pos, self._all_mass, self._all_hsml, self._all_qty)
+                self._grid = SpatialGrid(
+                    self._all_pos, self._all_mass, self._all_hsml, self._all_qty, n_cells=self.tree_n_cells
+                )
                 print(f"  Spatial grid rebuilt in {time.perf_counter()-t0:.1f}s")
             else:
                 self._grid = None
@@ -453,7 +516,8 @@ class WGPURenderer:
         if self._grid is not None:
             t0 = time.perf_counter()
             result = self._grid.query_frustum_lod(
-                camera, self.max_render_particles,
+                camera,
+                self.max_render_particles,
                 lod_pixels=self.lod_pixels,
                 importance_sampling=self.use_importance_sampling,
                 viewport_width=self._viewport_width,
@@ -473,15 +537,19 @@ class WGPURenderer:
                     qty = np.concatenate([r_qty, s_qty]) if len(r_qty) + len(s_qty) > 0 else r_qty
                     self._upload_arrays(pos, hsml, mass, qty, camera)
                     self._upload_aniso_summaries(
-                        np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                        np.zeros(0, np.float32), np.zeros((0, 6), np.float32),
+                        np.zeros((0, 3), np.float32),
+                        np.zeros(0, np.float32),
+                        np.zeros(0, np.float32),
+                        np.zeros((0, 6), np.float32),
                     )
             else:
                 pos, hsml, mass, qty = result
                 self._upload_arrays(pos, hsml, mass, qty, camera)
                 self._upload_aniso_summaries(
-                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                    np.zeros(0, np.float32), np.zeros((0, 6), np.float32),
+                    np.zeros((0, 3), np.float32),
+                    np.zeros(0, np.float32),
+                    np.zeros(0, np.float32),
+                    np.zeros((0, 6), np.float32),
                 )
         else:
             # No tree: simple frustum cull
@@ -550,11 +618,10 @@ class WGPURenderer:
         """Create identity sort index buffer (no sorting). Cached by size."""
         if n == 0:
             n = 1
-        if hasattr(self, '_identity_sort_n') and self._identity_sort_n >= n:
+        if hasattr(self, "_identity_sort_n") and self._identity_sort_n >= n:
             return  # reuse existing buffer (large enough)
         identity = np.arange(n, dtype=np.uint32)
-        self._sort_index_buf = self.device.create_buffer_with_data(
-            data=identity, usage=wgpu.BufferUsage.STORAGE)
+        self._sort_index_buf = self.device.create_buffer_with_data(data=identity, usage=wgpu.BufferUsage.STORAGE)
         self._sort_bg = self.device.create_bind_group(
             layout=self._splat_bgl2,
             entries=[{"binding": 0, "resource": {"buffer": self._sort_index_buf}}],
@@ -634,8 +701,7 @@ class WGPURenderer:
         pos4[:, :3] = positions.astype(np.float32)
         self._star_bufs = {
             "pos": dev.create_buffer_with_data(data=pos4, usage=wgpu.BufferUsage.STORAGE),
-            "mass": dev.create_buffer_with_data(
-                data=masses.astype(np.float32), usage=wgpu.BufferUsage.STORAGE),
+            "mass": dev.create_buffer_with_data(data=masses.astype(np.float32), usage=wgpu.BufferUsage.STORAGE),
         }
         self._star_bg1 = dev.create_bind_group(
             layout=self._star_bgl1,
@@ -669,9 +735,9 @@ class WGPURenderer:
             tex = dev.create_texture(
                 size=(width, height, 1),
                 format=self._accum_format,
-                usage=(wgpu.TextureUsage.RENDER_ATTACHMENT |
-                       wgpu.TextureUsage.TEXTURE_BINDING |
-                       wgpu.TextureUsage.COPY_SRC),
+                usage=(
+                    wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_SRC
+                ),
             )
             textures.append(tex)
             views.append(tex.create_view())
@@ -696,6 +762,7 @@ class WGPURenderer:
         data_bytes = bytearray(data.tobytes())
         # Write kernel_id at offset 136 (byte 34*4=136)
         import struct
+
         struct.pack_into("I", data_bytes, 136, kernel_id)
         struct.pack_into("I", data_bytes, 140, 0)  # padding
 
@@ -720,7 +787,7 @@ class WGPURenderer:
         )
 
         # Draw regular particles (all as instanced quads)
-        if self.n_particles > 0 and self._particle_bufs and hasattr(self, '_sort_bg'):
+        if self.n_particles > 0 and self._particle_bufs and hasattr(self, "_sort_bg"):
             render_pass.set_pipeline(self._splat_pipeline)
             render_pass.set_bind_group(0, self._camera_bg)
             render_pass.set_bind_group(1, self._particle_bg)
@@ -759,9 +826,8 @@ class WGPURenderer:
 
         # Write resolve params
         import struct
-        resolve_data = struct.pack("ffII",
-                                   self.qty_min, self.qty_max,
-                                   self.resolve_mode, self.log_scale)
+
+        resolve_data = struct.pack("ffII", self.qty_min, self.qty_max, self.resolve_mode, self.log_scale)
         self.device.queue.write_buffer(self._resolve_params_buf, 0, resolve_data)
 
         # Create resolve bind group (references accum textures)
@@ -779,12 +845,14 @@ class WGPURenderer:
 
         encoder = self.device.create_command_encoder()
         render_pass = encoder.begin_render_pass(
-            color_attachments=[{
-                "view": screen_view,
-                "clear_value": (0, 0, 0, 1),
-                "load_op": "clear",
-                "store_op": "store",
-            }],
+            color_attachments=[
+                {
+                    "view": screen_view,
+                    "clear_value": (0, 0, 0, 1),
+                    "load_op": "clear",
+                    "store_op": "store",
+                }
+            ],
         )
         render_pass.set_pipeline(self._resolve_pipeline)
         render_pass.set_bind_group(0, resolve_bg)
@@ -797,11 +865,13 @@ class WGPURenderer:
             self.device.queue.write_buffer(self._star_params_buf, 0, star_data.tobytes())
 
             render_pass2 = encoder.begin_render_pass(
-                color_attachments=[{
-                    "view": screen_view,
-                    "load_op": "load",
-                    "store_op": "store",
-                }],
+                color_attachments=[
+                    {
+                        "view": screen_view,
+                        "load_op": "load",
+                        "store_op": "store",
+                    }
+                ],
             )
             render_pass2.set_pipeline(self._star_pipeline)
             render_pass2.set_bind_group(0, self._star_bg0)
@@ -811,9 +881,7 @@ class WGPURenderer:
 
         self.device.queue.submit([encoder.finish()])
 
-    def render_composite(self, camera, width, height,
-                         mode1, min1, max1, log1,
-                         mode2, min2, max2, log2):
+    def render_composite(self, camera, width, height, mode1, min1, max1, log1, mode2, min2, max2, log2):
         """Composite two pre-filled FBOs."""
         self._viewport_width = width
         self._ensure_fbo(width, height, which=1)
@@ -826,9 +894,8 @@ class WGPURenderer:
         screen_view = current_tex.create_view()
 
         import struct
-        comp_data = struct.pack("ffIIffII",
-                                min1, max1, mode1, log1,
-                                min2, max2, mode2, log2)
+
+        comp_data = struct.pack("ffIIffII", min1, max1, mode1, log1, min2, max2, mode2, log2)
         self.device.queue.write_buffer(self._composite_params_buf, 0, comp_data)
 
         composite_bg = self.device.create_bind_group(
@@ -848,12 +915,14 @@ class WGPURenderer:
 
         encoder = self.device.create_command_encoder()
         render_pass = encoder.begin_render_pass(
-            color_attachments=[{
-                "view": screen_view,
-                "clear_value": (0, 0, 0, 1),
-                "load_op": "clear",
-                "store_op": "store",
-            }],
+            color_attachments=[
+                {
+                    "view": screen_view,
+                    "clear_value": (0, 0, 0, 1),
+                    "load_op": "clear",
+                    "store_op": "store",
+                }
+            ],
         )
         render_pass.set_pipeline(self._composite_pipeline)
         render_pass.set_bind_group(0, composite_bg)
@@ -866,11 +935,13 @@ class WGPURenderer:
             self.device.queue.write_buffer(self._star_params_buf, 0, star_data.tobytes())
 
             render_pass2 = encoder.begin_render_pass(
-                color_attachments=[{
-                    "view": screen_view,
-                    "load_op": "load",
-                    "store_op": "store",
-                }],
+                color_attachments=[
+                    {
+                        "view": screen_view,
+                        "load_op": "load",
+                        "store_op": "store",
+                    }
+                ],
             )
             render_pass2.set_pipeline(self._star_pipeline)
             render_pass2.set_bind_group(0, self._star_bg0)

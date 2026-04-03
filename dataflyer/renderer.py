@@ -33,10 +33,11 @@ class RenderMode:
             weight=Masses, qty=Temperature, resolve_mode=1
             displays: Sigma(Masses * Temperature * W / h^2) / Sigma(Masses * W / h^2)
     """
-    name: str           # display name
-    weight_field: str   # field loaded into the mass/weight slot
-    qty_field: str      # field loaded into the quantity slot
-    resolve_mode: int   # 0: display denominator, 1: display num/denom
+
+    name: str  # display name
+    weight_field: str  # field loaded into the mass/weight slot
+    qty_field: str  # field loaded into the quantity slot
+    resolve_mode: int  # 0: display denominator, 1: display num/denom
 
     @staticmethod
     def surface_density(weight_field="Masses"):
@@ -290,11 +291,12 @@ class SplatRenderer:
         self.qty_min = -1.0
         self.qty_max = 3.0
         self.resolve_mode = 0  # 0: surface density, 1: weighted quantity (set by RenderMode)
-        self.lod_pixels = 4  # cells subtending fewer pixels than this get summarized
+        self.lod_pixels = 16  # cells subtending fewer pixels than this get summarized
         self.log_scale = 1  # 1: log10, 0: linear
         self.max_render_particles = MAX_RENDER_PARTICLES
         self.use_tree = True
         self.tree_min_particles = 0  # only build tree if N > this threshold
+        self.tree_n_cells = 64  # grid cells per side (must be power of 2)
         self.use_importance_sampling = False
         self.KERNELS = ["cubic_spline", "wendland_c2", "gaussian", "quartic", "sphere"]
         self.kernel = "cubic_spline"
@@ -305,7 +307,7 @@ class SplatRenderer:
         self.summary_overlap = 0.1  # cell-size padding to bridge voids at tree boundaries
         self.use_aniso_summaries = True  # False = isotropic spherical summaries
         self.bypass_cull = False  # render all particles without frustum culling
-        self.auto_lod = True  # auto-tune LOD to maintain target FPS while moving
+        self.auto_lod = False  # auto-tune LOD to maintain target FPS while moving
         self.target_fps = 15.0  # target FPS for auto-LOD
         self.auto_lod_smooth = 1.0  # EMA smoothing timescale in seconds
         self.pid_Kp = 0.5  # PID proportional gain (log2-units/sec per unit error)
@@ -324,11 +326,17 @@ class SplatRenderer:
         self._all_qty = quantity.astype(np.float32)
         self.n_total = len(masses)
 
+        # Set default LOD from particle count: n^(1/3) / 8
+        self.lod_pixels = max(1.0, self.n_total ** (1.0 / 3.0) / 16.0)
+
         # Build spatial grid for frustum culling and LOD
         if self.use_tree and self.n_total > self.tree_min_particles:
             import time
+
             t0 = time.perf_counter()
-            self._grid = SpatialGrid(self._all_pos, self._all_mass, self._all_hsml, self._all_qty)
+            self._grid = SpatialGrid(
+                self._all_pos, self._all_mass, self._all_hsml, self._all_qty, n_cells=self.tree_n_cells
+            )
             print(f"  Spatial grid built in {time.perf_counter()-t0:.1f}s")
         else:
             self._grid = None
@@ -346,6 +354,7 @@ class SplatRenderer:
 
         if self._grid is not None:
             import time
+
             t0 = time.perf_counter()
             self._grid.update_weights(masses, quantity)
             print(f"  Grid re-weighted in {time.perf_counter()-t0:.1f}s")
@@ -354,6 +363,7 @@ class SplatRenderer:
     def update_visible(self, camera):
         """Cull and upload only visible particles for this frame."""
         import time as _time
+
         self._last_cull_ms = 0.0
         self._last_upload_ms = 0.0
 
@@ -370,8 +380,11 @@ class SplatRenderer:
             self._needs_grid_rebuild = False
             if self.use_tree and self.n_total > self.tree_min_particles:
                 import time
+
                 t0 = time.perf_counter()
-                self._grid = SpatialGrid(self._all_pos, self._all_mass, self._all_hsml, self._all_qty)
+                self._grid = SpatialGrid(
+                    self._all_pos, self._all_mass, self._all_hsml, self._all_qty, n_cells=self.tree_n_cells
+                )
                 print(f"  Spatial grid rebuilt in {time.perf_counter()-t0:.1f}s")
             else:
                 self._grid = None
@@ -400,15 +413,19 @@ class SplatRenderer:
                     qty = np.concatenate([r_qty, s_qty]) if len(r_qty) + len(s_qty) > 0 else r_qty
                     self._upload_arrays(pos, hsml, mass, qty, camera)
                     self._upload_aniso_summaries(
-                        np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                        np.zeros(0, np.float32), np.zeros((0, 6), np.float32),
+                        np.zeros((0, 3), np.float32),
+                        np.zeros(0, np.float32),
+                        np.zeros(0, np.float32),
+                        np.zeros((0, 6), np.float32),
                     )
             else:
                 pos, hsml, mass, qty = result
                 self._upload_arrays(pos, hsml, mass, qty, camera)
                 self._upload_aniso_summaries(
-                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                    np.zeros(0, np.float32), np.zeros((0, 6), np.float32),
+                    np.zeros((0, 3), np.float32),
+                    np.zeros(0, np.float32),
+                    np.zeros(0, np.float32),
+                    np.zeros((0, 6), np.float32),
                 )
         else:
             # No tree: simple numpy frustum cull + subsample
@@ -447,8 +464,14 @@ class SplatRenderer:
 
         # Release old buffers
         for attr in (
-            "pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo",
-            "big_pos_vbo", "big_hsml_vbo", "big_mass_vbo", "big_qty_vbo",
+            "pos_vbo",
+            "hsml_vbo",
+            "mass_vbo",
+            "qty_vbo",
+            "big_pos_vbo",
+            "big_hsml_vbo",
+            "big_mass_vbo",
+            "big_qty_vbo",
         ):
             old = getattr(self, attr, None)
             if old is not None:
@@ -693,9 +716,7 @@ class SplatRenderer:
         proj = np.ascontiguousarray(camera.projection_matrix().T)
         self.star_layer.render(view.tobytes(), proj.tobytes())
 
-    def render_composite(self, camera, width, height,
-                         mode1, min1, max1, log1,
-                         mode2, min2, max2, log2):
+    def render_composite(self, camera, width, height, mode1, min1, max1, log1, mode2, min2, max2, log2):
         """Render two fields and composite: field1=lightness, field2=color.
 
         Call update_weights() with field1 data, then render_composite() which:
@@ -823,14 +844,40 @@ class SplatRenderer:
     def release(self):
         """Clean up GPU resources."""
         for attr in (
-            "pos_vbo", "hsml_vbo", "mass_vbo", "qty_vbo",
-            "big_pos_vbo", "big_hsml_vbo", "big_mass_vbo", "big_qty_vbo",
-            "quad_vbo", "quad_ibo", "fs_quad_vbo",
-            "aniso_pos_vbo", "aniso_mass_vbo", "aniso_qty_vbo", "aniso_cov_vbo",
-            "vao_additive", "vao_quad", "vao_aniso", "vao_resolve", "vao_composite",
-            "prog_additive", "prog_quad", "prog_aniso", "prog_resolve", "prog_composite", "prog_star",
-            "_accum_fbo", "_accum_tex_num", "_accum_tex_den", "_accum_tex_sq",
-            "_accum_fbo2", "_accum_tex_num2", "_accum_tex_den2", "_accum_tex_sq2",
+            "pos_vbo",
+            "hsml_vbo",
+            "mass_vbo",
+            "qty_vbo",
+            "big_pos_vbo",
+            "big_hsml_vbo",
+            "big_mass_vbo",
+            "big_qty_vbo",
+            "quad_vbo",
+            "quad_ibo",
+            "fs_quad_vbo",
+            "aniso_pos_vbo",
+            "aniso_mass_vbo",
+            "aniso_qty_vbo",
+            "aniso_cov_vbo",
+            "vao_additive",
+            "vao_quad",
+            "vao_aniso",
+            "vao_resolve",
+            "vao_composite",
+            "prog_additive",
+            "prog_quad",
+            "prog_aniso",
+            "prog_resolve",
+            "prog_composite",
+            "prog_star",
+            "_accum_fbo",
+            "_accum_tex_num",
+            "_accum_tex_den",
+            "_accum_tex_sq",
+            "_accum_fbo2",
+            "_accum_tex_num2",
+            "_accum_tex_den2",
+            "_accum_tex_sq2",
         ):
             obj = getattr(self, attr, None)
             if obj is not None:
