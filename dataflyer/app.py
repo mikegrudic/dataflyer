@@ -1152,9 +1152,9 @@ def main():
                         help="Run N-frame scripted benchmark and exit")
     parser.add_argument("--fullscreen", action="store_true",
                         help="Run in fullscreen mode at specified resolution")
-    parser.add_argument("--backend", type=str, default="moderngl",
+    parser.add_argument("--backend", type=str, default="wgpu",
                         choices=["moderngl", "wgpu"],
-                        help="Rendering backend (default: moderngl)")
+                        help="Rendering backend (default: wgpu)")
     args = parser.parse_args()
 
     if args.backend == "wgpu":
