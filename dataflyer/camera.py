@@ -25,6 +25,7 @@ class Camera:
         # Movement
         self.speed = 1.0  # units/sec, will be auto-scaled from data
         self.mouse_sensitivity = 0.002
+        self.invert_mouse = True
         self.roll_speed = 1.5  # rad/sec
 
         # Input state
@@ -157,8 +158,9 @@ class Camera:
         self._last_cursor = (xpos, ypos)
 
         if abs(dx) > 0 or abs(dy) > 0:
-            self._yaw(-dx * self.mouse_sensitivity)
-            self._pitch(-dy * self.mouse_sensitivity)
+            sign = -1.0 if self.invert_mouse else 1.0
+            self._yaw(-dx * self.mouse_sensitivity * sign)
+            self._pitch(-dy * self.mouse_sensitivity * sign)
             self._moving = True
 
     def on_scroll(self, offset):

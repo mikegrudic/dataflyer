@@ -362,6 +362,7 @@ class DevOverlay(Panel):
     def update(self, renderer, camera, fps, render_mode_name, cmap_name, timings, message, **kwargs):
         if not self.enabled:
             return
+        self._camera = camera
         self._last_message = message
 
         items = []
@@ -386,6 +387,7 @@ class DevOverlay(Panel):
         items.append(("text", f"Speed: {camera.speed:.3g}"))
         items.append(("text", ""))
 
+        items.append(("toggle", "Invert Mouse", camera.invert_mouse, "cam:invert_mouse"))
         items.append(("toggle", "Tree", renderer.use_tree, "use_tree"))
         items.append(("toggle", "Importance Sampling", renderer.use_importance_sampling, "use_importance_sampling"))
         items.append(("toggle", "Hybrid Rendering", renderer.use_hybrid_rendering, "use_hybrid_rendering"))
@@ -455,7 +457,12 @@ class DevOverlay(Panel):
 
         if wtype == "toggle":
             key = widget[3]
-            setattr(renderer, key, not getattr(renderer, key))
+            if key.startswith("cam:"):
+                # Camera attribute — stored on self._camera (set during update)
+                attr = key[4:]
+                setattr(self._camera, attr, not getattr(self._camera, attr))
+            else:
+                setattr(renderer, key, not getattr(renderer, key))
             return True
 
         if wtype == "dropdown_item":

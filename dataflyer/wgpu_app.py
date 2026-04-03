@@ -208,6 +208,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         print(f"Auto-range {label}: {lo:.3g} .. {hi:.3g}")
 
     def key_callback(win, key, scancode, action, mods):
+        nonlocal user_lod, user_budget, _cmap_idx, needs_auto_range, ui_hidden
         if user_menu.on_key(key, action):
             return
         if action == glfw.PRESS:
@@ -226,12 +227,46 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     _auto_range_composite_slot(0, "Lightness")
             elif key == glfw.KEY_L:
                     renderer.log_scale = 1 - renderer.log_scale
-                    nonlocal needs_auto_range
                     needs_auto_range = True
+            elif key == glfw.KEY_RIGHT_BRACKET:
+                renderer.lod_pixels = max(1, renderer.lod_pixels // 2)
+                user_lod = renderer.lod_pixels
+                print(f"LOD: {renderer.lod_pixels}px (more detail)")
+            elif key == glfw.KEY_LEFT_BRACKET:
+                renderer.lod_pixels = min(256, renderer.lod_pixels * 2)
+                user_lod = renderer.lod_pixels
+                print(f"LOD: {renderer.lod_pixels}px (faster)")
+            elif key == glfw.KEY_PERIOD:
+                renderer.max_render_particles = min(
+                    renderer.n_total, int(renderer.max_render_particles * 2))
+                user_budget = renderer.max_render_particles
+                print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
+            elif key == glfw.KEY_COMMA:
+                renderer.max_render_particles = max(
+                    100_000, renderer.max_render_particles // 2)
+                user_budget = renderer.max_render_particles
+                print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
+            elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
+                mid = (renderer.qty_min + renderer.qty_max) / 2
+                half = (renderer.qty_max - renderer.qty_min) / 2 * 0.8
+                renderer.qty_min = mid - half
+                renderer.qty_max = mid + half
+            elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
+                mid = (renderer.qty_min + renderer.qty_max) / 2
+                half = (renderer.qty_max - renderer.qty_min) / 2 * 1.25
+                renderer.qty_min = mid - half
+                renderer.qty_max = mid + half
+            elif key == glfw.KEY_C:
+                nonlocal _cmap_idx
+                _cmap_idx = (_cmap_idx + 1) % len(AVAILABLE_COLORMAPS)
+                from .colormaps import colormap_to_texture_data
+                renderer.set_colormap(colormap_to_texture_data(AVAILABLE_COLORMAPS[_cmap_idx]))
+                _state["_cmap_idx"] = _cmap_idx
+            elif key == glfw.KEY_P:
+                renderer.screenshot(f"dataflyer_{int(time.time())}.png")
             elif key == glfw.KEY_F1 or key == glfw.KEY_BACKSLASH:
                 overlay.enabled = not overlay.enabled
             elif key == glfw.KEY_TAB:
-                nonlocal ui_hidden
                 ui_hidden = not ui_hidden
         camera.on_key(key, action)
 
