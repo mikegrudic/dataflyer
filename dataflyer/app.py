@@ -13,7 +13,7 @@ from .overlay import DevOverlay, UserMenu
 
 
 class DataFlyerApp:
-    def __init__(self, snapshot_path, width=1920, height=1080, fov=90.0):
+    def __init__(self, snapshot_path, width=1920, height=1080, fov=90.0, fullscreen=False):
         self.width = width
         self.height = height
 
@@ -27,7 +27,8 @@ class DataFlyerApp:
         glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, True)
         glfw.window_hint(glfw.SAMPLES, 0)
 
-        self.window = glfw.create_window(width, height, "DataFlyer", None, None)
+        monitor = glfw.get_primary_monitor() if fullscreen else None
+        self.window = glfw.create_window(width, height, "DataFlyer", monitor, None)
         if not self.window:
             glfw.terminate()
             raise RuntimeError("Failed to create GLFW window")
@@ -1149,6 +1150,8 @@ def main():
                         help="Render one frame to this file and exit")
     parser.add_argument("--benchmark", type=int, default=None, metavar="N",
                         help="Run N-frame scripted benchmark and exit")
+    parser.add_argument("--fullscreen", action="store_true",
+                        help="Run in fullscreen mode at specified resolution")
     parser.add_argument("--backend", type=str, default="moderngl",
                         choices=["moderngl", "wgpu"],
                         help="Rendering backend (default: moderngl)")
@@ -1157,10 +1160,12 @@ def main():
     if args.backend == "wgpu":
         from .wgpu_app import run_wgpu_app
         run_wgpu_app(args.snapshot, width=args.width, height=args.height, fov=args.fov,
-                     screenshot=args.screenshot, benchmark=args.benchmark)
+                     screenshot=args.screenshot, benchmark=args.benchmark,
+                     fullscreen=args.fullscreen)
         return
 
-    app = DataFlyerApp(args.snapshot, width=args.width, height=args.height, fov=args.fov)
+    app = DataFlyerApp(args.snapshot, width=args.width, height=args.height, fov=args.fov,
+                       fullscreen=args.fullscreen)
     if args.screenshot:
         app.render_one_frame(args.screenshot)
     elif args.benchmark is not None:

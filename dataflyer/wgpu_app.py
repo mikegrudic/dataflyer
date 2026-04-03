@@ -20,7 +20,7 @@ from .renderer import RenderMode
 
 
 def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
-                 screenshot=None, benchmark=None):
+                 screenshot=None, benchmark=None, fullscreen=False):
     """Run the DataFlyer application with the wgpu backend."""
     import os
     snapshot_path = os.path.abspath(snapshot_path)
@@ -33,7 +33,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     glfw.window_hint(glfw.CLIENT_API, glfw.NO_API)  # No OpenGL context
     glfw.window_hint(glfw.RESIZABLE, True)
 
-    window = glfw.create_window(width, height, "DataFlyer [wgpu]", None, None)
+    monitor = glfw.get_primary_monitor() if fullscreen else None
+    window = glfw.create_window(width, height, "DataFlyer [wgpu]", monitor, None)
     if not window:
         glfw.terminate()
         raise RuntimeError("Failed to create GLFW window")
