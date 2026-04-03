@@ -719,11 +719,18 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         elif not moved:
             # CPU fallback for non-GPU LOS (when gpu_compute not ready)
             def _is_los_stale():
-                if _state["_render_mode_name"] not in ("WeightedAverage", "WeightedVariance"):
-                    sd_f = _state["_sd_field"]
-                    sd_f2 = _state.get("_sd_field2", "None")
-                    if sd_f not in _vector_fields and (sd_f2 == "None" or sd_f2 not in _vector_fields):
-                        return False
+                # Check if any active field is a vector with LOS projection
+                uses_vector = False
+                if _state["_render_mode_name"] in ("WeightedAverage", "WeightedVariance"):
+                    if _state["_wa_data_field"] in _vector_fields:
+                        uses_vector = True
+                if _state["_sd_field"] in _vector_fields:
+                    uses_vector = True
+                sd_f2 = _state.get("_sd_field2", "None")
+                if sd_f2 != "None" and sd_f2 in _vector_fields:
+                    uses_vector = True
+                if not uses_vector:
+                    return False
                 if _state["_vector_projection"] != "LOS":
                     return False
                 if _state["_los_camera_fwd"] is None:
