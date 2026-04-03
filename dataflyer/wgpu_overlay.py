@@ -123,6 +123,7 @@ class _WGPUPanelMixin:
 
     def _upload_panel(self, tw, th, data):
         """Override: upload via wgpu instead of moderngl."""
+        self._tex = True  # satisfy dirty-flag check in render_panel
         fb_w, fb_h = self._fb_width, self._fb_height
         s = self.style
         px_w = tw / fb_w * 2
