@@ -21,6 +21,32 @@ def _div_ceil(n, d):
     return (n + d - 1) // d
 
 
+def _make_bind_group(dev, layout, buffers):
+    """Create bind group from layout + ordered list of buffers."""
+    return dev.create_bind_group(
+        layout=layout,
+        entries=[{"binding": i, "resource": {"buffer": b}} for i, b in enumerate(buffers)],
+    )
+
+
+def _make_compute_bgl(dev, buffer_types):
+    """Create compute bind group layout from list of buffer type strings.
+
+    Each entry is 'uniform', 'read-only-storage', or 'storage'.
+    """
+    return dev.create_bind_group_layout(entries=[
+        {"binding": i, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": t}}
+        for i, t in enumerate(buffer_types)
+    ])
+
+
+def _make_compute_pipeline(dev, bgl_list, module, entry_point):
+    """Create compute pipeline from bind group layouts, shader module, and entry point."""
+    layout = dev.create_pipeline_layout(bind_group_layouts=bgl_list)
+    return dev.create_compute_pipeline(
+        layout=layout, compute={"module": module, "entry_point": entry_point})
+
+
 class GPUCompute:
     """GPU-side frustum culling, LOD selection, and particle gathering."""
 
@@ -54,6 +80,20 @@ class GPUCompute:
         self._cull_params_buf = None
         self._gather_params_buf = None
         self._scan_params_buf = None
+
+    def _dispatch(self, pipeline, bind_groups, workgroups, wy=1):
+        """Submit a single compute dispatch."""
+        encoder = self.device.create_command_encoder()
+        cpass = encoder.begin_compute_pass()
+        cpass.set_pipeline(pipeline)
+        if isinstance(bind_groups, list):
+            for i, bg in enumerate(bind_groups):
+                cpass.set_bind_group(i, bg)
+        else:
+            cpass.set_bind_group(0, bind_groups)
+        cpass.dispatch_workgroups(workgroups, wy)
+        cpass.end()
+        self.device.queue.submit([encoder.finish()])
 
     def upload_snapshot(self, grid, max_output=4_000_000):
         """Upload grid structure and sorted particle data to GPU (blocking)."""
@@ -283,143 +323,56 @@ class GPUCompute:
     def _build_pipelines(self):
         """Build all compute pipelines."""
         dev = self.device
+        _bgl = _make_compute_bgl
+        _bg = _make_bind_group
+        _pipe = _make_compute_pipeline
 
         # --- Frustum cull pipeline ---
-        self._cull_bgl = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 4, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 5, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-        ])
-        cull_layout = dev.create_pipeline_layout(bind_group_layouts=[self._cull_bgl])
-        self._cull_pipeline = dev.create_compute_pipeline(
-            layout=cull_layout,
-            compute={"module": self._cull_module, "entry_point": "main"},
-        )
+        self._cull_bgl = _bgl(dev, [
+            "uniform", "read-only-storage", "read-only-storage",
+            "read-only-storage", "read-only-storage", "storage"])
+        self._cull_pipeline = _pipe(dev, [self._cull_bgl], self._cull_module, "main")
 
-        # --- Compute stride pipeline (single thread, eliminates CPU readback) ---
+        # --- Compute stride pipeline ---
         stride_module = dev.create_shader_module(code=_load_wgsl("compute_stride.wgsl"))
-        self._stride_bgl = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-        ])
-        stride_layout = dev.create_pipeline_layout(bind_group_layouts=[self._stride_bgl])
-        self._stride_pipeline = dev.create_compute_pipeline(
-            layout=stride_layout,
-            compute={"module": stride_module, "entry_point": "main"},
-        )
+        self._stride_bgl = _bgl(dev, ["uniform", "storage"])
+        self._stride_pipeline = _pipe(dev, [self._stride_bgl], stride_module, "main")
 
         # --- Prefix sum pipelines ---
-        self._scan_bgl = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
-        ])
-        scan_layout = dev.create_pipeline_layout(bind_group_layouts=[self._scan_bgl])
-        self._scan_local_pipeline = dev.create_compute_pipeline(
-            layout=scan_layout,
-            compute={"module": self._scan_module, "entry_point": "scan_local"},
-        )
-        self._scan_propagate_pipeline = dev.create_compute_pipeline(
-            layout=scan_layout,
-            compute={"module": self._scan_module, "entry_point": "propagate"},
-        )
+        self._scan_bgl = _bgl(dev, ["storage", "storage", "uniform"])
+        self._scan_local_pipeline = _pipe(dev, [self._scan_bgl], self._scan_module, "scan_local")
+        self._scan_propagate_pipeline = _pipe(dev, [self._scan_bgl], self._scan_module, "propagate")
 
         # --- Gather pipelines ---
-        self._gather_bgl0 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 4, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-        ])
-        self._gather_bgl1 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-        ])
-        self._gather_bgl2 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-        ])
-        gather_layout = dev.create_pipeline_layout(
-            bind_group_layouts=[self._gather_bgl0, self._gather_bgl1, self._gather_bgl2])
+        self._gather_bgl0 = _bgl(dev, [
+            "uniform", "read-only-storage", "read-only-storage", "storage", "storage"])
+        self._gather_bgl1 = _bgl(dev, ["read-only-storage"] * 4)
+        self._gather_bgl2 = _bgl(dev, ["storage"] * 4)
+        gather_bgls = [self._gather_bgl0, self._gather_bgl1, self._gather_bgl2]
+        self._count_pipeline = _pipe(dev, gather_bgls, self._gather_module, "count_particles")
+        self._apply_stride_pipeline = _pipe(dev, gather_bgls, self._gather_module, "apply_stride")
+        self._gather_pipeline = _pipe(dev, gather_bgls, self._gather_module, "gather_particles")
 
-        self._count_pipeline = dev.create_compute_pipeline(
-            layout=gather_layout,
-            compute={"module": self._gather_module, "entry_point": "count_particles"},
-        )
-        self._apply_stride_pipeline = dev.create_compute_pipeline(
-            layout=gather_layout,
-            compute={"module": self._gather_module, "entry_point": "apply_stride"},
-        )
-        self._gather_pipeline = dev.create_compute_pipeline(
-            layout=gather_layout,
-            compute={"module": self._gather_module, "entry_point": "gather_particles"},
-        )
-
-        # --- Summary gather pipeline (atomic offset, no prefix sum) ---
+        # --- Summary gather pipeline ---
         summary_module = dev.create_shader_module(code=_load_wgsl("gather_summaries.wgsl"))
-        self._summary_bgl0 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-        ])
-        self._summary_bgl1 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 4, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 5, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-        ])
-        self._summary_bgl2 = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-        ])
-        summary_layout = dev.create_pipeline_layout(
-            bind_group_layouts=[self._summary_bgl0, self._summary_bgl1, self._summary_bgl2])
-        self._summary_gather_pipeline = dev.create_compute_pipeline(
-            layout=summary_layout,
-            compute={"module": summary_module, "entry_point": "gather_summaries"},
-        )
+        self._summary_bgl0 = _bgl(dev, ["uniform", "read-only-storage", "storage"])
+        self._summary_bgl1 = _bgl(dev, ["read-only-storage"] * 6)
+        self._summary_bgl2 = _bgl(dev, ["storage"] * 4)
+        summary_bgls = [self._summary_bgl0, self._summary_bgl1, self._summary_bgl2]
+        self._summary_gather_pipeline = _pipe(dev, summary_bgls, summary_module, "gather_summaries")
+
         # Summary output bind group (static)
-        self._summary_out_bg = dev.create_bind_group(
-            layout=self._summary_bgl2,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._summary_bufs["pos"]}},
-                {"binding": 1, "resource": {"buffer": self._summary_bufs["mass"]}},
-                {"binding": 2, "resource": {"buffer": self._summary_bufs["qty"]}},
-                {"binding": 3, "resource": {"buffer": self._summary_bufs["cov"]}},
-            ],
-        )
+        sb = self._summary_bufs
+        self._summary_out_bg = _bg(dev, self._summary_bgl2,
+                                   [sb["pos"], sb["mass"], sb["qty"], sb["cov"]])
 
         # Build static bind groups
-        self._gather_bg1 = dev.create_bind_group(
-            layout=self._gather_bgl1,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._particle_bufs["pos"]}},
-                {"binding": 1, "resource": {"buffer": self._particle_bufs["hsml"]}},
-                {"binding": 2, "resource": {"buffer": self._particle_bufs["mass"]}},
-                {"binding": 3, "resource": {"buffer": self._particle_bufs["qty"]}},
-            ],
-        )
-        self._gather_bg2 = dev.create_bind_group(
-            layout=self._gather_bgl2,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._output_bufs["pos"]}},
-                {"binding": 1, "resource": {"buffer": self._output_bufs["hsml"]}},
-                {"binding": 2, "resource": {"buffer": self._output_bufs["mass"]}},
-                {"binding": 3, "resource": {"buffer": self._output_bufs["qty"]}},
-            ],
-        )
+        pb = self._particle_bufs
+        self._gather_bg1 = _bg(dev, self._gather_bgl1,
+                               [pb["pos"], pb["hsml"], pb["mass"], pb["qty"]])
+        ob = self._output_bufs
+        self._gather_bg2 = _bg(dev, self._gather_bgl2,
+                               [ob["pos"], ob["hsml"], ob["mass"], ob["qty"]])
 
         # Pre-build per-level cull bind groups
         self._per_level_cull_bgs = []
@@ -429,39 +382,21 @@ class GPUCompute:
                 self._level_bufs[li + 1]["decision"] if li < self._n_levels - 1
                 else self._dummy_decision_buf
             )
-            bg = dev.create_bind_group(
-                layout=self._cull_bgl,
-                entries=[
-                    {"binding": 0, "resource": {"buffer": self._per_level_cull_params[li]}},
-                    {"binding": 1, "resource": {"buffer": lb["mass"]}},
-                    {"binding": 2, "resource": {"buffer": lb["hsml"]}},
-                    {"binding": 3, "resource": {"buffer": lb["centers"]}},
-                    {"binding": 4, "resource": {"buffer": parent_decision_buf}},
-                    {"binding": 5, "resource": {"buffer": lb["decision"]}},
-                ],
-            )
-            self._per_level_cull_bgs.append(bg)
+            self._per_level_cull_bgs.append(_bg(dev, self._cull_bgl, [
+                self._per_level_cull_params[li], lb["mass"], lb["hsml"],
+                lb["centers"], parent_decision_buf, lb["decision"]]))
 
         # Pre-build per-level summary bind groups
         self._per_level_summary_bg0s = []
         self._per_level_summary_bg1s = []
         for li in range(self._n_levels):
             lb = self._level_bufs[li]
-            bg0 = dev.create_bind_group(layout=self._summary_bgl0, entries=[
-                {"binding": 0, "resource": {"buffer": self._per_level_summary_params[li]}},
-                {"binding": 1, "resource": {"buffer": lb["decision"]}},
-                {"binding": 2, "resource": {"buffer": self._summary_counters_buf}},
-            ])
-            bg1 = dev.create_bind_group(layout=self._summary_bgl1, entries=[
-                {"binding": 0, "resource": {"buffer": lb["com_gpu"]}},
-                {"binding": 1, "resource": {"buffer": lb["hsml"]}},
-                {"binding": 2, "resource": {"buffer": lb["mass"]}},
-                {"binding": 3, "resource": {"buffer": lb["qty_gpu"]}},
-                {"binding": 4, "resource": {"buffer": lb["cov_gpu"]}},
-                {"binding": 5, "resource": {"buffer": lb["mh2_gpu"]}},
-            ])
-            self._per_level_summary_bg0s.append(bg0)
-            self._per_level_summary_bg1s.append(bg1)
+            self._per_level_summary_bg0s.append(_bg(dev, self._summary_bgl0, [
+                self._per_level_summary_params[li], lb["decision"],
+                self._summary_counters_buf]))
+            self._per_level_summary_bg1s.append(_bg(dev, self._summary_bgl1, [
+                lb["com_gpu"], lb["hsml"], lb["mass"],
+                lb["qty_gpu"], lb["cov_gpu"], lb["mh2_gpu"]]))
 
     def dispatch_cull(self, camera, max_particles, lod_pixels=4,
                       viewport_width=2048, summary_overlap=0.0):
@@ -542,27 +477,13 @@ class GPUCompute:
                                struct.pack("IIII", nc3, budget, 0, 1))
 
         finest_decision_buf = self._level_bufs[0]["decision"]
-        gather_bg0 = dev.create_bind_group(
-            layout=self._gather_bgl0,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._gather_params_buf}},
-                {"binding": 1, "resource": {"buffer": finest_decision_buf}},
-                {"binding": 2, "resource": {"buffer": self._cell_start_buf}},
-                {"binding": 3, "resource": {"buffer": self._cell_out_counts_buf}},
-                {"binding": 4, "resource": {"buffer": self._counters_buf}},
-            ],
-        )
+        gather_bg0 = _make_bind_group(dev, self._gather_bgl0, [
+            self._gather_params_buf, finest_decision_buf, self._cell_start_buf,
+            self._cell_out_counts_buf, self._counters_buf])
+        gather_bgs = [gather_bg0, self._gather_bg1, self._gather_bg2]
 
         # Count particles
-        encoder = dev.create_command_encoder()
-        cpass = encoder.begin_compute_pass()
-        cpass.set_pipeline(self._count_pipeline)
-        cpass.set_bind_group(0, gather_bg0)
-        cpass.set_bind_group(1, self._gather_bg1)
-        cpass.set_bind_group(2, self._gather_bg2)
-        cpass.dispatch_workgroups(_div_ceil(nc3, WG_SIZE))
-        cpass.end()
-        dev.queue.submit([encoder.finish()])
+        self._dispatch(self._count_pipeline, gather_bgs, _div_ceil(nc3, WG_SIZE))
 
         # Read total visible, compute stride on CPU
         counter_data = dev.queue.read_buffer(self._counters_buf, size=16)
@@ -572,15 +493,7 @@ class GPUCompute:
         # Apply stride
         dev.queue.write_buffer(self._gather_params_buf, 0,
                                struct.pack("IIII", nc3, budget, total_visible, stride))
-        encoder = dev.create_command_encoder()
-        cpass = encoder.begin_compute_pass()
-        cpass.set_pipeline(self._apply_stride_pipeline)
-        cpass.set_bind_group(0, gather_bg0)
-        cpass.set_bind_group(1, self._gather_bg1)
-        cpass.set_bind_group(2, self._gather_bg2)
-        cpass.dispatch_workgroups(_div_ceil(nc3, WG_SIZE))
-        cpass.end()
-        dev.queue.submit([encoder.finish()])
+        self._dispatch(self._apply_stride_pipeline, gather_bgs, _div_ceil(nc3, WG_SIZE))
 
         # Prefix sum
         self._prefix_sum(self._cell_out_counts_buf, nc3)
@@ -591,15 +504,7 @@ class GPUCompute:
         n_output = min(n_output, self._max_output)
 
         # === Pass 5: Gather particles ===
-        encoder = dev.create_command_encoder()
-        cpass = encoder.begin_compute_pass()
-        cpass.set_pipeline(self._gather_pipeline)
-        cpass.set_bind_group(0, gather_bg0)
-        cpass.set_bind_group(1, self._gather_bg1)
-        cpass.set_bind_group(2, self._gather_bg2)
-        cpass.dispatch_workgroups(_div_ceil(nc3, WG_SIZE))
-        cpass.end()
-        dev.queue.submit([encoder.finish()])
+        self._dispatch(self._gather_pipeline, gather_bgs, _div_ceil(nc3, WG_SIZE))
 
         # Read n_summaries
         sc_data = dev.queue.read_buffer(self._summary_counters_buf, size=4)
@@ -636,110 +541,50 @@ class GPUCompute:
 
         return n_output, total_visible, (s_pos, s_hsml, s_mass, s_qty, s_cov)
 
-    def _prefix_sum(self, buf, n):
-        """Run multi-level prefix sum on a u32 storage buffer. Returns total sum."""
+    def _prefix_sum(self, buf, n, block_sums_1=None, block_sums_2=None):
+        """Run multi-level prefix sum on a u32 storage buffer.
+
+        Args:
+            buf: GPU buffer to scan in-place.
+            n: Number of elements.
+            block_sums_1/2: Scratch buffers for hierarchical scan. Defaults to
+                the cell-grid block sum buffers allocated in _prepare_snapshot.
+        """
+        if block_sums_1 is None:
+            block_sums_1 = self._scan_block_sums_1
+        if block_sums_2 is None:
+            block_sums_2 = self._scan_block_sums_2
+
         dev = self.device
+        _bg = _make_bind_group
+        params = self._scan_params_buf
         n_blocks_1 = _div_ceil(n, WG_SIZE)
 
+        def _scan_level(data_buf, out_buf, count, workgroups):
+            dev.queue.write_buffer(params, 0, struct.pack("IIII", count, 0, 0, 0))
+            self._dispatch(self._scan_local_pipeline,
+                           _bg(dev, self._scan_bgl, [data_buf, out_buf, params]),
+                           workgroups)
+
+        def _propagate(data_buf, sums_buf, count):
+            dev.queue.write_buffer(params, 0, struct.pack("IIII", count, 0, 0, 0))
+            self._dispatch(self._scan_propagate_pipeline,
+                           _bg(dev, self._scan_bgl, [data_buf, sums_buf, params]),
+                           _div_ceil(count, WG_SIZE))
+
         # Level 1: scan local blocks
-        dev.queue.write_buffer(self._scan_params_buf, 0, struct.pack("IIII", n, 0, 0, 0))
-        scan_bg = dev.create_bind_group(
-            layout=self._scan_bgl,
-            entries=[
-                {"binding": 0, "resource": {"buffer": buf}},
-                {"binding": 1, "resource": {"buffer": self._scan_block_sums_1}},
-                {"binding": 2, "resource": {"buffer": self._scan_params_buf}},
-            ],
-        )
-        encoder = dev.create_command_encoder()
-        cpass = encoder.begin_compute_pass()
-        cpass.set_pipeline(self._scan_local_pipeline)
-        cpass.set_bind_group(0, scan_bg)
-        cpass.dispatch_workgroups(n_blocks_1)
-        cpass.end()
-        dev.queue.submit([encoder.finish()])
+        _scan_level(buf, block_sums_1, n, n_blocks_1)
 
         if n_blocks_1 > 1:
-            # Level 2: scan block sums
             n_blocks_2 = _div_ceil(n_blocks_1, WG_SIZE)
-            dev.queue.write_buffer(self._scan_params_buf, 0,
-                                   struct.pack("IIII", n_blocks_1, 0, 0, 0))
-            scan_bg2 = dev.create_bind_group(
-                layout=self._scan_bgl,
-                entries=[
-                    {"binding": 0, "resource": {"buffer": self._scan_block_sums_1}},
-                    {"binding": 1, "resource": {"buffer": self._scan_block_sums_2}},
-                    {"binding": 2, "resource": {"buffer": self._scan_params_buf}},
-                ],
-            )
-            encoder = dev.create_command_encoder()
-            cpass = encoder.begin_compute_pass()
-            cpass.set_pipeline(self._scan_local_pipeline)
-            cpass.set_bind_group(0, scan_bg2)
-            cpass.dispatch_workgroups(n_blocks_2)
-            cpass.end()
-            dev.queue.submit([encoder.finish()])
+            _scan_level(block_sums_1, block_sums_2, n_blocks_1, n_blocks_2)
 
             if n_blocks_2 > 1:
-                # Level 3: scan level-2 block sums (for nc3=262144, n_blocks_2=4, fits in one WG)
-                n_blocks_3 = _div_ceil(n_blocks_2, WG_SIZE)
-                dev.queue.write_buffer(self._scan_params_buf, 0,
-                                       struct.pack("IIII", n_blocks_2, 0, 0, 0))
-                scan_bg3 = dev.create_bind_group(
-                    layout=self._scan_bgl,
-                    entries=[
-                        {"binding": 0, "resource": {"buffer": self._scan_block_sums_2}},
-                        {"binding": 1, "resource": {"buffer": self._scan_block_sums_2}},  # dummy
-                        {"binding": 2, "resource": {"buffer": self._scan_params_buf}},
-                    ],
-                )
-                encoder = dev.create_command_encoder()
-                cpass = encoder.begin_compute_pass()
-                cpass.set_pipeline(self._scan_local_pipeline)
-                cpass.set_bind_group(0, scan_bg3)
-                cpass.dispatch_workgroups(1)
-                cpass.end()
-                dev.queue.submit([encoder.finish()])
+                # Level 3: scan level-2 block sums (fits in one WG)
+                _scan_level(block_sums_2, block_sums_2, n_blocks_2, 1)
+                _propagate(block_sums_1, block_sums_2, n_blocks_1)
 
-                # Propagate level-2 block sums into level-1 block sums
-                dev.queue.write_buffer(self._scan_params_buf, 0,
-                                       struct.pack("IIII", n_blocks_1, 0, 0, 0))
-                prop_bg2 = dev.create_bind_group(
-                    layout=self._scan_bgl,
-                    entries=[
-                        {"binding": 0, "resource": {"buffer": self._scan_block_sums_1}},
-                        {"binding": 1, "resource": {"buffer": self._scan_block_sums_2}},
-                        {"binding": 2, "resource": {"buffer": self._scan_params_buf}},
-                    ],
-                )
-                encoder = dev.create_command_encoder()
-                cpass = encoder.begin_compute_pass()
-                cpass.set_pipeline(self._scan_propagate_pipeline)
-                cpass.set_bind_group(0, prop_bg2)
-                cpass.dispatch_workgroups(n_blocks_1)
-                cpass.end()
-                dev.queue.submit([encoder.finish()])
-
-            # Propagate level-1 block sums into data
-            dev.queue.write_buffer(self._scan_params_buf, 0, struct.pack("IIII", n, 0, 0, 0))
-            prop_bg = dev.create_bind_group(
-                layout=self._scan_bgl,
-                entries=[
-                    {"binding": 0, "resource": {"buffer": buf}},
-                    {"binding": 1, "resource": {"buffer": self._scan_block_sums_1}},
-                    {"binding": 2, "resource": {"buffer": self._scan_params_buf}},
-                ],
-            )
-            encoder = dev.create_command_encoder()
-            cpass = encoder.begin_compute_pass()
-            cpass.set_pipeline(self._scan_propagate_pipeline)
-            cpass.set_bind_group(0, prop_bg)
-            cpass.dispatch_workgroups(_div_ceil(n, WG_SIZE))
-            cpass.end()
-            dev.queue.submit([encoder.finish()])
-
-        # Total output count not needed here — caller computes from counters
-        return 0
+            _propagate(buf, block_sums_1, n)
 
     # ---- GPU-side LOS projection ----
 
@@ -768,16 +613,8 @@ class GPUCompute:
         # Compile LOS shader if not yet done
         if not hasattr(self, '_los_pipeline'):
             los_module = dev.create_shader_module(code=_load_wgsl("los_project.wgsl"))
-            self._los_bgl = dev.create_bind_group_layout(entries=[
-                {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
-                {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-                {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            ])
-            los_layout = dev.create_pipeline_layout(bind_group_layouts=[self._los_bgl])
-            self._los_pipeline = dev.create_compute_pipeline(
-                layout=los_layout,
-                compute={"module": los_module, "entry_point": "main"},
-            )
+            self._los_bgl = _make_compute_bgl(dev, ["uniform", "read-only-storage", "storage"])
+            self._los_pipeline = _make_compute_pipeline(dev, [self._los_bgl], los_module, "main")
             self._los_params_buf = dev.create_buffer(
                 size=32, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
@@ -801,22 +638,10 @@ class GPUCompute:
         params = struct.pack("fffI IIII", *camera.forward, n, dispatch_x, 0, 0, 0)
         dev.queue.write_buffer(self._los_params_buf, 0, params)
 
-        los_bg = dev.create_bind_group(
-            layout=self._los_bgl,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._los_params_buf}},
-                {"binding": 1, "resource": {"buffer": self._los_vec_buf}},
-                {"binding": 2, "resource": {"buffer": self._particle_bufs["qty"]}},
-            ],
-        )
-
-        encoder = dev.create_command_encoder()
-        cpass = encoder.begin_compute_pass()
-        cpass.set_pipeline(self._los_pipeline)
-        cpass.set_bind_group(0, los_bg)
-        cpass.dispatch_workgroups(dispatch_x, dispatch_y)
-        cpass.end()
-        dev.queue.submit([encoder.finish()])
+        los_bg = _make_bind_group(dev, self._los_bgl,
+                                   [self._los_params_buf, self._los_vec_buf,
+                                    self._particle_bufs["qty"]])
+        self._dispatch(self._los_pipeline, los_bg, dispatch_x, wy=dispatch_y)
 
     def upload_slot_data(self, slot_idx, slot_id, sorted_mass, sorted_qty):
         """Write sorted mass/qty to persistent per-slot buffers. Only writes on config change."""
@@ -856,15 +681,9 @@ class GPUCompute:
                 size=new_max * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC),
         }
         # Rebuild gather bind group for new output buffers
-        self._gather_bg2 = dev.create_bind_group(
-            layout=self._gather_bgl2,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._output_bufs["pos"]}},
-                {"binding": 1, "resource": {"buffer": self._output_bufs["hsml"]}},
-                {"binding": 2, "resource": {"buffer": self._output_bufs["mass"]}},
-                {"binding": 3, "resource": {"buffer": self._output_bufs["qty"]}},
-            ],
-        )
+        ob = self._output_bufs
+        self._gather_bg2 = _make_bind_group(dev, self._gather_bgl2,
+                                            [ob["pos"], ob["hsml"], ob["mass"], ob["qty"]])
 
     def get_output_buffers(self):
         """Return output SoA buffers for direct use by the render pipeline."""
@@ -907,37 +726,19 @@ class GPUCompute:
         self._sort_module = dev.create_shader_module(code=_load_wgsl("radix_sort.wgsl"))
 
         # Depth keys pipeline
-        self._depth_bgl = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-        ])
-        depth_layout = dev.create_pipeline_layout(bind_group_layouts=[self._depth_bgl])
-        self._depth_pipeline = dev.create_compute_pipeline(
-            layout=depth_layout,
-            compute={"module": self._depth_module, "entry_point": "main"},
-        )
+        self._depth_bgl = _make_compute_bgl(dev, [
+            "uniform", "read-only-storage", "storage", "storage"])
+        self._depth_pipeline = _make_compute_pipeline(dev, [self._depth_bgl],
+                                                      self._depth_module, "main")
 
         # Radix sort pipelines
-        self._sort_bgl = dev.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
-            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 4, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-            {"binding": 5, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-        ])
-        sort_layout = dev.create_pipeline_layout(bind_group_layouts=[self._sort_bgl])
-
-        self._histogram_pipeline = dev.create_compute_pipeline(
-            layout=sort_layout,
-            compute={"module": self._sort_module, "entry_point": "build_histogram"},
-        )
-        self._scatter_pipeline = dev.create_compute_pipeline(
-            layout=sort_layout,
-            compute={"module": self._sort_module, "entry_point": "scatter"},
-        )
+        self._sort_bgl = _make_compute_bgl(dev, [
+            "uniform", "read-only-storage", "read-only-storage",
+            "storage", "storage", "storage"])
+        self._histogram_pipeline = _make_compute_pipeline(
+            dev, [self._sort_bgl], self._sort_module, "build_histogram")
+        self._scatter_pipeline = _make_compute_pipeline(
+            dev, [self._sort_bgl], self._sort_module, "scatter")
 
         # Depth params uniform
         self._depth_params_buf = dev.create_buffer(
@@ -968,23 +769,10 @@ class GPUCompute:
                                  *camera.forward, n)
         dev.queue.write_buffer(self._depth_params_buf, 0, depth_data)
 
-        depth_bg = dev.create_bind_group(
-            layout=self._depth_bgl,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._depth_params_buf}},
-                {"binding": 1, "resource": {"buffer": self._output_bufs["pos"]}},
-                {"binding": 2, "resource": {"buffer": self._sort_keys_a}},
-                {"binding": 3, "resource": {"buffer": self._sort_index_a}},
-            ],
-        )
-
-        encoder = dev.create_command_encoder()
-        cpass = encoder.begin_compute_pass()
-        cpass.set_pipeline(self._depth_pipeline)
-        cpass.set_bind_group(0, depth_bg)
-        cpass.dispatch_workgroups(n_wg)
-        cpass.end()
-        dev.queue.submit([encoder.finish()])
+        depth_bg = _make_bind_group(dev, self._depth_bgl, [
+            self._depth_params_buf, self._output_bufs["pos"],
+            self._sort_keys_a, self._sort_index_a])
+        self._dispatch(self._depth_pipeline, depth_bg, n_wg)
 
         # Stage 1-8: Radix sort passes (4-bit radix, 8 passes for 32-bit keys)
         keys_a, keys_b = self._sort_keys_a, self._sort_keys_b
@@ -1000,39 +788,20 @@ class GPUCompute:
             dev.queue.write_buffer(self._sort_histogram, 0,
                                    bytes(16 * n_wg * 4))
 
-            sort_bg = dev.create_bind_group(
-                layout=self._sort_bgl,
-                entries=[
-                    {"binding": 0, "resource": {"buffer": self._sort_params_buf_sort}},
-                    {"binding": 1, "resource": {"buffer": keys_a}},
-                    {"binding": 2, "resource": {"buffer": idx_a}},
-                    {"binding": 3, "resource": {"buffer": keys_b}},
-                    {"binding": 4, "resource": {"buffer": idx_b}},
-                    {"binding": 5, "resource": {"buffer": self._sort_histogram}},
-                ],
-            )
+            sort_bg = _make_bind_group(dev, self._sort_bgl, [
+                self._sort_params_buf_sort, keys_a, idx_a,
+                keys_b, idx_b, self._sort_histogram])
 
             # Build histogram
-            encoder = dev.create_command_encoder()
-            cpass = encoder.begin_compute_pass()
-            cpass.set_pipeline(self._histogram_pipeline)
-            cpass.set_bind_group(0, sort_bg)
-            cpass.dispatch_workgroups(n_wg)
-            cpass.end()
-            dev.queue.submit([encoder.finish()])
+            self._dispatch(self._histogram_pipeline, sort_bg, n_wg)
 
             # Prefix sum on histogram
             hist_n = 16 * n_wg
-            self._prefix_sum_sort(self._sort_histogram, hist_n)
+            self._prefix_sum(self._sort_histogram, hist_n,
+                             self._sort_hist_block_sums_1, self._sort_hist_block_sums_2)
 
             # Scatter
-            encoder = dev.create_command_encoder()
-            cpass = encoder.begin_compute_pass()
-            cpass.set_pipeline(self._scatter_pipeline)
-            cpass.set_bind_group(0, sort_bg)
-            cpass.dispatch_workgroups(n_wg)
-            cpass.end()
-            dev.queue.submit([encoder.finish()])
+            self._dispatch(self._scatter_pipeline, sort_bg, n_wg)
 
             # Swap buffers for next pass
             keys_a, keys_b = keys_b, keys_a
@@ -1042,103 +811,6 @@ class GPUCompute:
         # _sort_index_a now contains the sorted permutation
         self._sort_index_a = idx_a
         return self._sort_index_a
-
-    def _prefix_sum_sort(self, buf, n):
-        """Prefix sum for sort histogram (may be larger than cell grid)."""
-        # Reuse the existing prefix sum infrastructure but with sort-specific block sums
-        dev = self.device
-        n_blocks_1 = _div_ceil(n, WG_SIZE)
-
-        dev.queue.write_buffer(self._scan_params_buf, 0, struct.pack("IIII", n, 0, 0, 0))
-        scan_bg = dev.create_bind_group(
-            layout=self._scan_bgl,
-            entries=[
-                {"binding": 0, "resource": {"buffer": buf}},
-                {"binding": 1, "resource": {"buffer": self._sort_hist_block_sums_1}},
-                {"binding": 2, "resource": {"buffer": self._scan_params_buf}},
-            ],
-        )
-        encoder = dev.create_command_encoder()
-        cpass = encoder.begin_compute_pass()
-        cpass.set_pipeline(self._scan_local_pipeline)
-        cpass.set_bind_group(0, scan_bg)
-        cpass.dispatch_workgroups(n_blocks_1)
-        cpass.end()
-        dev.queue.submit([encoder.finish()])
-
-        if n_blocks_1 > 1:
-            n_blocks_2 = _div_ceil(n_blocks_1, WG_SIZE)
-            dev.queue.write_buffer(self._scan_params_buf, 0,
-                                   struct.pack("IIII", n_blocks_1, 0, 0, 0))
-            scan_bg2 = dev.create_bind_group(
-                layout=self._scan_bgl,
-                entries=[
-                    {"binding": 0, "resource": {"buffer": self._sort_hist_block_sums_1}},
-                    {"binding": 1, "resource": {"buffer": self._sort_hist_block_sums_2}},
-                    {"binding": 2, "resource": {"buffer": self._scan_params_buf}},
-                ],
-            )
-            encoder = dev.create_command_encoder()
-            cpass = encoder.begin_compute_pass()
-            cpass.set_pipeline(self._scan_local_pipeline)
-            cpass.set_bind_group(0, scan_bg2)
-            cpass.dispatch_workgroups(n_blocks_2)
-            cpass.end()
-            dev.queue.submit([encoder.finish()])
-
-            if n_blocks_2 > 1:
-                dev.queue.write_buffer(self._scan_params_buf, 0,
-                                       struct.pack("IIII", n_blocks_2, 0, 0, 0))
-                scan_bg3 = dev.create_bind_group(
-                    layout=self._scan_bgl,
-                    entries=[
-                        {"binding": 0, "resource": {"buffer": self._sort_hist_block_sums_2}},
-                        {"binding": 1, "resource": {"buffer": self._sort_hist_block_sums_2}},
-                        {"binding": 2, "resource": {"buffer": self._scan_params_buf}},
-                    ],
-                )
-                encoder = dev.create_command_encoder()
-                cpass = encoder.begin_compute_pass()
-                cpass.set_pipeline(self._scan_local_pipeline)
-                cpass.set_bind_group(0, scan_bg3)
-                cpass.dispatch_workgroups(1)
-                cpass.end()
-                dev.queue.submit([encoder.finish()])
-
-                dev.queue.write_buffer(self._scan_params_buf, 0,
-                                       struct.pack("IIII", n_blocks_1, 0, 0, 0))
-                prop_bg2 = dev.create_bind_group(
-                    layout=self._scan_bgl,
-                    entries=[
-                        {"binding": 0, "resource": {"buffer": self._sort_hist_block_sums_1}},
-                        {"binding": 1, "resource": {"buffer": self._sort_hist_block_sums_2}},
-                        {"binding": 2, "resource": {"buffer": self._scan_params_buf}},
-                    ],
-                )
-                encoder = dev.create_command_encoder()
-                cpass = encoder.begin_compute_pass()
-                cpass.set_pipeline(self._scan_propagate_pipeline)
-                cpass.set_bind_group(0, prop_bg2)
-                cpass.dispatch_workgroups(n_blocks_1)
-                cpass.end()
-                dev.queue.submit([encoder.finish()])
-
-            dev.queue.write_buffer(self._scan_params_buf, 0, struct.pack("IIII", n, 0, 0, 0))
-            prop_bg = dev.create_bind_group(
-                layout=self._scan_bgl,
-                entries=[
-                    {"binding": 0, "resource": {"buffer": buf}},
-                    {"binding": 1, "resource": {"buffer": self._sort_hist_block_sums_1}},
-                    {"binding": 2, "resource": {"buffer": self._scan_params_buf}},
-                ],
-            )
-            encoder = dev.create_command_encoder()
-            cpass = encoder.begin_compute_pass()
-            cpass.set_pipeline(self._scan_propagate_pipeline)
-            cpass.set_bind_group(0, prop_bg)
-            cpass.dispatch_workgroups(_div_ceil(n, WG_SIZE))
-            cpass.end()
-            dev.queue.submit([encoder.finish()])
 
     def release(self):
         self._level_bufs = []
