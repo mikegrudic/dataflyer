@@ -705,8 +705,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 if renderer.auto_lod and smooth_frame_ms > 0 and (now - last_lod_adjust) >= tau:
                     target_ms = 1000.0 / max(renderer.target_fps, 1.0)
                     if smooth_frame_ms > target_ms:
-                        renderer.lod_pixels = min(256, renderer.lod_pixels * 2)
-                        renderer.max_render_particles = max(100_000, renderer.max_render_particles // 2)
+                        renderer.lod_pixels = min(32, renderer.lod_pixels * 2)
+                        renderer.max_render_particles = max(500_000, renderer.max_render_particles // 2)
                         last_lod_adjust = now
                     elif smooth_frame_ms < target_ms * 0.5:
                         renderer.lod_pixels = max(1, renderer.lod_pixels // 2)
