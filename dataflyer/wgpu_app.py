@@ -44,7 +44,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     canvas_context = wgpu.gpu.get_canvas_context(present_info)
 
     adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
-    print(f"  wgpu adapter: {adapter.info.get('description', 'unknown')}")
+    info = adapter.info
+    print(f"  wgpu adapter: {info.get('description', 'unknown')}")
+    print(f"    vendor:  {info.get('vendor', '?')}")
+    print(f"    device:  {info.get('device', '?')}")
+    print(f"    backend: {info.get('backend_type', info.get('adapter_type', '?'))}")
+    print(f"    driver:  {info.get('driver', info.get('driver_description', '?'))}")
 
     # Request float32-blendable if available
     req_features = set()
