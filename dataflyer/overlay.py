@@ -80,9 +80,13 @@ class Panel:
     on_widget_click() to handle interactions.
     """
 
+    # Reference height for DPI scaling (styles are designed for 1080p)
+    _REF_HEIGHT = 1080
+
     def __init__(self, ctx, style):
         self.ctx = ctx
         self.style = style
+        self._base_style = style  # unscaled original
         self._tex = None
         self._prog = ctx.program(
             vertex_shader=_load_shader("text.vert"),
@@ -94,6 +98,7 @@ class Panel:
             [(self._vbo, "2f 2f", "in_position", "in_uv")],
         )
         self._font = _get_font(style.font_size)
+        self._dpi_scale = 1.0
         self._widgets = []
         self._dropdown_open = None
         self._dropdown_scroll = {}
@@ -108,6 +113,29 @@ class Panel:
     def set_framebuffer_size(self, w, h):
         self._fb_width = w
         self._fb_height = h
+        # DPI scaling: scale UI relative to 1080p reference
+        new_scale = max(h, 1) / self._REF_HEIGHT
+        if abs(new_scale - self._dpi_scale) > 0.01:
+            self._dpi_scale = new_scale
+            bs = self._base_style
+            self.style = PanelStyle(
+                font_size=max(8, int(bs.font_size * new_scale)),
+                line_height=max(12, int(bs.line_height * new_scale)),
+                margin=max(4, int(bs.margin * new_scale)),
+                min_width=max(100, int(bs.min_width * new_scale)),
+                bg_color=bs.bg_color, text_color=bs.text_color,
+                accent_color=bs.accent_color,
+                toggle_on_color=bs.toggle_on_color,
+                toggle_off_color=bs.toggle_off_color,
+                dropdown_bg=bs.dropdown_bg,
+                dropdown_hover=bs.dropdown_hover,
+                slider_btn=bs.slider_btn,
+                field_bg=bs.field_bg,
+                field_active=bs.field_active,
+                position=bs.position,
+            )
+            self._font = _get_font(self.style.font_size)
+            self._last_items_key = None  # force re-render
 
     def render_panel(self, items):
         """Measure, draw, and upload a list of widget items. Skips if unchanged."""
