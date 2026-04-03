@@ -729,8 +729,6 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 refine_budget = min(refine_budget * 2, renderer.n_total)
                 renderer.lod_pixels = 1
                 renderer.max_render_particles = refine_budget
-        elif not gpu_ready and moved:
-            pass  # keep rendering last frame — no cull, no lag
         elif moved:
             # Restore user base if coming out of refinement
             if refine_saved_lod is not None:
