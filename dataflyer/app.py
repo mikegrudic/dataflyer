@@ -134,6 +134,10 @@ class DataFlyerApp:
         glfw.set_scroll_callback(self.window, self._scroll_callback)
         glfw.set_framebuffer_size_callback(self.window, self._resize_callback)
 
+        # User's base LOD settings (set by [/] and </> keys)
+        self._user_lod = self.renderer.lod_pixels
+        self._user_budget = self.renderer.max_render_particles
+
         # Timing
         self._last_time = time.perf_counter()
         self._frame_count = 0
@@ -626,6 +630,112 @@ class DataFlyerApp:
         print(f"  Speed    : {self.camera.speed:.3g}")
         print("--------------------------\n")
 
+    def _run_cull_frame(self, now, dt, moved):
+        """Run one frame of the cull / auto-LOD / progressive refinement logic.
+
+        Called from both run() and run_benchmark() so the benchmark exercises
+        the same PID and refinement code paths as interactive use.
+        """
+        import math
+
+        # Check LOS staleness every frame
+        if self._is_los_stale():
+            self._apply_render_mode(auto_range=True)
+
+        if moved:
+            # --- MOVING: auto-LOD + throttled cull ---
+            if self._refine_saved_lod is not None:
+                self.renderer.lod_pixels = self._user_lod
+                self.renderer.max_render_particles = self._user_budget
+                self._refine_saved_lod = None
+                self._refine_saved_budget = None
+            self._refine_budget = 0
+
+            if not self._was_moving:
+                self.renderer.lod_pixels = max(self._user_lod, 4)
+                self.renderer.max_render_particles = min(self._user_budget, 4_000_000)
+                if not self._composite:
+                    self.renderer.update_visible(self.camera)
+                self._last_cull_time = now
+
+            # Smoothed frame time (EMA)
+            # Smoothed wall-clock frame time (EMA)
+            if dt > 0:
+                if not self._was_moving:
+                    self._smooth_frame_ms = 0.0
+                    self._pid_integral = 0.0
+                    self._pid_prev_error = 0.0
+                elif self._smooth_frame_ms == 0.0:
+                    self._smooth_frame_ms = dt * 1000
+                else:
+                    tau = max(self.renderer.auto_lod_smooth, 0.01)
+                    a = min(dt / tau, 1.0)
+                    self._smooth_frame_ms = (1 - a) * self._smooth_frame_ms + a * dt * 1000
+
+            # PID auto-LOD: controls log2(max_render_particles) in real time.
+            # Output is in log2-units/second, scaled by dt for frame-rate independence.
+            # budget_new = budget_old * (target/work)^(Kp*dt) — smooth at any FPS.
+            if self.renderer.auto_lod and self._smooth_frame_ms > 0 and dt > 0:
+                target_ms = 1000.0 / max(self.renderer.target_fps, 1.0)
+                error = math.log2(max(self._smooth_frame_ms / target_ms, 0.01))
+
+                Kp = self.renderer.pid_Kp
+                Ki = self.renderer.pid_Ki
+                Kd = self.renderer.pid_Kd
+
+                self._pid_integral += error * dt
+                self._pid_integral = max(-4.0, min(4.0, self._pid_integral))
+                derivative = (error - self._pid_prev_error) / dt
+                self._pid_prev_error = error
+
+                # Output in log2-units per second
+                rate = Kp * error + Ki * self._pid_integral + Kd * derivative
+                # Scale by dt for frame-rate independent correction
+                output = rate * dt
+
+                log2_budget = math.log2(max(self.renderer.max_render_particles, 100_000))
+                log2_budget = log2_budget - output
+                log2_n = math.log2(max(self.renderer.n_total, 1))
+                log2_budget = max(math.log2(100_000), min(log2_n, log2_budget))
+                self.renderer.max_render_particles = max(100_000, min(
+                    self.renderer.n_total, int(2 ** log2_budget)))
+
+                # Scale lod_pixels proportionally: fewer particles → coarser LOD
+                frac = self.renderer.max_render_particles / max(self.renderer.n_total, 1)
+                # At frac=1 → lod=1, at frac=0.01 → lod~128
+                self.renderer.lod_pixels = max(1, min(256, int(1.0 / max(frac, 0.004))))
+
+            # Throttled cull
+            if now - self._last_cull_time >= self.renderer.cull_interval:
+                if not self._composite:
+                    self.renderer.update_visible(self.camera)
+                self._last_cull_time = now
+
+        elif self._refine_budget < self.renderer.n_total:
+            # --- STOPPED: progressive refinement ---
+            if self._was_moving:
+                self._smooth_frame_ms = 0.0
+                self._refine_saved_lod = self.renderer.lod_pixels
+                self._refine_saved_budget = self.renderer.max_render_particles
+                self._refine_budget = max(self._user_budget, 4_000_000)
+
+            if self._refine_budget == 0:
+                self._refine_budget = max(self._user_budget, 4_000_000)
+                self._refine_saved_lod = self.renderer.lod_pixels
+                self._refine_saved_budget = self.renderer.max_render_particles
+
+            self._refine_budget = min(self._refine_budget * 2, self.renderer.n_total)
+            self.renderer.lod_pixels = 1
+            self.renderer.max_render_particles = self._refine_budget
+
+            if not self._composite:
+                self.renderer.update_visible(self.camera)
+                if self._refine_saved_lod is not None:
+                    self.renderer.lod_pixels = self._refine_saved_lod
+                    self.renderer.max_render_particles = self._refine_saved_budget
+
+        self._was_moving = moved
+
     def run(self):
         """Main event loop."""
         print("DataFlyer running. Press H for help, ESC to quit.")
@@ -664,100 +774,15 @@ class DataFlyerApp:
             if not hasattr(self, '_was_moving'):
                 self._was_moving = False
                 self._last_cull_time = 0.0
-                self._user_lod = self.renderer.lod_pixels
-                self._user_budget = self.renderer.max_render_particles
                 self._smooth_frame_ms = 0.0
                 self._last_lod_adjust = 0.0
+                self._pid_integral = 0.0
+                self._pid_prev_error = 0.0
                 self._refine_budget = 0
                 self._refine_saved_lod = None
                 self._refine_saved_budget = None
 
-            # Check LOS staleness every frame (camera may rotate at any time)
-            if self._is_los_stale():
-                self._apply_render_mode(auto_range=True)
-
-            if moved:
-                # --- MOVING: auto-LOD + throttled cull ---
-                # Restore user base if coming out of refinement
-                if self._refine_saved_lod is not None:
-                    self.renderer.lod_pixels = self._user_lod
-                    self.renderer.max_render_particles = self._user_budget
-                    self._refine_saved_lod = None
-                    self._refine_saved_budget = None
-                self._refine_budget = 0
-
-                if not self._was_moving:
-                    # Just started moving after being stopped — immediately
-                    # switch to low-quality cull for responsive first frame
-                    self.renderer.lod_pixels = max(self._user_lod, 4)
-                    self.renderer.max_render_particles = min(self._user_budget, 4_000_000)
-                    if not self._composite:
-                        t0 = time.perf_counter()
-                        self.renderer.update_visible(self.camera)
-                        t_cull = time.perf_counter() - t0
-                    self._last_cull_time = now
-
-                # Smoothed frame time (EMA, only while moving)
-                if dt > 0:
-                    if not self._was_moving:
-                        self._smooth_frame_ms = 0.0  # don't seed from idle frame
-                    elif self._smooth_frame_ms == 0.0:
-                        self._smooth_frame_ms = dt * 1000
-                    else:
-                        tau = max(self.renderer.auto_lod_smooth, 0.01)
-                        a = min(dt / tau, 1.0)
-                        self._smooth_frame_ms = (1 - a) * self._smooth_frame_ms + a * dt * 1000
-
-                # Auto-LOD: 2x adjust, at most once per tau
-                tau = max(self.renderer.auto_lod_smooth, 0.01)
-                if self.renderer.auto_lod and self._smooth_frame_ms > 0 and (now - self._last_lod_adjust) >= tau:
-                    target_ms = 1000.0 / max(self.renderer.target_fps, 1.0)
-                    if self._smooth_frame_ms > target_ms:
-                        self.renderer.lod_pixels = min(256, self.renderer.lod_pixels * 2)
-                        self.renderer.max_render_particles = max(100_000, self.renderer.max_render_particles // 2)
-                        self._last_lod_adjust = now
-                    elif self._smooth_frame_ms < target_ms * 0.5:
-                        self.renderer.lod_pixels = max(1, self.renderer.lod_pixels // 2)
-                        self.renderer.max_render_particles = min(self.renderer.n_total, self.renderer.max_render_particles * 2)
-                        self._last_lod_adjust = now
-
-                # Throttled cull
-                if now - self._last_cull_time >= self.renderer.cull_interval:
-                    if not self._composite:
-                        t0 = time.perf_counter()
-                        self.renderer.update_visible(self.camera)
-                        t_cull = time.perf_counter() - t0
-                    self._last_cull_time = now
-
-            elif self._refine_budget < self.renderer.n_total:
-                # --- STOPPED: progressive refinement ---
-                if self._was_moving:
-                    self._smooth_frame_ms = 0.0
-                    # Save current settings, start refinement from user base
-                    self._refine_saved_lod = self.renderer.lod_pixels
-                    self._refine_saved_budget = self.renderer.max_render_particles
-                    self._refine_budget = max(self._user_budget, 4_000_000)
-
-                # Ensure base budget is set (handles case where camera never moved)
-                if self._refine_budget == 0:
-                    self._refine_budget = max(self._user_budget, 4_000_000)
-                    self._refine_saved_lod = self.renderer.lod_pixels
-                    self._refine_saved_budget = self.renderer.max_render_particles
-                # Double budget each frame
-                self._refine_budget = min(self._refine_budget * 2, self.renderer.n_total)
-                self.renderer.lod_pixels = 1
-                self.renderer.max_render_particles = self._refine_budget
-
-                if not self._composite:
-                    t0 = time.perf_counter()
-                    self.renderer.update_visible(self.camera)
-                    t_cull = time.perf_counter() - t0
-                    # Restore (render uses the data already uploaded by update_visible)
-                    if self._refine_saved_lod is not None:
-                        self.renderer.lod_pixels = self._refine_saved_lod
-                        self.renderer.max_render_particles = self._refine_saved_budget
-
-            self._was_moving = moved
+            self._run_cull_frame(now, dt, moved)
 
             # Get framebuffer size (may differ from window size on retina)
             fb_width, fb_height = glfw.get_framebuffer_size(self.window)
@@ -842,7 +867,7 @@ class DataFlyerApp:
         self._cleanup()
 
     def run_benchmark(self, n_frames=100):
-        """Scripted benchmark: fly a camera path, measure real frame times, print stats."""
+        """Scripted benchmark: realistic camera maneuvers, measure frame times."""
         import numpy as np
 
         boxsize = self.data.header.get("BoxSize", None)
@@ -852,34 +877,105 @@ class DataFlyerApp:
             )
         else:
             extent = float(boxsize)
-        center = self.camera.position.copy()
 
-        # Build a camera path: orbit around the data center
-        angles = np.linspace(0, 2 * np.pi, n_frames, endpoint=False)
-        radius = extent * 0.6
-        orbit_center = center.copy()
-        orbit_center[2] -= radius  # start looking at center from current position
+        center = np.mean([self.data.positions.min(axis=0),
+                          self.data.positions.max(axis=0)], axis=0)
+        start_pos = self.camera.position.copy()
 
-        # Auto-range first
+        def rodrigues(v, axis, angle):
+            c, s = np.cos(angle), np.sin(angle)
+            return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1 - c)
+
+        # Build waypoints: look around, fly across, turn, fly back
+        fwd0 = self.camera.forward.copy()
+        up0 = self.camera.up.copy()
+        right0 = self.camera.right.copy()
+
+        keyframes = []  # (position, forward, up, label)
+        def kf(pos, fwd, up, label):
+            keyframes.append((pos.astype(np.float32), fwd.astype(np.float32),
+                              up.astype(np.float32), label))
+
+        kf(start_pos, fwd0, up0, "start")
+        kf(start_pos, rodrigues(fwd0, right0, np.radians(30)), up0, "look up")
+        kf(start_pos, rodrigues(fwd0, right0, np.radians(-30)), up0, "look down")
+        kf(start_pos, rodrigues(fwd0, up0, np.radians(45)), up0, "look left")
+        kf(start_pos, rodrigues(fwd0, up0, np.radians(-45)), up0, "look right")
+        kf(start_pos, fwd0, rodrigues(up0, fwd0, np.radians(30)), "roll left")
+        kf(start_pos, fwd0, rodrigues(up0, fwd0, np.radians(-30)), "roll right")
+        kf(start_pos, fwd0, up0, "reset")
+
+        # Fly to opposite side
+        far_pos = start_pos + fwd0 * extent * 1.5
+        n_fly = max(n_frames // 4, 10)
+        for i in range(n_fly):
+            t = (i + 1) / n_fly
+            pos = start_pos * (1 - t) + far_pos * t
+            kf(pos, fwd0, up0, f"fly out {int(t*100)}%")
+
+        # Turn around
+        fwd_back = -fwd0
+        kf(far_pos, fwd_back, up0, "turn around")
+
+        # Fly back
+        for i in range(n_fly):
+            t = (i + 1) / n_fly
+            pos = far_pos * (1 - t) + start_pos * t
+            kf(pos, fwd_back, up0, f"fly back {int(t*100)}%")
+
+        # Orbit around the data center for remaining frames
+        n_orbit = max(n_frames - len(keyframes), 0)
+        if n_orbit > 0:
+            radius = extent * 0.6
+            angles = np.linspace(0, 2 * np.pi, n_orbit, endpoint=False)
+            for theta in angles:
+                pos = np.array([
+                    center[0] + radius * np.sin(theta),
+                    center[1],
+                    center[2] + radius * np.cos(theta),
+                ], dtype=np.float32)
+                fwd = (center - pos)
+                fwd = fwd / np.linalg.norm(fwd)
+                kf(pos, fwd, up0, "orbit")
+
+        keyframes = keyframes[:n_frames]
+
+        # Progressive refinement to full detail before starting benchmark
         fb_width, fb_height = glfw.get_framebuffer_size(self.window)
         self.ctx.viewport = (0, 0, fb_width, fb_height)
+        budget = max(4_000_000, self.renderer.max_render_particles)
+        while budget < self.renderer.n_total:
+            budget = min(budget * 2, self.renderer.n_total)
+            self.renderer.lod_pixels = 1
+            self.renderer.max_render_particles = budget
+            self.renderer.update_visible(self.camera)
+            self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+            self.ctx.screen.use()
+            self.renderer.render(self.camera, fb_width, fb_height)
+            glfw.swap_buffers(self.window)
+            glfw.poll_events()
+            n_vis = self.renderer.n_particles + self.renderer.n_big
+            print(f"  Refining: {n_vis:,} / {self.renderer.n_total:,} particles")
+            if glfw.window_should_close(self.window):
+                self._cleanup()
+                return
+
+        # Auto-range at full quality
         self.ctx.clear(0.0, 0.0, 0.0, 1.0)
         self.ctx.screen.use()
         self.renderer.render(self.camera, fb_width, fb_height)
         self._auto_range_from_framebuffer()
 
-        # Warmup: 10 frames
-        for i in range(10):
-            theta = angles[i % len(angles)]
-            self.camera.position = np.array([
-                orbit_center[0] + radius * np.sin(theta),
-                orbit_center[1],
-                orbit_center[2] + radius * np.cos(theta),
-            ], dtype=np.float32)
-            self.camera._forward = (orbit_center - self.camera.position)
-            self.camera._forward /= np.linalg.norm(self.camera._forward)
-            self.camera._dirty = True
+        # Restore user LOD for benchmark run
+        self.renderer.lod_pixels = self._user_lod
+        self.renderer.max_render_particles = self._user_budget
 
+        # Warmup
+        for pos, fwd, up, _ in keyframes[:10]:
+            self.camera.position = pos.copy()
+            self.camera._forward = fwd.copy()
+            self.camera._up = up.copy()
+            self.camera._dirty = True
             self.renderer.update_visible(self.camera)
             self.ctx.clear(0.0, 0.0, 0.0, 1.0)
             self.ctx.screen.use()
@@ -887,72 +983,155 @@ class DataFlyerApp:
             glfw.swap_buffers(self.window)
             glfw.poll_events()
 
-        # Timed run
+        # Timed run: smoothly interpolate between keyframes
+        # Each keyframe transition takes 0.5s, then hold for 1.5s
+        TRANSITION_S = 0.5
+        HOLD_S = 1.5
         frame_times = []
         cull_times = []
-        t_prev = time.perf_counter()
+        n_vis_list = []
+        cam_pos_list = []
+        cam_fwd_list = []
+        phase_list = []
+        kf_idx_list = []
 
-        for i in range(n_frames):
+        def slerp_vec(a, b, t):
+            """Interpolate unit vectors via slerp-like blend."""
+            blend = a * (1 - t) + b * t
+            n = np.linalg.norm(blend)
+            return blend / n if n > 1e-8 else a
+
+        def render_frame():
+            fb_w, fb_h = glfw.get_framebuffer_size(self.window)
+            self.ctx.viewport = (0, 0, fb_w, fb_h)
+            self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+            self.ctx.screen.use()
+            self.renderer.render(self.camera, fb_w, fb_h)
+            glfw.swap_buffers(self.window)
+            glfw.poll_events()
+
+        def record(t_frame_ms, phase, keyframe_idx):
+            r = self.renderer
+            cull_times.append(getattr(r, '_last_cull_ms', 0) + getattr(r, '_last_upload_ms', 0))
+            frame_times.append(t_frame_ms)
+            n_vis_list.append(r.n_particles + r.n_big)
+            cam_pos_list.append(self.camera.position.copy())
+            cam_fwd_list.append(self.camera.forward.copy())
+            phase_list.append(phase)
+            kf_idx_list.append(keyframe_idx)
+            lod_list.append(r.lod_pixels)
+            budget_list.append(r.max_render_particles)
+
+        lod_list = []
+        budget_list = []
+        prev_kf = keyframes[0]
+
+        # Initialize main-loop state so PID and refinement work
+        self._was_moving = False
+        self._last_cull_time = 0.0
+        self._smooth_frame_ms = 0.0
+        self._last_lod_adjust = 0.0
+        self._pid_integral = 0.0
+        self._pid_prev_error = 0.0
+        self._refine_budget = 0
+        self._refine_saved_lod = None
+        self._refine_saved_budget = None
+
+        for ki, (pos, fwd, up, label) in enumerate(keyframes):
             if glfw.window_should_close(self.window):
                 break
 
-            theta = angles[i]
-            self.camera.position = np.array([
-                orbit_center[0] + radius * np.sin(theta),
-                orbit_center[1],
-                orbit_center[2] + radius * np.cos(theta),
-            ], dtype=np.float32)
-            self.camera._forward = (orbit_center - self.camera.position)
-            self.camera._forward /= np.linalg.norm(self.camera._forward)
+            p0, f0, u0, _ = prev_kf
+
+            # --- Transition: interpolate, using real PID auto-LOD ---
+            t_start = time.perf_counter()
+            t_prev = t_start
+            while True:
+                if glfw.window_should_close(self.window):
+                    break
+                elapsed = time.perf_counter() - t_start
+                if elapsed >= TRANSITION_S:
+                    break
+                t = elapsed / TRANSITION_S
+                self.camera.position = (p0 * (1 - t) + pos * t).astype(np.float32)
+                self.camera._forward = slerp_vec(f0, fwd, t).astype(np.float32)
+                self.camera._up = slerp_vec(u0, up, t).astype(np.float32)
+                self.camera._dirty = True
+
+                # Simulate main loop: moved=True
+                now = time.perf_counter()
+                dt = now - t_prev
+                self._run_cull_frame(now, dt, moved=True)
+                render_frame()
+
+                now2 = time.perf_counter()
+                record((now2 - t_prev) * 1000, "transition", ki)
+                t_prev = now2
+
+            # --- Hold: camera stationary, using real progressive refinement ---
+            self.camera.position = pos.copy()
+            self.camera._forward = fwd.copy()
+            self.camera._up = up.copy()
             self.camera._dirty = True
 
-            t0 = time.perf_counter()
-            self.renderer.update_visible(self.camera)
-            cull_times.append((time.perf_counter() - t0) * 1000)
+            t_start = time.perf_counter()
+            t_prev = t_start
+            while True:
+                if glfw.window_should_close(self.window):
+                    break
+                if time.perf_counter() - t_start >= HOLD_S:
+                    break
 
-            fb_width, fb_height = glfw.get_framebuffer_size(self.window)
-            self.ctx.viewport = (0, 0, fb_width, fb_height)
-            self.ctx.clear(0.0, 0.0, 0.0, 1.0)
-            self.ctx.screen.use()
-            self.renderer.render(self.camera, fb_width, fb_height)
+                now = time.perf_counter()
+                dt = now - t_prev
+                self._run_cull_frame(now, dt, moved=False)
+                render_frame()
 
-            # Overlays
-            self.user_menu.set_framebuffer_size(fb_width, fb_height)
-            self.user_menu.update(
-                self.renderer,
-                AVAILABLE_COLORMAPS[self._cmap_idx], AVAILABLE_COLORMAPS,
-                sd_fields=self._sd_fields, sd_field=self._sd_field,
-                sd_field2=self._sd_field2, sd_op=self._sd_op, sd_ops=self._SD_OPS,
-                render_modes=self._RENDER_MODES, render_mode_name=self._render_mode_name,
-                wa_data_field=self._wa_data_field,
-                vector_fields=self._vector_fields,
-                vector_projection=self._vector_projection,
-                vector_projections=self._VECTOR_PROJECTIONS,
-                composite_slots=self._slot if self._composite else None,
-            )
-            self.user_menu.render()
+                now2 = time.perf_counter()
+                record((now2 - t_prev) * 1000, "hold", ki)
+                t_prev = now2
 
-            glfw.swap_buffers(self.window)
-            glfw.poll_events()
-
-            now = time.perf_counter()
-            frame_times.append((now - t_prev) * 1000)
-            t_prev = now
+            prev_kf = (pos, fwd, up, label)
 
         frame_times = np.array(frame_times)
         cull_times = np.array(cull_times)
-        fps = 1000.0 / frame_times
+        phases = np.array(phase_list)
 
         print(f"\n--- Benchmark Results ({len(frame_times)} frames) ---")
-        print(f"  Frame time:  median={np.median(frame_times):.1f}ms  "
-              f"p5={np.percentile(frame_times, 5):.1f}ms  "
-              f"p95={np.percentile(frame_times, 95):.1f}ms")
-        print(f"  FPS:         median={np.median(fps):.0f}  "
-              f"p5={np.percentile(fps, 5):.0f}  "
-              f"p95={np.percentile(fps, 95):.0f}")
-        print(f"  Cull time:   median={np.median(cull_times):.1f}ms  "
-              f"p95={np.percentile(cull_times, 95):.1f}ms")
+        for phase_name in ("transition", "hold"):
+            mask = phases == phase_name
+            if not mask.any():
+                continue
+            ft = frame_times[mask]
+            ct = cull_times[mask]
+            fps = 1000.0 / ft
+            print(f"  {phase_name.capitalize()} ({mask.sum()} frames):")
+            print(f"    Frame time:  median={np.median(ft):.1f}ms  "
+                  f"p5={np.percentile(ft, 5):.1f}ms  "
+                  f"p95={np.percentile(ft, 95):.1f}ms")
+            print(f"    FPS:         median={np.median(fps):.0f}  "
+                  f"p5={np.percentile(fps, 5):.0f}  "
+                  f"p95={np.percentile(fps, 95):.0f}")
+            print(f"    Cull time:   median={np.median(ct):.1f}ms  "
+                  f"p95={np.percentile(ct, 95):.1f}ms")
         print(f"  Particles:   {self.renderer.n_total:,} total")
+
+        # Save detailed per-frame data
+        outfile = f"benchmark_{int(time.time())}.npz"
+        kf_labels = [kf[3] for kf in keyframes]
+        np.savez(outfile,
+                 frame_time_ms=frame_times,
+                 cull_time_ms=cull_times,
+                 n_visible=np.array(n_vis_list),
+                 cam_pos=np.array(cam_pos_list),
+                 cam_fwd=np.array(cam_fwd_list),
+                 phase=np.array(phase_list),
+                 keyframe_idx=np.array(kf_idx_list),
+                 keyframe_labels=np.array(kf_labels),
+                 lod_pixels=np.array(lod_list),
+                 max_render_particles=np.array(budget_list),
+                 n_total=self.renderer.n_total)
+        print(f"  Saved: {outfile} ({len(frame_times)} frames)")
         print("-----------------------------------\n")
 
         self._cleanup()

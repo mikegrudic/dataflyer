@@ -359,7 +359,7 @@ class DevOverlay(Panel):
         self.enabled = False
         self._last_message = ""
 
-    def update(self, renderer, camera, fps, render_mode_name, cmap_name, timings, message, smooth_fps=0.0):
+    def update(self, renderer, camera, fps, render_mode_name, cmap_name, timings, message, **kwargs):
         if not self.enabled:
             return
         self._last_message = message
@@ -369,8 +369,9 @@ class DevOverlay(Panel):
         n_tot = renderer.n_total
         scale = "log" if renderer.log_scale else "linear"
 
-        smooth_str = f"  (smooth: {smooth_fps:.0f})" if smooth_fps > 0 else ""
-        items.append(("text", f"FPS: {fps:.0f}{smooth_str}"))
+        smooth_fps = kwargs.get('smooth_fps', 0)
+        pid_str = f"  (PID: {smooth_fps:.0f})" if smooth_fps > 0 else ""
+        items.append(("text", f"FPS: {fps:.0f}{pid_str}"))
         items.append(("text", f"Particles: {n_vis:,} / {n_tot:,}"))
         items.append(("text", f"LOD: {renderer.lod_pixels}px  Budget: {renderer.max_render_particles/1e6:.1f}M"))
         items.append(("text", f"Cull: {timings.get('cull',0)*1000:.0f}ms  Upload: {timings.get('upload',0)*1000:.0f}ms  Render: {timings.get('render',0)*1000:.0f}ms"))
@@ -391,10 +392,15 @@ class DevOverlay(Panel):
         items.append(("toggle", "Quad Rendering", renderer.use_quad_rendering, "use_quad_rendering"))
         items.append(("toggle", "Aniso Summaries", renderer.use_aniso_summaries, "use_aniso_summaries"))
         items.append(("toggle", "Bypass Cull", renderer.bypass_cull, "bypass_cull"))
+        if hasattr(renderer, 'skip_vsync'):
+            items.append(("toggle", "Skip Vsync", renderer.skip_vsync, "skip_vsync"))
         items.append(("toggle", "Auto LOD", renderer.auto_lod, "auto_lod"))
         if renderer.auto_lod:
             items.append(("slider", "Target FPS", renderer.target_fps, 1.0, 60.0, "target_fps"))
-            items.append(("slider", "LOD Smooth (s)", renderer.auto_lod_smooth, 0.1, 5.0, "auto_lod_smooth"))
+            items.append(("slider", "LOD Smooth (s)", renderer.auto_lod_smooth, 0.05, 2.0, "auto_lod_smooth"))
+            items.append(("slider", "PID Kp", renderer.pid_Kp, 0.0, 5.0, "pid_Kp"))
+            items.append(("slider", "PID Ki", renderer.pid_Ki, 0.0, 2.0, "pid_Ki"))
+            items.append(("slider", "PID Kd", renderer.pid_Kd, 0.0, 2.0, "pid_Kd"))
         items.append(("text", ""))
 
         items.append(("dropdown", "Kernel", renderer.kernel, renderer.KERNELS, "kernel"))

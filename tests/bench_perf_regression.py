@@ -1,11 +1,11 @@
-"""Performance regression benchmark across git commits.
+"""Performance regression benchmark.
 
-Loads SN_512 (134M particles), flies camera to opposite side of box and
-turns around, measuring cull + render times at each step.
+Loads a snapshot and simulates realistic camera movement: look up, down,
+left, right, roll left, roll right, then fly to the opposite side of the
+box, turn around, and fly back. Measures cull + render times at each step.
 """
 
 import time
-import sys
 import types
 import numpy as np
 
@@ -21,7 +21,6 @@ def load_snapshot(path):
         pos = f["PartType0/Coordinates"][:].astype(np.float32)
         masses = f["PartType0/Masses"][:].astype(np.float32)
         boxsize = float(f["Header"].attrs["BoxSize"])
-        # Try KernelMaxRadius, fall back to SmoothingLength
         for field in ("KernelMaxRadius", "SmoothingLength"):
             if field in f["PartType0"]:
                 hsml = f["PartType0"][field][:].astype(np.float32)
@@ -38,6 +37,7 @@ def make_camera(boxsize, fov):
     camera.position = np.array([center, center, boxsize], dtype=np.float32)
     camera._forward = np.array([0, 0, -1], dtype=np.float32)
     camera._up = np.array([0, 1, 0], dtype=np.float32)
+    camera._dirty = True
     camera.near = boxsize * 1e-6
     camera.far = boxsize * 10
     camera.speed = boxsize / 10
@@ -51,14 +51,12 @@ def setup_renderer(ctx):
     renderer.colormap_tex = create_colormap_texture_safe(ctx, "magma")
     renderer.resolve_mode = 0
     renderer.log_scale = 1
-    if hasattr(renderer, 'use_tree'):
-        renderer.use_tree = True
+    renderer.use_tree = True
     return renderer
 
 
 def patch_render_headless(ctx, renderer):
-    """Patch render() to work without a real screen framebuffer."""
-    original_render = renderer.render.__func__ if hasattr(renderer.render, '__func__') else renderer.render
+    original_render = renderer.render.__func__
     original_screen = type(ctx).screen
 
     def _headless_render(self, camera, width, height):
@@ -73,6 +71,76 @@ def patch_render_headless(ctx, renderer):
     renderer.render = types.MethodType(_headless_render, renderer)
 
 
+def rodrigues(v, axis, angle):
+    """Rotate vector v around unit axis by angle (radians)."""
+    c, s = np.cos(angle), np.sin(angle)
+    return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1 - c)
+
+
+def build_waypoints(boxsize):
+    """Build realistic camera waypoints: look around, fly across, turn, fly back."""
+    center = boxsize / 2
+    start_pos = np.array([center, center, boxsize], dtype=np.float32)
+    fwd_z = np.array([0, 0, -1], dtype=np.float32)
+    up_y = np.array([0, 1, 0], dtype=np.float32)
+    right_x = np.array([1, 0, 0], dtype=np.float32)
+
+    waypoints = []
+
+    def add(pos, fwd, up, label):
+        waypoints.append((pos.astype(np.float32), fwd.astype(np.float32),
+                          up.astype(np.float32), label))
+
+    # Start: looking down -z
+    add(start_pos, fwd_z, up_y, "start (look -z)")
+
+    # Look up (pitch up 30 deg)
+    fwd_up = rodrigues(fwd_z, right_x, np.radians(30))
+    add(start_pos, fwd_up, up_y, "look up 30deg")
+
+    # Look down (pitch down 30 deg from original)
+    fwd_down = rodrigues(fwd_z, right_x, np.radians(-30))
+    add(start_pos, fwd_down, up_y, "look down 30deg")
+
+    # Look left (yaw left 45 deg)
+    fwd_left = rodrigues(fwd_z, up_y, np.radians(45))
+    add(start_pos, fwd_left, up_y, "look left 45deg")
+
+    # Look right (yaw right 45 deg)
+    fwd_right = rodrigues(fwd_z, up_y, np.radians(-45))
+    add(start_pos, fwd_right, up_y, "look right 45deg")
+
+    # Roll left 30 deg (forward unchanged, up rotates)
+    up_roll_l = rodrigues(up_y, fwd_z, np.radians(30))
+    add(start_pos, fwd_z, up_roll_l, "roll left 30deg")
+
+    # Roll right 30 deg
+    up_roll_r = rodrigues(up_y, fwd_z, np.radians(-30))
+    add(start_pos, fwd_z, up_roll_r, "roll right 30deg")
+
+    # Back to center, looking -z
+    add(start_pos, fwd_z, up_y, "reset orientation")
+
+    # Fly forward through center to opposite side
+    mid_pos = np.array([center, center, center], dtype=np.float32)
+    add(mid_pos, fwd_z, up_y, "fly to center")
+
+    far_pos = np.array([center, center, 0], dtype=np.float32)
+    add(far_pos, fwd_z, up_y, "fly to far side")
+
+    # Turn around 180 deg (yaw 180)
+    fwd_back = np.array([0, 0, 1], dtype=np.float32)
+    add(far_pos, fwd_back, up_y, "turn around")
+
+    # Fly back through center
+    add(mid_pos, fwd_back, up_y, "fly back to center")
+
+    # Fly back to start
+    add(start_pos, fwd_back, up_y, "fly back to start")
+
+    return waypoints
+
+
 def run_benchmark():
     import moderngl
 
@@ -85,7 +153,6 @@ def run_benchmark():
     camera = make_camera(boxsize, FOV)
     renderer._viewport_width = RES
 
-    # set_particles (includes grid build)
     t0 = time.perf_counter()
     renderer.set_particles(pos, hsml, masses)
     t_build = time.perf_counter() - t0
@@ -93,47 +160,32 @@ def run_benchmark():
 
     patch_render_headless(ctx, renderer)
 
-    # Define camera waypoints: start at top looking -z, fly to bottom, turn around
-    center = boxsize / 2
-    waypoints = [
-        # (position, forward) — fly through box then look back
-        (np.array([center, center, boxsize], dtype=np.float32),
-         np.array([0, 0, -1], dtype=np.float32)),
-        (np.array([center, center, center], dtype=np.float32),
-         np.array([0, 0, -1], dtype=np.float32)),
-        (np.array([center, center, 0], dtype=np.float32),
-         np.array([0, 0, -1], dtype=np.float32)),
-        # Turn around — now at bottom looking +z back through the box
-        (np.array([center, center, 0], dtype=np.float32),
-         np.array([0, 0, 1], dtype=np.float32)),
-        (np.array([center, center, center], dtype=np.float32),
-         np.array([0, 0, 1], dtype=np.float32)),
-    ]
+    waypoints = build_waypoints(boxsize)
 
-    print(f"\n  {'Step':<35s} {'cull_ms':>8s} {'render_ms':>10s} {'n_vis':>10s}")
-    print("  " + "-" * 67)
+    # Warmup
+    for wp_pos, wp_fwd, wp_up, _ in waypoints[:3]:
+        camera.position = wp_pos.copy()
+        camera._forward = wp_fwd.copy()
+        camera._up = wp_up.copy()
+        camera._dirty = True
+        renderer.update_visible(camera)
+        renderer.render(camera, RES, RES)
+        ctx.finish()
+
+    print(f"\n  {'Step':<25s} {'cull_ms':>8s} {'render_ms':>10s} {'n_vis':>10s}")
+    print("  " + "-" * 57)
 
     cull_times = []
     render_times = []
 
-    # Warmup: 3 cull+render cycles to prime CPU caches and JIT
-    for wp in waypoints[:3]:
-        camera.position = wp[0].copy()
-        camera._forward = wp[1].copy()
-        camera._up = np.array([0, 1, 0], dtype=np.float32)
-        if hasattr(renderer, 'update_visible'):
-            renderer.update_visible(camera)
-        renderer.render(camera, RES, RES)
-        ctx.finish()
-
-    for _, (position, forward) in enumerate(waypoints):
-        camera.position = position.copy()
-        camera._forward = forward.copy()
-        camera._up = np.array([0, 1, 0], dtype=np.float32)
+    for wp_pos, wp_fwd, wp_up, label in waypoints:
+        camera.position = wp_pos.copy()
+        camera._forward = wp_fwd.copy()
+        camera._up = wp_up.copy()
+        camera._dirty = True
 
         t0 = time.perf_counter()
-        if hasattr(renderer, 'update_visible'):
-            renderer.update_visible(camera)
+        renderer.update_visible(camera)
         t_cull = (time.perf_counter() - t0) * 1000
 
         t0 = time.perf_counter()
@@ -145,8 +197,7 @@ def run_benchmark():
         render_times.append(t_render)
 
         n_vis = renderer.n_particles + getattr(renderer, 'n_big', 0)
-        label = f"pos=({position[0]:.0f},{position[1]:.0f},{position[2]:.0f}) fwd=({forward[2]:+.0f}z)"
-        print(f"  {label:<35s} {t_cull:>7.1f}  {t_render:>9.1f}  {n_vis:>10,}")
+        print(f"  {label:<25s} {t_cull:>7.1f}  {t_render:>9.1f}  {n_vis:>10,}")
 
     med_cull = float(np.median(cull_times))
     med_render = float(np.median(render_times))

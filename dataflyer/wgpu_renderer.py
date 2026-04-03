@@ -81,7 +81,11 @@ class WGPURenderer:
         self.bypass_cull = False
         self.auto_lod = True
         self.target_fps = 15.0
-        self.auto_lod_smooth = 1.0
+        self.auto_lod_smooth = 0.3
+        self.pid_Kp = 4.0
+        self.pid_Ki = 0.0
+        self.pid_Kd = 0.0
+        self.skip_vsync = False  # skip alternate presents to reduce vsync overhead
         self.cull_interval = 0.033  # cull every frame at 30fps (GPU compute is fast enough)
         self._needs_grid_rebuild = False
 

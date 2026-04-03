@@ -230,6 +230,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     needs_auto_range = True
             elif key == glfw.KEY_F1 or key == glfw.KEY_BACKSLASH:
                 overlay.enabled = not overlay.enabled
+            elif key == glfw.KEY_TAB:
+                nonlocal ui_hidden
+                ui_hidden = not ui_hidden
         camera.on_key(key, action)
 
     glfw.set_key_callback(window, key_callback)
@@ -436,6 +439,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     glfw.set_scroll_callback(window, scroll_callback)
 
     needs_auto_range = True
+    ui_hidden = False
     _gpu_upload_iter = None  # chunked upload iterator
 
     # Main loop state
@@ -451,6 +455,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     user_budget = renderer.max_render_particles
     smooth_frame_ms = 0.0
     last_lod_adjust = 0.0
+    pid_integral = 0.0
+    pid_prev_error = 0.0
     refine_budget = 0
     refine_saved_lod = None
     refine_saved_budget = None
@@ -605,6 +611,18 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         else:
             renderer.update_visible(camera)
 
+    # --- Benchmark mode ---
+    if benchmark is not None:
+        _run_wgpu_benchmark(
+            benchmark, window, canvas_context, device, renderer, camera, data,
+            gpu_compute, _bg, grid_thread, do_cull, fb_w, fb_h,
+            user_lod, user_budget, app_proxy,
+        )
+        renderer.release()
+        data.close()
+        glfw.destroy_window(window)
+        return
+
     print("DataFlyer [wgpu] running. WASD=move, mouse=look, ESC=quit, R=auto-range.")
 
     while not glfw.window_should_close(window):
@@ -692,10 +710,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     renderer.lod_pixels = max(user_lod, 8)
                     renderer.max_render_particles = min(user_budget, 2_000_000)
 
-                # Smoothed frame time (EMA)
+                # Smoothed wall-clock frame time (EMA)
                 if dt > 0:
                     if not was_moving:
                         smooth_frame_ms = 0.0
+                        pid_integral = 0.0
+                        pid_prev_error = 0.0
                     elif smooth_frame_ms == 0.0:
                         smooth_frame_ms = dt * 1000
                     else:
@@ -703,18 +723,25 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                         a = min(dt / tau, 1.0)
                         smooth_frame_ms = (1 - a) * smooth_frame_ms + a * dt * 1000
 
-                # Auto-LOD (more aggressive for composite since it's 2x cost)
-                tau = max(renderer.auto_lod_smooth, 0.01)
-                if renderer.auto_lod and smooth_frame_ms > 0 and (now - last_lod_adjust) >= tau:
+                # PID auto-LOD on log2(budget)
+                import math
+                if renderer.auto_lod and smooth_frame_ms > 0 and dt > 0:
                     target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-                    if smooth_frame_ms > target_ms:
-                        renderer.lod_pixels = min(32, renderer.lod_pixels * 2)
-                        renderer.max_render_particles = max(500_000, renderer.max_render_particles // 2)
-                        last_lod_adjust = now
-                    elif smooth_frame_ms < target_ms * 0.5:
-                        renderer.lod_pixels = max(1, renderer.lod_pixels // 2)
-                        renderer.max_render_particles = min(renderer.n_total, renderer.max_render_particles * 2)
-                        last_lod_adjust = now
+                    error = math.log2(max(smooth_frame_ms / target_ms, 0.01))
+                    pid_integral += error * dt
+                    pid_integral = max(-4.0, min(4.0, pid_integral))
+                    derivative = (error - pid_prev_error) / dt
+                    pid_prev_error = error
+                    rate = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
+                    output = rate * dt
+                    log2_budget = math.log2(max(renderer.max_render_particles, 100_000))
+                    log2_budget -= output
+                    log2_n = math.log2(max(renderer.n_total, 1))
+                    log2_budget = max(math.log2(100_000), min(log2_n, log2_budget))
+                    renderer.max_render_particles = max(100_000, min(
+                        renderer.n_total, int(2 ** log2_budget)))
+                    frac = renderer.max_render_particles / max(renderer.n_total, 1)
+                    renderer.lod_pixels = max(1, min(256, int(1.0 / max(frac, 0.004))))
 
             elif refine_budget < renderer.n_total:
                 if was_moving:
@@ -745,29 +772,38 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 do_cull()
                 last_cull_time = now
 
-            # Smoothed frame time (EMA)
+            # Smoothed WORK time (cull + upload, excludes vsync wait)
+            work_ms = getattr(renderer, '_last_cull_ms', 0) + getattr(renderer, '_last_upload_ms', 0)
             if dt > 0:
                 if not was_moving:
                     smooth_frame_ms = 0.0
-                elif smooth_frame_ms == 0.0:
-                    smooth_frame_ms = dt * 1000
-                else:
+                    pid_integral = 0.0
+                    pid_prev_error = 0.0
+                elif smooth_frame_ms == 0.0 and work_ms > 0:
+                    smooth_frame_ms = work_ms
+                elif work_ms > 0:
                     tau = max(renderer.auto_lod_smooth, 0.01)
                     a = min(dt / tau, 1.0)
-                    smooth_frame_ms = (1 - a) * smooth_frame_ms + a * dt * 1000
+                    smooth_frame_ms = (1 - a) * smooth_frame_ms + a * work_ms
 
-            # Auto-LOD: 2x adjust, at most once per tau
-            tau = max(renderer.auto_lod_smooth, 0.01)
-            if renderer.auto_lod and smooth_frame_ms > 0 and (now - last_lod_adjust) >= tau:
+            # PID auto-LOD on log2(budget)
+            import math
+            if renderer.auto_lod and smooth_frame_ms > 0 and dt > 0:
                 target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-                if smooth_frame_ms > target_ms:
-                    renderer.lod_pixels = min(32, renderer.lod_pixels * 2)
-                    renderer.max_render_particles = max(500_000, renderer.max_render_particles // 2)
-                    last_lod_adjust = now
-                elif smooth_frame_ms < target_ms * 0.5:
-                    renderer.lod_pixels = max(1, renderer.lod_pixels // 2)
-                    renderer.max_render_particles = min(renderer.n_total, renderer.max_render_particles * 2)
-                    last_lod_adjust = now
+                error = math.log2(max(smooth_frame_ms / target_ms, 0.01))
+                pid_integral += error * dt
+                pid_integral = max(-4.0, min(4.0, pid_integral))
+                derivative = (error - pid_prev_error) / dt
+                pid_prev_error = error
+                output = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
+                log2_budget = math.log2(max(renderer.max_render_particles, 100_000))
+                log2_budget -= output
+                log2_n = math.log2(max(renderer.n_total, 1))
+                log2_budget = max(math.log2(100_000), min(log2_n, log2_budget))
+                renderer.max_render_particles = max(100_000, min(
+                    renderer.n_total, int(2 ** log2_budget)))
+                frac = renderer.max_render_particles / max(renderer.n_total, 1)
+                renderer.lod_pixels = max(1, min(256, int(1.0 / max(frac, 0.004))))
 
             # Throttled cull
             cull_dt = renderer.cull_interval
@@ -775,8 +811,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 do_cull()
                 last_cull_time = now
 
-        elif refine_budget < renderer.n_total and getattr(gpu_compute, '_upload_ready', False):
-            # --- STOPPED: progressive refinement (only when GPU compute is ready) ---
+        elif refine_budget < renderer.n_total:
+            # --- STOPPED: progressive refinement ---
             if was_moving:
                 smooth_frame_ms = 0.0
                 refine_saved_lod = renderer.lod_pixels
@@ -845,18 +881,21 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             _timings["cull"] = _timings["cull"] * (1 - alpha) + cull_s * alpha
             _timings["upload"] = _timings["upload"] * (1 - alpha) + upload_s * alpha
 
+        # Sync auto-range request from proxy
+        if _state["_needs_auto_range"]:
+            needs_auto_range = True
+            _state["_needs_auto_range"] = False
+
         # Overlay rendering pass (on top of the resolved image)
-        try:
+        # Skip overlay + present on odd frames when skip_vsync is on
+        _do_present = not renderer.skip_vsync or frame_count % 2 == 0
+        if not ui_hidden and _do_present:
+          try:
             current_tex = canvas_context.get_current_texture()
             screen_view = current_tex.create_view()
 
             overlay.set_framebuffer_size(fb_w, fb_h)
             user_menu.set_framebuffer_size(fb_w, fb_h)
-
-            # Sync auto-range request from proxy
-            if _state["_needs_auto_range"]:
-                needs_auto_range = True
-                _state["_needs_auto_range"] = False
 
             smooth_fps_val = 1000.0 / max(smooth_frame_ms, 1.0) if smooth_frame_ms > 0 else 0.0
             # Only rebuild overlay texture at ~4Hz to avoid PIL cost every frame
@@ -896,13 +935,299 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 overlay.render_to_pass(rpass)
             rpass.end()
             device.queue.submit([encoder.finish()])
-        except Exception:
+          except Exception:
             import traceback
-            traceback.print_exc()  # print once, then continue
+            traceback.print_exc()
 
-        canvas_context.present()
+        if _do_present:
+            canvas_context.present()
 
     # Cleanup
     renderer.release()
     data.close()
     glfw.destroy_window(window)
+
+
+def _run_wgpu_benchmark(n_frames, window, canvas_context, device, renderer, camera,
+                        data, gpu_compute, _bg, grid_thread, do_cull, fb_w, fb_h,
+                        user_lod, user_budget, app_proxy):
+    """Run the scripted benchmark using the wgpu backend."""
+    import math
+
+    # Wait for grid build
+    print("  Waiting for spatial grid...")
+    grid_thread.join()
+    if _bg["grid"] is not None and renderer._grid is None:
+        renderer._grid = _bg["grid"]
+        renderer.use_tree = True
+        renderer.update_visible(camera)
+        _bg["grid"] = None
+
+    # Init GPU compute if available
+    from .gpu_compute import GPUCompute
+    GPU_COMPUTE_THRESHOLD = 10_000_000
+    if (gpu_compute is None and renderer._grid is not None
+            and renderer.n_total >= GPU_COMPUTE_THRESHOLD):
+        try:
+            gpu_compute = GPUCompute(device)
+            gpu_compute.upload_snapshot(renderer._grid)
+            print("  GPU compute pipeline initialized")
+        except Exception as e:
+            print(f"  GPU compute init failed: {e}")
+
+    boxsize = data.header.get("BoxSize", None)
+    extent = float(boxsize) if boxsize else float(np.linalg.norm(
+        data.positions.max(axis=0) - data.positions.min(axis=0)))
+    center = np.mean([data.positions.min(axis=0), data.positions.max(axis=0)], axis=0)
+    start_pos = camera.position.copy()
+    fwd0 = camera.forward.copy()
+    up0 = camera.up.copy()
+    right0 = camera.right.copy()
+
+    def rodrigues(v, axis, angle):
+        c, s = np.cos(angle), np.sin(angle)
+        return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1 - c)
+
+    def slerp_vec(a, b, t):
+        blend = a * (1 - t) + b * t
+        n = np.linalg.norm(blend)
+        return blend / n if n > 1e-8 else a
+
+    # Build keyframes (same as moderngl benchmark)
+    keyframes = []
+    def kf(pos, fwd, up, label):
+        keyframes.append((pos.astype(np.float32), fwd.astype(np.float32),
+                          up.astype(np.float32), label))
+
+    kf(start_pos, fwd0, up0, "start")
+    kf(start_pos, rodrigues(fwd0, right0, np.radians(30)), up0, "look up")
+    kf(start_pos, rodrigues(fwd0, right0, np.radians(-30)), up0, "look down")
+    kf(start_pos, rodrigues(fwd0, up0, np.radians(45)), up0, "look left")
+    kf(start_pos, rodrigues(fwd0, up0, np.radians(-45)), up0, "look right")
+    kf(start_pos, fwd0, rodrigues(up0, fwd0, np.radians(30)), "roll left")
+    kf(start_pos, fwd0, rodrigues(up0, fwd0, np.radians(-30)), "roll right")
+    kf(start_pos, fwd0, up0, "reset")
+
+    far_pos = start_pos + fwd0 * extent * 1.5
+    n_fly = max(n_frames // 4, 10)
+    for i in range(n_fly):
+        t = (i + 1) / n_fly
+        kf(start_pos * (1 - t) + far_pos * t, fwd0, up0, f"fly out {int(t*100)}%")
+
+    fwd_back = -fwd0
+    kf(far_pos, fwd_back, up0, "turn around")
+
+    for i in range(n_fly):
+        t = (i + 1) / n_fly
+        kf(far_pos * (1 - t) + start_pos * t, fwd_back, up0, f"fly back {int(t*100)}%")
+
+    n_orbit = max(n_frames - len(keyframes), 0)
+    if n_orbit > 0:
+        radius = extent * 0.6
+        angles = np.linspace(0, 2 * np.pi, n_orbit, endpoint=False)
+        for theta in angles:
+            pos = np.array([center[0] + radius * np.sin(theta), center[1],
+                            center[2] + radius * np.cos(theta)], dtype=np.float32)
+            fwd = (center - pos).astype(np.float32)
+            fwd = fwd / np.linalg.norm(fwd)
+            kf(pos, fwd, up0, "orbit")
+
+    keyframes = keyframes[:n_frames]
+
+    # Progressive refinement to full detail
+    budget = max(4_000_000, renderer.max_render_particles)
+    while budget < renderer.n_total:
+        budget = min(budget * 2, renderer.n_total)
+        renderer.lod_pixels = 1
+        renderer.max_render_particles = budget
+        if gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False):
+            gpu_compute.dispatch_cull(camera, budget, lod_pixels=1,
+                                      viewport_width=renderer._viewport_width,
+                                      summary_overlap=renderer.summary_overlap)
+        else:
+            renderer.update_visible(camera)
+        try:
+            renderer.render(camera, fb_w, fb_h)
+            canvas_context.present()
+        except Exception:
+            pass
+        glfw.poll_events()
+        n_vis = renderer.n_particles + renderer.n_aniso
+        print(f"  Refining: {n_vis:,} / {renderer.n_total:,}")
+        if glfw.window_should_close(window):
+            return
+
+    # Auto-range at full quality
+    try:
+        renderer.render(camera, fb_w, fb_h)
+        canvas_context.present()
+    except Exception:
+        pass
+    lo, hi = renderer.read_accum_range()
+    renderer.qty_min = lo
+    renderer.qty_max = hi
+    print(f"  Auto-range: {lo:.3g} .. {hi:.3g}")
+
+    renderer.lod_pixels = user_lod
+    renderer.max_render_particles = user_budget
+
+    # PID state
+    smooth_frame_ms = 0.0
+    pid_integral = 0.0
+    pid_prev_error = 0.0
+    was_moving = False
+    last_cull_time = 0.0
+    refine_budget = 0
+
+    TRANSITION_S = 0.5
+    HOLD_S = 1.5
+
+    frame_times = []
+    cull_times = []
+    n_vis_list = []
+    phase_list = []
+    kf_idx_list = []
+    lod_list = []
+    budget_list = []
+
+    def render_frame():
+        try:
+            renderer.render(camera, fb_w, fb_h)
+            canvas_context.present()
+        except Exception:
+            pass
+        glfw.poll_events()
+
+    def record(t_frame_ms, phase, ki):
+        cull_times.append(getattr(renderer, '_last_cull_ms', 0) + getattr(renderer, '_last_upload_ms', 0))
+        frame_times.append(t_frame_ms)
+        n_vis_list.append(renderer.n_particles + renderer.n_aniso)
+        phase_list.append(phase)
+        kf_idx_list.append(ki)
+        lod_list.append(renderer.lod_pixels)
+        budget_list.append(renderer.max_render_particles)
+
+    def pid_update(dt_s):
+        nonlocal smooth_frame_ms, pid_integral, pid_prev_error
+        if not renderer.auto_lod or smooth_frame_ms <= 0 or dt_s <= 0:
+            return
+        target_ms = 1000.0 / max(renderer.target_fps, 1.0)
+        error = math.log2(max(smooth_frame_ms / target_ms, 0.01))
+        pid_integral += error * dt_s
+        pid_integral = max(-4.0, min(4.0, pid_integral))
+        derivative = (error - pid_prev_error) / dt_s
+        pid_prev_error = error
+        rate = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
+        output = rate * dt_s
+        log2_budget = math.log2(max(renderer.max_render_particles, 100_000))
+        log2_budget -= output
+        log2_n = math.log2(max(renderer.n_total, 1))
+        log2_budget = max(math.log2(100_000), min(log2_n, log2_budget))
+        renderer.max_render_particles = max(100_000, min(renderer.n_total, int(2 ** log2_budget)))
+        frac = renderer.max_render_particles / max(renderer.n_total, 1)
+        renderer.lod_pixels = max(1, min(256, int(1.0 / max(frac, 0.004))))
+
+    prev_kf = keyframes[0]
+
+    for ki, (pos, fwd, up, label) in enumerate(keyframes):
+        if glfw.window_should_close(window):
+            break
+        p0, f0, u0, _ = prev_kf
+
+        # Transition
+        t_start = time.perf_counter()
+        t_prev = t_start
+        while not glfw.window_should_close(window):
+            elapsed = time.perf_counter() - t_start
+            if elapsed >= TRANSITION_S:
+                break
+            t = elapsed / TRANSITION_S
+            camera.position = (p0 * (1 - t) + pos * t).astype(np.float32)
+            camera._forward = slerp_vec(f0, fwd, t).astype(np.float32)
+            camera._up = slerp_vec(u0, up, t).astype(np.float32)
+            camera._dirty = True
+
+            now = time.perf_counter()
+            dt_s = now - t_prev
+            if dt_s > 0:
+                if not was_moving:
+                    smooth_frame_ms = 0.0
+                    pid_integral = 0.0
+                    pid_prev_error = 0.0
+                elif smooth_frame_ms == 0.0:
+                    smooth_frame_ms = dt_s * 1000
+                else:
+                    tau = max(renderer.auto_lod_smooth, 0.01)
+                    a = min(dt_s / tau, 1.0)
+                    smooth_frame_ms = (1 - a) * smooth_frame_ms + a * dt_s * 1000
+                pid_update(dt_s)
+
+            do_cull()
+            render_frame()
+            was_moving = True
+            refine_budget = 0
+
+            now2 = time.perf_counter()
+            record((now2 - t_prev) * 1000, "transition", ki)
+            t_prev = now2
+
+        # Hold
+        camera.position = pos.copy()
+        camera._forward = fwd.copy()
+        camera._up = up.copy()
+        camera._dirty = True
+
+        t_start = time.perf_counter()
+        t_prev = t_start
+        hold_refine_budget = max(user_budget, 4_000_000)
+        while not glfw.window_should_close(window):
+            if time.perf_counter() - t_start >= HOLD_S:
+                break
+            hold_refine_budget = min(hold_refine_budget * 2, renderer.n_total)
+            renderer.lod_pixels = 1
+            renderer.max_render_particles = hold_refine_budget
+            do_cull()
+            render_frame()
+            renderer.lod_pixels = user_lod
+            renderer.max_render_particles = user_budget
+            was_moving = False
+
+            now2 = time.perf_counter()
+            record((now2 - t_prev) * 1000, "hold", ki)
+            t_prev = now2
+
+        prev_kf = (pos, fwd, up, label)
+
+    # Print results
+    frame_times = np.array(frame_times)
+    cull_times = np.array(cull_times)
+    phases = np.array(phase_list)
+
+    print(f"\n--- wgpu Benchmark Results ({len(frame_times)} frames) ---")
+    for phase_name in ("transition", "hold"):
+        mask = phases == phase_name
+        if not mask.any():
+            continue
+        ft = frame_times[mask]
+        ct = cull_times[mask]
+        fps = 1000.0 / ft
+        print(f"  {phase_name.capitalize()} ({mask.sum()} frames):")
+        print(f"    Frame time:  median={np.median(ft):.1f}ms  "
+              f"p5={np.percentile(ft, 5):.1f}ms  p95={np.percentile(ft, 95):.1f}ms")
+        print(f"    FPS:         median={np.median(fps):.0f}  "
+              f"p5={np.percentile(fps, 5):.0f}  p95={np.percentile(fps, 95):.0f}")
+        print(f"    Cull time:   median={np.median(ct):.1f}ms  p95={np.percentile(ct, 95):.1f}ms")
+    print(f"  Particles:   {renderer.n_total:,} total")
+
+    outfile = f"benchmark_wgpu_{int(time.time())}.npz"
+    kf_labels = [kf[3] for kf in keyframes]
+    np.savez(outfile,
+             frame_time_ms=frame_times, cull_time_ms=cull_times,
+             n_visible=np.array(n_vis_list), phase=phases,
+             keyframe_idx=np.array(kf_idx_list),
+             keyframe_labels=np.array(kf_labels),
+             lod_pixels=np.array(lod_list),
+             max_render_particles=np.array(budget_list),
+             n_total=renderer.n_total, backend="wgpu")
+    print(f"  Saved: {outfile} ({len(frame_times)} frames)")
+    print("-----------------------------------\n")
