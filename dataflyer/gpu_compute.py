@@ -92,6 +92,13 @@ class GPUCompute:
             centers4[:, 3] = hd
 
             buf_usage = wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST
+            # Pack summary data for GPU gather
+            com4 = np.zeros((n, 4), dtype=np.float32)
+            com4[:, :3] = lv["com"]
+            cov_packed = np.zeros((n * 2, 4), dtype=np.float32)
+            cov_packed[0::2, :3] = lv["cov"][:, :3]  # xx, xy, xz
+            cov_packed[1::2, :3] = lv["cov"][:, 3:]  # yy, yz, zz
+
             level_data = {
                 "nc": nc,
                 "mass": dev.create_buffer_with_data(
@@ -102,13 +109,17 @@ class GPUCompute:
                     data=centers4, usage=buf_usage),
                 "decision": dev.create_buffer(
                     size=n * 4, usage=buf_usage),
-                "com": lv["com"],
-                "hsml_np": lv["hsml"].copy(),
-                "qty": lv["qty"],
-                "cov": lv["cov"],
-                "mh2": lv["mh2"],
+                "com_gpu": dev.create_buffer_with_data(data=com4, usage=buf_usage),
+                "qty_gpu": dev.create_buffer_with_data(
+                    data=lv["qty"].astype(np.float32), usage=buf_usage),
+                "cov_gpu": dev.create_buffer_with_data(data=cov_packed, usage=buf_usage),
+                "mh2_gpu": dev.create_buffer_with_data(
+                    data=lv["mh2"].astype(np.float32), usage=buf_usage),
+                "cs": lv["cs"].copy(),
+                "half_diag": hd,
+                # Numpy copies for upload_weights refresh
                 "mass_np": lv["mass"],
-                "cs": lv["cs"],
+                "hsml_np": lv["hsml"].copy(),
             }
             self._level_bufs.append(level_data)
 
@@ -152,6 +163,25 @@ class GPUCompute:
             size=max(n_blocks_1 * 4, 4), usage=wgpu.BufferUsage.STORAGE)
         self._scan_block_sums_2 = dev.create_buffer(
             size=max(n_blocks_2 * 4, 4), usage=wgpu.BufferUsage.STORAGE)
+
+        # Summary output buffers (max ~50K summaries is generous)
+        MAX_SUMMARIES = 50_000
+        self._max_summaries = MAX_SUMMARIES
+        out_usage = wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
+        self._summary_bufs = {
+            "pos": dev.create_buffer(size=MAX_SUMMARIES * 16, usage=out_usage),
+            "mass": dev.create_buffer(size=MAX_SUMMARIES * 4, usage=out_usage),
+            "qty": dev.create_buffer(size=MAX_SUMMARIES * 4, usage=out_usage),
+            "cov": dev.create_buffer(size=MAX_SUMMARIES * 2 * 16, usage=out_usage),  # 2 vec4 per summary
+        }
+        # Per-level summary count buffer (reused for each level's prefix sum)
+        max_level_nc3 = max(lv["nc"] ** 3 for lv in grid.levels)
+        self._summary_counts_buf = dev.create_buffer(
+            size=max_level_nc3 * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
+        self._summary_counters_buf = dev.create_buffer(
+            size=16, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST)
+        self._summary_params_buf = dev.create_buffer(
+            size=32, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
         self._dummy_decision_buf = dev.create_buffer(
             size=4, usage=wgpu.BufferUsage.STORAGE)
@@ -211,15 +241,22 @@ class GPUCompute:
         # Re-upload per-level data that depends on mass/qty
         for i, lv in enumerate(grid.levels):
             lb = self._level_bufs[i]
+            nc = lb["nc"]
+            n = nc ** 3
             dev.queue.write_buffer(lb["mass"], 0, lv["mass"].astype(np.float32).tobytes())
             dev.queue.write_buffer(lb["hsml"], 0, lv["hsml"].astype(np.float32).tobytes())
-            # Update numpy arrays for summary readback
-            lb["com"] = lv["com"]
-            lb["hsml_np"] = lv["hsml"].copy()
-            lb["qty"] = lv["qty"]
-            lb["cov"] = lv["cov"]
-            lb["mh2"] = lv["mh2"]
+            # Summary GPU buffers
+            com4 = np.zeros((n, 4), dtype=np.float32)
+            com4[:, :3] = lv["com"]
+            dev.queue.write_buffer(lb["com_gpu"], 0, com4.tobytes())
+            dev.queue.write_buffer(lb["qty_gpu"], 0, lv["qty"].astype(np.float32).tobytes())
+            cov_packed = np.zeros((n * 2, 4), dtype=np.float32)
+            cov_packed[0::2, :3] = lv["cov"][:, :3]
+            cov_packed[1::2, :3] = lv["cov"][:, 3:]
+            dev.queue.write_buffer(lb["cov_gpu"], 0, cov_packed.tobytes())
+            dev.queue.write_buffer(lb["mh2_gpu"], 0, lv["mh2"].astype(np.float32).tobytes())
             lb["mass_np"] = lv["mass"]
+            lb["hsml_np"] = lv["hsml"].copy()
 
     def _build_pipelines(self):
         """Build all compute pipelines."""
@@ -290,6 +327,49 @@ class GPUCompute:
         self._gather_pipeline = dev.create_compute_pipeline(
             layout=gather_layout,
             compute={"module": self._gather_module, "entry_point": "gather_particles"},
+        )
+
+        # --- Summary gather pipelines ---
+        summary_module = dev.create_shader_module(code=_load_wgsl("gather_summaries.wgsl"))
+        self._summary_bgl0 = dev.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
+            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
+            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
+        ])
+        self._summary_bgl1 = dev.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
+            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
+            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
+            {"binding": 4, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
+            {"binding": 5, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "read-only-storage"}},
+        ])
+        self._summary_bgl2 = dev.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
+            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
+            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
+        ])
+        summary_layout = dev.create_pipeline_layout(
+            bind_group_layouts=[self._summary_bgl0, self._summary_bgl1, self._summary_bgl2])
+        self._summary_count_pipeline = dev.create_compute_pipeline(
+            layout=summary_layout,
+            compute={"module": summary_module, "entry_point": "count_summaries"},
+        )
+        self._summary_gather_pipeline = dev.create_compute_pipeline(
+            layout=summary_layout,
+            compute={"module": summary_module, "entry_point": "gather_summaries"},
+        )
+        # Summary output bind group (static)
+        self._summary_out_bg = dev.create_bind_group(
+            layout=self._summary_bgl2,
+            entries=[
+                {"binding": 0, "resource": {"buffer": self._summary_bufs["pos"]}},
+                {"binding": 1, "resource": {"buffer": self._summary_bufs["mass"]}},
+                {"binding": 2, "resource": {"buffer": self._summary_bufs["qty"]}},
+                {"binding": 3, "resource": {"buffer": self._summary_bufs["cov"]}},
+            ],
         )
 
         # Build static bind groups
@@ -374,26 +454,69 @@ class GPUCompute:
             cpass.end()
             dev.queue.submit([encoder.finish()])
 
-        # === Read back decisions to collect summaries (CPU) ===
-        # Summaries are typically few (<10K) so CPU assembly of covariance is fine.
-        # Collect summaries from all non-finest levels where decision == SUMMARY
-        summary_parts = []
-        for li in range(self._n_levels - 1, 0, -1):  # skip finest (li=0)
+        # === GPU Summary Gather: per-level count + prefix sum + gather ===
+        summary_offset = 0
+        n_summaries = 0
+        for li in range(self._n_levels - 1, 0, -1):  # skip finest
             lb = self._level_bufs[li]
             level_nc3 = lb["nc"] ** 3
-            decision_data = dev.queue.read_buffer(lb["decision"], size=level_nc3 * 4)
-            decisions = np.frombuffer(decision_data, dtype=np.uint32)
-            s_idx = np.where(decisions == 1)[0]
-            if len(s_idx) > 0:
-                summary_parts.append((
-                    lb["com"][s_idx],
-                    lb["hsml_np"][s_idx],
-                    lb["mass_np"][s_idx],
-                    lb["qty"][s_idx],
-                    lb["cov"][s_idx],
-                    lb["mh2"][s_idx] / np.maximum(lb["mass_np"][s_idx], 1e-30),
-                    lb["cs"],
-                ))
+            cs = lb["cs"]
+
+            # Clear per-level counter
+            dev.queue.write_buffer(self._summary_counters_buf, 0, struct.pack("IIII", 0, 0, 0, 0))
+            dev.queue.write_buffer(self._summary_params_buf, 0,
+                                   struct.pack("IfffffII", level_nc3, summary_overlap,
+                                               float(cs[0]**2), float(cs[1]**2),
+                                               float(cs[2]**2), summary_offset, 0, 0))
+
+            sbg0 = dev.create_bind_group(layout=self._summary_bgl0, entries=[
+                {"binding": 0, "resource": {"buffer": self._summary_params_buf}},
+                {"binding": 1, "resource": {"buffer": lb["decision"]}},
+                {"binding": 2, "resource": {"buffer": self._summary_counts_buf}},
+                {"binding": 3, "resource": {"buffer": self._summary_counters_buf}},
+            ])
+            sbg1 = dev.create_bind_group(layout=self._summary_bgl1, entries=[
+                {"binding": 0, "resource": {"buffer": lb["com_gpu"]}},
+                {"binding": 1, "resource": {"buffer": lb["hsml"]}},
+                {"binding": 2, "resource": {"buffer": lb["mass"]}},
+                {"binding": 3, "resource": {"buffer": lb["qty_gpu"]}},
+                {"binding": 4, "resource": {"buffer": lb["cov_gpu"]}},
+                {"binding": 5, "resource": {"buffer": lb["mh2_gpu"]}},
+            ])
+
+            # Count
+            encoder = dev.create_command_encoder()
+            cpass = encoder.begin_compute_pass()
+            cpass.set_pipeline(self._summary_count_pipeline)
+            cpass.set_bind_group(0, sbg0)
+            cpass.set_bind_group(1, sbg1)
+            cpass.set_bind_group(2, self._summary_out_bg)
+            cpass.dispatch_workgroups(_div_ceil(level_nc3, WG_SIZE))
+            cpass.end()
+            dev.queue.submit([encoder.finish()])
+
+            # Read this level's count
+            sc_data = dev.queue.read_buffer(self._summary_counters_buf, size=4)
+            level_count = struct.unpack("I", sc_data)[0]
+            if level_count == 0:
+                continue
+
+            # Prefix sum on counts
+            self._prefix_sum(self._summary_counts_buf, level_nc3)
+
+            # Gather
+            encoder = dev.create_command_encoder()
+            cpass = encoder.begin_compute_pass()
+            cpass.set_pipeline(self._summary_gather_pipeline)
+            cpass.set_bind_group(0, sbg0)
+            cpass.set_bind_group(1, sbg1)
+            cpass.set_bind_group(2, self._summary_out_bg)
+            cpass.dispatch_workgroups(_div_ceil(level_nc3, WG_SIZE))
+            cpass.end()
+            dev.queue.submit([encoder.finish()])
+
+            summary_offset += level_count
+            n_summaries += level_count
 
         # === Pass 2: Count particles in EMIT cells ===
         # Clear counters
@@ -434,7 +557,6 @@ class GPUCompute:
         # 28 bytes/particle (pos=16 + hsml=4 + mass=4 + qty=4), pos is largest at 16.
         max_buf_bytes = self.device.adapter.limits.get("max-buffer-size", 2**30)
         MAX_OUTPUT_CAP = max_buf_bytes // (16 * 4)  # conservative: 25% of limit for pos buffer
-        n_summaries = sum(len(p[0]) for p in summary_parts) if summary_parts else 0
         budget = min(max(max_particles - n_summaries, max_particles // 2), MAX_OUTPUT_CAP)
         if budget > self._max_output:
             self._grow_output_buffers(budget)
@@ -473,30 +595,31 @@ class GPUCompute:
         cpass.end()
         dev.queue.submit([encoder.finish()])
 
-        # === Assemble summary output ===
+        # === Read back summary data from GPU ===
         z3 = np.zeros((0, 3), dtype=np.float32)
         z1 = np.zeros(0, dtype=np.float32)
         z6 = np.zeros((0, 6), dtype=np.float32)
 
-        if summary_parts:
-            s_pos = np.concatenate([p[0] for p in summary_parts]).astype(np.float32)
-            s_hsml = np.concatenate([p[1] for p in summary_parts]).astype(np.float32)
-            s_mass = np.concatenate([p[2] for p in summary_parts]).astype(np.float32)
-            s_qty = np.concatenate([p[3] for p in summary_parts]).astype(np.float32)
-            s_cov = np.concatenate([p[4] for p in summary_parts]).astype(np.float32)
-            s_mean_h2 = np.concatenate([p[5] for p in summary_parts]).astype(np.float32)
-            s_cs2 = np.concatenate([
-                np.broadcast_to((p[6] ** 2)[None, :], (len(p[0]), 3))
-                for p in summary_parts
-            ]).astype(np.float32)
-            # Add kernel smoothing and overlap padding to covariance diagonal
-            s_cov[:, 0] += 0.225 * s_mean_h2
-            s_cov[:, 3] += 0.225 * s_mean_h2
-            s_cov[:, 5] += 0.225 * s_mean_h2
-            alpha = summary_overlap
-            s_cov[:, 0] += alpha * s_cs2[:, 0]
-            s_cov[:, 3] += alpha * s_cs2[:, 1]
-            s_cov[:, 5] += alpha * s_cs2[:, 2]
+        if n_summaries > 0:
+            s_pos4 = np.frombuffer(
+                dev.queue.read_buffer(self._summary_bufs["pos"], size=n_summaries * 16),
+                dtype=np.float32).reshape(-1, 4)
+            s_pos = s_pos4[:, :3].copy()
+            s_mass = np.frombuffer(
+                dev.queue.read_buffer(self._summary_bufs["mass"], size=n_summaries * 4),
+                dtype=np.float32).copy()
+            s_qty = np.frombuffer(
+                dev.queue.read_buffer(self._summary_bufs["qty"], size=n_summaries * 4),
+                dtype=np.float32).copy()
+            s_cov_packed = np.frombuffer(
+                dev.queue.read_buffer(self._summary_bufs["cov"], size=n_summaries * 2 * 16),
+                dtype=np.float32).reshape(-1, 4)
+            # Unpack: [xx,xy,xz,_] [yy,yz,zz,_] → (n, 6)
+            s_cov = np.zeros((n_summaries, 6), dtype=np.float32)
+            s_cov[:, :3] = s_cov_packed[0::2, :3]
+            s_cov[:, 3:] = s_cov_packed[1::2, :3]
+            # hsml not stored in summaries — use sqrt(trace(cov)) as proxy
+            s_hsml = np.sqrt(np.maximum(s_cov[:, 0] + s_cov[:, 3] + s_cov[:, 5], 1e-30))
         else:
             s_pos, s_hsml, s_mass, s_qty, s_cov = z3, z1, z1, z1, z6
 
