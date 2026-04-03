@@ -135,11 +135,26 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     _sd_op = "*"
     _render_mode_name = "SurfaceDensity"
     _wa_data_field = "Masses"
-    _RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance"]
+    _RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance", "Composite"]
     _SD_OPS = ["*", "+", "-", "/", "min", "max"]
     _VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
     _vector_projection = "LOS"
     _los_camera_fwd = None
+
+    # Composite mode slots
+    _has_vel = "Velocities" in _vector_fields
+    _composite = False
+    _slot = [
+        {"mode": "SurfaceDensity", "weight": "Masses", "data": "Masses",
+         "weight2": "None", "op": "*", "proj": "LOS",
+         "min": -1.0, "max": 3.0, "log": 1, "resolve": 0},
+        {"mode": "WeightedVariance" if _has_vel else "SurfaceDensity",
+         "weight": "Masses",
+         "data": "Velocities" if _has_vel else "Masses",
+         "weight2": "None", "op": "*", "proj": "LOS",
+         "min": -1.0, "max": 3.0, "log": 1,
+         "resolve": 2 if _has_vel else 0},
+    ]
 
     # Stars
     if data.n_stars > 0:
@@ -147,6 +162,51 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         print(f"  {data.n_stars} star particles loaded")
 
     # Input callbacks
+    def _auto_range_composite_slot(slot_idx, label):
+        s = _state["_slot"][slot_idx]
+        renderer.resolve_mode = s["resolve"]
+        renderer.log_scale = s["log"]
+
+        gpu_ready_now = gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False)
+        fb_w_, fb_h_ = glfw.get_framebuffer_size(window)
+
+        if gpu_ready_now and renderer._grid is not None:
+            # GPU path: write sorted arrays directly, dispatch, render, read back
+            sorted_mass, sorted_qty = _ensure_slot_sorted(slot_idx)
+            device.queue.write_buffer(gpu_compute._particle_bufs["mass"], 0, sorted_mass.tobytes())
+
+            sl = _state["_slot"][slot_idx]
+            is_los_vec = (sl.get("proj") == "LOS" and
+                          sl["mode"] in ("WeightedAverage", "WeightedVariance") and
+                          sl["data"] in _state["_vector_fields"])
+            if is_los_vec:
+                if not gpu_compute.has_los_field() or getattr(gpu_compute, '_los_field_name', '') != sl["data"]:
+                    gpu_compute.upload_vector_field(renderer._grid, sl["data"], data)
+                gpu_compute.dispatch_los_project(camera)
+            else:
+                device.queue.write_buffer(gpu_compute._particle_bufs["qty"], 0, sorted_qty.tobytes())
+
+            n_out, _, summary_data = gpu_compute.dispatch_cull(
+                camera, renderer.max_render_particles,
+                lod_pixels=renderer.lod_pixels,
+                viewport_width=renderer._viewport_width,
+                summary_overlap=renderer.summary_overlap,
+            )
+            renderer.set_particle_buffers_from_gpu(gpu_compute.get_output_buffers(), n_out)
+        else:
+            # CPU fallback
+            w, q = app_proxy._compute_slot(s)
+            renderer.update_weights(w, q)
+            renderer.update_visible(camera)
+
+        renderer._ensure_fbo(fb_w_, fb_h_, which=1)
+        renderer._write_camera_uniforms(camera, fb_w_, fb_h_)
+        renderer._render_accum(camera, fb_w_, fb_h_, renderer._accum_textures)
+        lo, hi = renderer.read_accum_range()
+        s["min"] = lo
+        s["max"] = hi
+        print(f"Auto-range {label}: {lo:.3g} .. {hi:.3g}")
+
     def key_callback(win, key, scancode, action, mods):
         if user_menu.on_key(key, action):
             return
@@ -154,10 +214,20 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             if key == glfw.KEY_ESCAPE:
                 glfw.set_window_should_close(win, True)
             elif key == glfw.KEY_R:
-                lo, hi = renderer.read_accum_range()
-                renderer.qty_min = lo
-                renderer.qty_max = hi
-                print(f"Auto-range: {lo:.3g} .. {hi:.3g}")
+                if _state["_composite"]:
+                    _auto_range_composite_slot(1, "Color")
+                else:
+                    lo, hi = renderer.read_accum_range()
+                    renderer.qty_min = lo
+                    renderer.qty_max = hi
+                    print(f"Auto-range: {lo:.3g} .. {hi:.3g}")
+            elif key == glfw.KEY_T:
+                if _state["_composite"]:
+                    _auto_range_composite_slot(0, "Lightness")
+            elif key == glfw.KEY_L:
+                    renderer.log_scale = 1 - renderer.log_scale
+                    nonlocal needs_auto_range
+                    needs_auto_range = True
             elif key == glfw.KEY_F1 or key == glfw.KEY_BACKSLASH:
                 overlay.enabled = not overlay.enabled
         camera.on_key(key, action)
@@ -176,9 +246,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         "_vector_projection": _vector_projection,
         "_los_camera_fwd": _los_camera_fwd,
         "_cmap_idx": _cmap_idx,
-        "_slot": [],
+        "_slot": _slot,
         "_needs_auto_range": False,
-        "_composite": False,
+        "_composite": _composite,
     }
 
     class _AppProxy:
@@ -224,6 +294,62 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 elif op == "max": w = np.maximum(w, w2)
             return w
 
+        def _compute_slot(self, slot):
+            """Compute weights and qty for a composite slot dict."""
+            s = slot
+            w_name = s["weight"]
+            if w_name in _state["_vector_fields"]:
+                vec = data.get_vector_field(w_name)
+                proj = s["proj"]
+                if proj == "LOS":
+                    weights = (vec @ camera.forward).astype(np.float32)
+                elif proj == "|v|":
+                    weights = np.linalg.norm(vec, axis=1).astype(np.float32)
+                else:
+                    weights = (vec * vec).sum(axis=1).astype(np.float32)
+            else:
+                weights = data.get_field(w_name)
+                if s.get("weight2", "None") != "None":
+                    w2_name = s["weight2"]
+                    if w2_name in _state["_vector_fields"]:
+                        vec = data.get_vector_field(w2_name)
+                        proj = s["proj"]
+                        if proj == "LOS":
+                            w2 = (vec @ camera.forward).astype(np.float32)
+                        elif proj == "|v|":
+                            w2 = np.linalg.norm(vec, axis=1).astype(np.float32)
+                        else:
+                            w2 = (vec * vec).sum(axis=1).astype(np.float32)
+                    else:
+                        w2 = data.get_field(w2_name)
+                    op = s.get("op", "*")
+                    if op == "*": weights = weights * w2
+                    elif op == "+": weights = weights + w2
+                    elif op == "-": weights = weights - w2
+                    elif op == "/": weights = weights / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
+                    elif op == "min": weights = np.minimum(weights, w2)
+                    elif op == "max": weights = np.maximum(weights, w2)
+
+            if s["mode"] in ("WeightedAverage", "WeightedVariance"):
+                d_name = s["data"]
+                if d_name in _state["_vector_fields"]:
+                    vec = data.get_vector_field(d_name)
+                    proj = s["proj"]
+                    if proj == "LOS":
+                        qty = (vec @ camera.forward).astype(np.float32)
+                    elif proj == "|v|":
+                        qty = np.linalg.norm(vec, axis=1).astype(np.float32)
+                    else:
+                        qty = (vec * vec).sum(axis=1).astype(np.float32)
+                else:
+                    qty = data.get_field(d_name)
+            else:
+                qty = None
+
+            resolve = {"SurfaceDensity": 0, "WeightedAverage": 1, "WeightedVariance": 2}[s["mode"]]
+            s["resolve"] = resolve
+            return weights, qty
+
         def _apply_render_mode(self, auto_range=True):
             nonlocal _render_mode, needs_auto_range, refine_budget, refine_saved_lod, refine_saved_budget
             _state["_los_camera_fwd"] = None
@@ -232,6 +358,18 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             refine_saved_budget = None
 
             mode = _state["_render_mode_name"]
+            _state["_composite"] = (mode == "Composite")
+
+            if mode == "Composite":
+                _render_mode = RenderMode(name="Composite", weight_field="", qty_field="", resolve_mode=-1)
+                # Pre-populate slot caches then auto-range
+                if renderer._grid is not None:
+                    for si in range(2):
+                        _ensure_slot_sorted(si)
+                    _auto_range_composite_slot(0, "Lightness")
+                    _auto_range_composite_slot(1, "Color")
+                return
+
             if mode in ("WeightedAverage", "WeightedVariance"):
                 weights = self._project_field(_state["_sd_field"])
                 qty = self._project_field(_state["_wa_data_field"])
@@ -250,7 +388,6 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             renderer.update_weights(weights, qty)
             if gpu_compute is not None and renderer._grid is not None:
                 gpu_compute.upload_weights(renderer._grid)
-                # Upload vector field for GPU-side LOS projection
                 _uses_los = (_state["_vector_projection"] == "LOS" and
                              _state.get("_wa_data_field", "") in _state["_vector_fields"])
                 if _uses_los:
@@ -317,6 +454,134 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     refine_budget = 0
     refine_saved_lod = None
     refine_saved_budget = None
+
+    # Pre-sort and cache slot weight arrays (done once per slot config change)
+    _slot_sorted = [None, None]  # (slot_id, sorted_mass, sorted_qty) per slot
+
+    def _ensure_slot_sorted(slot_idx):
+        """Ensure sorted mass/qty arrays are cached for this slot. Returns (mass, qty).
+
+        For LOS vector qty fields, qty is a placeholder — GPU projection handles it.
+        Only the weight (mass) array needs to be sorted on CPU.
+        """
+        sl = _state["_slot"][slot_idx]
+        slot_id = (sl["weight"], sl.get("weight2", "None"), sl.get("op", "*"),
+                   sl["mode"], sl["data"], sl.get("proj", "LOS"))
+        cached = _slot_sorted[slot_idx]
+        if cached is not None and cached[0] == slot_id:
+            return cached[1], cached[2]
+
+        # Only compute the weight field — skip qty for LOS (GPU handles it)
+        is_los_qty = (sl.get("proj") == "LOS" and
+                      sl["mode"] in ("WeightedAverage", "WeightedVariance") and
+                      sl["data"] in _state["_vector_fields"])
+
+        # Compute weight
+        w_name = sl["weight"]
+        if w_name in _state["_vector_fields"]:
+            vec = data.get_vector_field(w_name)
+            proj = sl.get("proj", "LOS")
+            if proj == "LOS":
+                w = (vec @ camera.forward).astype(np.float32)
+            elif proj == "|v|":
+                w = np.linalg.norm(vec, axis=1).astype(np.float32)
+            else:
+                w = (vec * vec).sum(axis=1).astype(np.float32)
+        else:
+            w = data.get_field(w_name)
+            if sl.get("weight2", "None") != "None":
+                w2 = data.get_field(sl["weight2"])
+                op = sl.get("op", "*")
+                if op == "*": w = w * w2
+                elif op == "+": w = w + w2
+                elif op == "-": w = w - w2
+                elif op == "/": w = w / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
+                elif op == "min": w = np.minimum(w, w2)
+                elif op == "max": w = np.maximum(w, w2)
+
+        so = renderer._grid.sort_order
+        sm = w[so].astype(np.float32)
+
+        if is_los_qty:
+            # Placeholder — GPU LOS projection will fill qty buffer
+            sq = sm  # won't be used
+        elif sl["mode"] in ("WeightedAverage", "WeightedVariance"):
+            d_name = sl["data"]
+            if d_name in _state["_vector_fields"]:
+                vec = data.get_vector_field(d_name)
+                proj = sl.get("proj", "LOS")
+                if proj == "|v|":
+                    q = np.linalg.norm(vec, axis=1).astype(np.float32)
+                else:
+                    q = (vec * vec).sum(axis=1).astype(np.float32)
+            else:
+                q = data.get_field(d_name)
+            sq = q[so].astype(np.float32)
+        else:
+            sq = sm
+
+        _slot_sorted[slot_idx] = (slot_id, sm, sq)
+        return sm, sq
+
+    def _render_composite_frame(fb_w, fb_h):
+        """Render two fields into separate FBOs and composite them."""
+        renderer._ensure_fbo(fb_w, fb_h, which=1)
+        renderer._ensure_fbo(fb_w, fb_h, which=2)
+
+        gpu_ready_now = gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False)
+        accum_sets = [renderer._accum_textures, renderer._accum_textures2]
+
+        for i in range(2):
+            sl = _state["_slot"][i]
+
+            cache_ready = _slot_sorted[i] is not None
+            if gpu_ready_now and renderer._grid is not None and cache_ready:
+                sorted_mass, sorted_qty = _slot_sorted[i][1], _slot_sorted[i][2]
+
+                # Write mass to GPU
+                device.queue.write_buffer(gpu_compute._particle_bufs["mass"], 0, sorted_mass.tobytes())
+
+                # For LOS vector fields: use GPU projection instead of CPU-sorted qty
+                is_los_vec = (sl.get("proj") == "LOS" and
+                              sl["mode"] in ("WeightedAverage", "WeightedVariance") and
+                              sl["data"] in _state["_vector_fields"])
+                is_los_weight = (sl.get("proj") == "LOS" and
+                                 sl["weight"] in _state["_vector_fields"])
+                if is_los_vec:
+                    if not gpu_compute.has_los_field() or getattr(gpu_compute, '_los_field_name', '') != sl["data"]:
+                        gpu_compute.upload_vector_field(renderer._grid, sl["data"], data)
+                    gpu_compute.dispatch_los_project(camera)
+                else:
+                    device.queue.write_buffer(gpu_compute._particle_bufs["qty"], 0, sorted_qty.tobytes())
+
+                n_out, n_vis, summary_data = gpu_compute.dispatch_cull(
+                    camera, renderer.max_render_particles,
+                    lod_pixels=renderer.lod_pixels,
+                    viewport_width=renderer._viewport_width,
+                    summary_overlap=renderer.summary_overlap,
+                )
+                renderer.set_particle_buffers_from_gpu(gpu_compute.get_output_buffers(), n_out)
+                s_pos, s_hsml, s_mass, s_qty, s_cov = summary_data
+                if renderer.use_aniso_summaries and len(s_pos) > 0:
+                    renderer._upload_aniso_summaries(s_pos, s_mass, s_qty, s_cov)
+                else:
+                    renderer._upload_aniso_summaries(
+                        np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                        np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
+            else:
+                w, q = app_proxy._compute_slot(sl)
+                renderer.update_weights(w, q)
+                renderer.update_visible(camera)
+
+            renderer._write_camera_uniforms(camera, fb_w, fb_h)
+            renderer._render_accum(camera, fb_w, fb_h, accum_sets[i])
+
+        s0, s1 = _state["_slot"][0], _state["_slot"][1]
+        renderer.render_composite(
+            camera, fb_w, fb_h,
+            s0["resolve"], s0["min"], s0["max"], s0["log"],
+            s1["resolve"], s1["min"], s1["max"], s1["log"],
+        )
 
     def do_cull():
         """Run cull via GPU compute (zero-copy) or CPU fallback."""
@@ -411,8 +676,57 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 app_proxy._apply_render_mode(auto_range=True)
 
         # --- Cull / progressive refinement / auto-LOD ---
-        # Skip all culling while GPU compute is still uploading — just render the existing frame
-        if not gpu_ready and moved:
+        # Composite mode: progressive refinement via budget, cull happens in _render_composite_frame
+        if _state["_composite"]:
+            if moved:
+                if refine_saved_lod is not None:
+                    renderer.lod_pixels = user_lod
+                    renderer.max_render_particles = user_budget
+                    refine_saved_lod = None
+                    refine_saved_budget = None
+                refine_budget = 0
+                if not was_moving:
+                    renderer.lod_pixels = max(user_lod, 8)
+                    renderer.max_render_particles = min(user_budget, 2_000_000)
+
+                # Smoothed frame time (EMA)
+                if dt > 0:
+                    if not was_moving:
+                        smooth_frame_ms = 0.0
+                    elif smooth_frame_ms == 0.0:
+                        smooth_frame_ms = dt * 1000
+                    else:
+                        tau = max(renderer.auto_lod_smooth, 0.01)
+                        a = min(dt / tau, 1.0)
+                        smooth_frame_ms = (1 - a) * smooth_frame_ms + a * dt * 1000
+
+                # Auto-LOD (more aggressive for composite since it's 2x cost)
+                tau = max(renderer.auto_lod_smooth, 0.01)
+                if renderer.auto_lod and smooth_frame_ms > 0 and (now - last_lod_adjust) >= tau:
+                    target_ms = 1000.0 / max(renderer.target_fps, 1.0)
+                    if smooth_frame_ms > target_ms:
+                        renderer.lod_pixels = min(256, renderer.lod_pixels * 2)
+                        renderer.max_render_particles = max(100_000, renderer.max_render_particles // 2)
+                        last_lod_adjust = now
+                    elif smooth_frame_ms < target_ms * 0.5:
+                        renderer.lod_pixels = max(1, renderer.lod_pixels // 2)
+                        renderer.max_render_particles = min(renderer.n_total, renderer.max_render_particles * 2)
+                        last_lod_adjust = now
+
+            elif refine_budget < renderer.n_total:
+                if was_moving:
+                    smooth_frame_ms = 0.0
+                    refine_saved_lod = renderer.lod_pixels
+                    refine_saved_budget = renderer.max_render_particles
+                    refine_budget = max(user_budget, 4_000_000)
+                if refine_budget == 0:
+                    refine_budget = max(user_budget, 4_000_000)
+                    refine_saved_lod = renderer.lod_pixels
+                    refine_saved_budget = renderer.max_render_particles
+                refine_budget = min(refine_budget * 2, renderer.n_total)
+                renderer.lod_pixels = 1
+                renderer.max_render_particles = refine_budget
+        elif not gpu_ready and moved:
             pass  # keep rendering last frame — no cull, no lag
         elif moved:
             # Restore user base if coming out of refinement
@@ -495,13 +809,21 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
         # Render
         try:
-            renderer.render(camera, fb_w, fb_h)
+            if _state["_composite"]:
+                _render_composite_frame(fb_w, fb_h)
+            else:
+                renderer.render(camera, fb_w, fb_h)
         except Exception as e:
             print(f"Render error: {e}")
-            continue
+            import traceback; traceback.print_exc()
+            # Ensure we still present something (avoid black flash)
+            try:
+                renderer.render(camera, fb_w, fb_h)
+            except Exception:
+                pass
 
         # Auto-range on first frame
-        if needs_auto_range:
+        if needs_auto_range and not _state["_composite"]:
             lo, hi = renderer.read_accum_range()
             renderer.qty_min = lo
             renderer.qty_max = hi
@@ -554,6 +876,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 vector_fields=_vector_fields,
                 vector_projection=_state["_vector_projection"],
                 vector_projections=_VECTOR_PROJECTIONS,
+                composite_slots=_state["_slot"] if _state["_composite"] else None,
             )
 
             encoder = device.create_command_encoder()
