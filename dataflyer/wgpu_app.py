@@ -243,7 +243,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
             elif key == glfw.KEY_COMMA:
                 renderer.max_render_particles = max(
-                    100_000, renderer.max_render_particles // 2)
+                    1_000, renderer.max_render_particles // 2)
                 user_budget = renderer.max_render_particles
                 print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
             elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
@@ -489,9 +489,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     user_lod = renderer.lod_pixels
     user_budget = renderer.max_render_particles
     smooth_frame_ms = 0.0
+    smooth_fps_ema = 0.0
     last_lod_adjust = 0.0
-    pid_integral = 0.0
     pid_prev_error = 0.0
+    pid_integral = 0.0
     refine_budget = 0
     refine_saved_lod = None
     refine_saved_budget = None
@@ -741,25 +742,22 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     refine_saved_lod = None
                     refine_saved_budget = None
                 refine_budget = 0
-                if not was_moving:
+                if not was_moving and renderer.auto_lod:
                     renderer.lod_pixels = max(user_lod, 8)
                     renderer.max_render_particles = min(user_budget, 2_000_000)
 
-                # Smoothed wall-clock frame time (EMA)
-                if dt > 0:
-                    if not was_moving:
-                        smooth_frame_ms = 0.0
-                        pid_integral = 0.0
-                        pid_prev_error = 0.0
-                    elif smooth_frame_ms == 0.0:
-                        smooth_frame_ms = dt * 1000
-                    else:
-                        tau = max(renderer.auto_lod_smooth, 0.01)
-                        a = min(dt / tau, 1.0)
-                        smooth_frame_ms = (1 - a) * smooth_frame_ms + a * dt * 1000
+                if not was_moving:
+                    pid_integral = 0.0
 
-                # PID auto-LOD on log2(budget)
+                # Smoothed frame time (unbiased EMA of frame rate)
                 import math
+                if dt > 0:
+                    tau = max(renderer.auto_lod_smooth, 0.01)
+                    a = min(1.0, dt / tau)
+                    fps_inst = 1.0 / dt
+                    smooth_fps_ema = (1 - a) * smooth_fps_ema + a * fps_inst
+                    smooth_frame_ms = 1000.0 / max(smooth_fps_ema, 0.01)
+                # PID auto-LOD on log2(budget)
                 if renderer.auto_lod and smooth_frame_ms > 0 and dt > 0:
                     target_ms = 1000.0 / max(renderer.target_fps, 1.0)
                     error = math.log2(max(smooth_frame_ms / target_ms, 0.01))
@@ -769,14 +767,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     pid_prev_error = error
                     rate = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
                     output = rate * dt
-                    log2_budget = math.log2(max(renderer.max_render_particles, 100_000))
+                    log2_budget = math.log2(max(renderer.max_render_particles, 1_000))
                     log2_budget -= output
                     log2_n = math.log2(max(renderer.n_total, 1))
-                    log2_budget = max(math.log2(100_000), min(log2_n, log2_budget))
-                    renderer.max_render_particles = max(100_000, min(
+                    log2_budget = max(math.log2(1_000), min(log2_n, log2_budget))
+                    renderer.max_render_particles = max(1_000, min(
                         renderer.n_total, int(2 ** log2_budget)))
                     frac = renderer.max_render_particles / max(renderer.n_total, 1)
-                    renderer.lod_pixels = max(1, min(256, int(1.0 / max(frac, 0.004))))
+                    renderer.lod_pixels = max(1.0, min(256.0, 1.0 / max(frac, 0.004)))
 
             elif refine_budget < renderer.n_total:
                 if was_moving:
@@ -800,28 +798,25 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 refine_saved_budget = None
             refine_budget = 0
 
-            if not was_moving:
+            if not was_moving and renderer.auto_lod:
                 # Just started moving — low-quality cull for responsive first frame
                 renderer.lod_pixels = max(user_lod, 4)
                 renderer.max_render_particles = min(user_budget, 4_000_000)
                 do_cull()
                 last_cull_time = now
 
-            # Smoothed wall-clock frame time (EMA)
-            if dt > 0:
-                if not was_moving:
-                    smooth_frame_ms = 0.0
-                    pid_integral = 0.0
-                    pid_prev_error = 0.0
-                elif smooth_frame_ms == 0.0:
-                    smooth_frame_ms = dt * 1000
-                else:
-                    tau = max(renderer.auto_lod_smooth, 0.01)
-                    a = min(dt / tau, 1.0)
-                    smooth_frame_ms = (1 - a) * smooth_frame_ms + a * dt * 1000
+            if not was_moving:
+                pid_integral = 0.0
 
-            # PID auto-LOD on log2(budget)
+            # Smoothed frame time (unbiased EMA of frame rate)
             import math
+            if dt > 0:
+                tau = max(renderer.auto_lod_smooth, 0.01)
+                a = min(1.0, dt / tau)
+                fps_inst = 1.0 / dt
+                smooth_fps_ema = (1 - a) * smooth_fps_ema + a * fps_inst
+                smooth_frame_ms = 1000.0 / max(smooth_fps_ema, 0.01)
+            # PID auto-LOD on log2(budget)
             if renderer.auto_lod and smooth_frame_ms > 0 and dt > 0:
                 target_ms = 1000.0 / max(renderer.target_fps, 1.0)
                 error = math.log2(max(smooth_frame_ms / target_ms, 0.01))
@@ -830,20 +825,18 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 derivative = (error - pid_prev_error) / dt
                 pid_prev_error = error
                 output = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
-                log2_budget = math.log2(max(renderer.max_render_particles, 100_000))
+                log2_budget = math.log2(max(renderer.max_render_particles, 1_000))
                 log2_budget -= output
                 log2_n = math.log2(max(renderer.n_total, 1))
-                log2_budget = max(math.log2(100_000), min(log2_n, log2_budget))
-                renderer.max_render_particles = max(100_000, min(
+                log2_budget = max(math.log2(1_000), min(log2_n, log2_budget))
+                renderer.max_render_particles = max(1_000, min(
                     renderer.n_total, int(2 ** log2_budget)))
                 frac = renderer.max_render_particles / max(renderer.n_total, 1)
-                renderer.lod_pixels = max(1, min(256, int(1.0 / max(frac, 0.004))))
+                renderer.lod_pixels = max(1.0, min(256.0, 1.0 / max(frac, 0.004)))
 
-            # Throttled cull
-            cull_dt = renderer.cull_interval
-            if now - last_cull_time >= cull_dt:
-                do_cull()
-                last_cull_time = now
+            # Cull every frame while moving (PID controls budget to keep it fast)
+            do_cull()
+            last_cull_time = now
 
         elif refine_budget < renderer.n_total:
             # --- STOPPED: progressive refinement ---
@@ -931,7 +924,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             overlay.set_framebuffer_size(fb_w, fb_h)
             user_menu.set_framebuffer_size(fb_w, fb_h)
 
-            smooth_fps_val = 1000.0 / max(smooth_frame_ms, 1.0) if smooth_frame_ms > 0 else 0.0
+            smooth_fps_val = smooth_fps_ema if smooth_fps_ema > 0 else fps
             # Only rebuild overlay texture at ~4Hz to avoid PIL cost every frame
             _overlay_age = getattr(overlay, '_last_update_time', 0)
             if now - _overlay_age > 0.25:
@@ -1142,24 +1135,24 @@ def _run_wgpu_benchmark(n_frames, window, canvas_context, device, renderer, came
         budget_list.append(renderer.max_render_particles)
 
     def pid_update(dt_s):
-        nonlocal smooth_frame_ms, pid_integral, pid_prev_error
-        if not renderer.auto_lod or smooth_frame_ms <= 0 or dt_s <= 0:
+        nonlocal pid_integral, pid_prev_error
+        if not renderer.auto_lod or dt_s <= 0:
             return
         target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-        error = math.log2(max(smooth_frame_ms / target_ms, 0.01))
+        error = math.log2(max(dt_s * 1000 / target_ms, 0.01))
         pid_integral += error * dt_s
         pid_integral = max(-4.0, min(4.0, pid_integral))
         derivative = (error - pid_prev_error) / dt_s
         pid_prev_error = error
         rate = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
         output = rate * dt_s
-        log2_budget = math.log2(max(renderer.max_render_particles, 100_000))
+        log2_budget = math.log2(max(renderer.max_render_particles, 1_000))
         log2_budget -= output
         log2_n = math.log2(max(renderer.n_total, 1))
-        log2_budget = max(math.log2(100_000), min(log2_n, log2_budget))
-        renderer.max_render_particles = max(100_000, min(renderer.n_total, int(2 ** log2_budget)))
+        log2_budget = max(math.log2(1_000), min(log2_n, log2_budget))
+        renderer.max_render_particles = max(1_000, min(renderer.n_total, int(2 ** log2_budget)))
         frac = renderer.max_render_particles / max(renderer.n_total, 1)
-        renderer.lod_pixels = max(1, min(256, int(1.0 / max(frac, 0.004))))
+        renderer.lod_pixels = max(1.0, min(256.0, 1.0 / max(frac, 0.004)))
 
     prev_kf = keyframes[0]
 
@@ -1187,7 +1180,6 @@ def _run_wgpu_benchmark(n_frames, window, canvas_context, device, renderer, came
                 if not was_moving:
                     smooth_frame_ms = 0.0
                     pid_integral = 0.0
-                    pid_prev_error = 0.0
                 elif smooth_frame_ms == 0.0:
                     smooth_frame_ms = dt_s * 1000
                 else:

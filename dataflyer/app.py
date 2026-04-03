@@ -448,7 +448,7 @@ class DataFlyerApp:
 
     def _decrease_budget(self):
         self.renderer.max_render_particles = max(
-            100_000, self.renderer.max_render_particles // 2)
+            1_000, self.renderer.max_render_particles // 2)
         self._user_budget = self.renderer.max_render_particles
         self._msg(f"Max particles: {self.renderer.max_render_particles/1e6:.1f}M")
         self._refinement_level = 0
@@ -652,58 +652,51 @@ class DataFlyerApp:
             self._refine_budget = 0
 
             if not self._was_moving:
-                self.renderer.lod_pixels = max(self._user_lod, 4)
-                self.renderer.max_render_particles = min(self._user_budget, 4_000_000)
+                self._pid_integral = 0.0
+                self._pid_prev_error = 0.0
+                if self.renderer.auto_lod:
+                    # Start moving with conservative settings; PID will adjust
+                    self.renderer.lod_pixels = max(self._user_lod, 4)
+                    self.renderer.max_render_particles = min(self._user_budget, 4_000_000)
                 if not self._composite:
                     self.renderer.update_visible(self.camera)
                 self._last_cull_time = now
 
-            # Smoothed frame time (EMA)
-            # Smoothed wall-clock frame time (EMA)
+            # Smoothed frame time (unbiased EMA — constant per-frame weight)
             if dt > 0:
-                if not self._was_moving:
-                    self._smooth_frame_ms = 0.0
-                    self._pid_integral = 0.0
-                    self._pid_prev_error = 0.0
-                elif self._smooth_frame_ms == 0.0:
-                    self._smooth_frame_ms = dt * 1000
-                else:
-                    tau = max(self.renderer.auto_lod_smooth, 0.01)
-                    a = min(dt / tau, 1.0)
-                    self._smooth_frame_ms = (1 - a) * self._smooth_frame_ms + a * dt * 1000
+                tau = max(self.renderer.auto_lod_smooth, 0.01)
+                a = min(1.0, dt / tau)  # ~N-frame window where N=tau/dt
+                # Use harmonic-mean-safe approach: smooth 1/dt (frame rate) then invert
+                fps_inst = 1000.0 / (dt * 1000)
+                self._smooth_fps = (1 - a) * self._smooth_fps + a * fps_inst
+                self._smooth_frame_ms = 1000.0 / max(self._smooth_fps, 0.01)
 
-            # PID auto-LOD: controls log2(max_render_particles) in real time.
-            # Output is in log2-units/second, scaled by dt for frame-rate independence.
-            # budget_new = budget_old * (target/work)^(Kp*dt) — smooth at any FPS.
+            # PID auto-LOD (operates on smoothed frame time, not raw dt)
             if self.renderer.auto_lod and self._smooth_frame_ms > 0 and dt > 0:
                 target_ms = 1000.0 / max(self.renderer.target_fps, 1.0)
                 error = math.log2(max(self._smooth_frame_ms / target_ms, 0.01))
 
-                Kp = self.renderer.pid_Kp
-                Ki = self.renderer.pid_Ki
-                Kd = self.renderer.pid_Kd
-
                 self._pid_integral += error * dt
                 self._pid_integral = max(-4.0, min(4.0, self._pid_integral))
-                derivative = (error - self._pid_prev_error) / dt
+                derivative = (error - self._pid_prev_error) / dt if dt > 0 else 0.0
                 self._pid_prev_error = error
 
-                # Output in log2-units per second
-                rate = Kp * error + Ki * self._pid_integral + Kd * derivative
-                # Scale by dt for frame-rate independent correction
+                rate = (self.renderer.pid_Kp * error
+                        + self.renderer.pid_Ki * self._pid_integral
+                        + self.renderer.pid_Kd * derivative)
                 output = rate * dt
 
-                log2_budget = math.log2(max(self.renderer.max_render_particles, 100_000))
+                log2_budget = math.log2(max(self.renderer.max_render_particles, 1_000))
                 log2_budget = log2_budget - output
                 log2_n = math.log2(max(self.renderer.n_total, 1))
-                log2_budget = max(math.log2(100_000), min(log2_n, log2_budget))
-                self.renderer.max_render_particles = max(100_000, min(
+                log2_budget = max(math.log2(1_000), min(log2_n, log2_budget))
+                self.renderer.max_render_particles = max(1_000, min(
                     self.renderer.n_total, int(2 ** log2_budget)))
 
                 # Scale lod_pixels proportionally: fewer particles → coarser LOD
                 frac = self.renderer.max_render_particles / max(self.renderer.n_total, 1)
                 # At frac=1 → lod=1, at frac=0.01 → lod~128
-                self.renderer.lod_pixels = max(1, min(256, int(1.0 / max(frac, 0.004))))
+                self.renderer.lod_pixels = max(1.0, min(256.0, 1.0 / max(frac, 0.004)))
 
             # Throttled cull
             if now - self._last_cull_time >= self.renderer.cull_interval:
@@ -775,6 +768,7 @@ class DataFlyerApp:
                 self._was_moving = False
                 self._last_cull_time = 0.0
                 self._smooth_frame_ms = 0.0
+                self._smooth_fps = 0.0
                 self._last_lod_adjust = 0.0
                 self._pid_integral = 0.0
                 self._pid_prev_error = 0.0
@@ -836,7 +830,7 @@ class DataFlyerApp:
 
                 if self.overlay.enabled:
                     self.overlay.set_framebuffer_size(fb_width, fb_height)
-                    smooth_fps = 1000.0 / max(self._smooth_frame_ms, 1.0) if self._smooth_frame_ms > 0 else 0.0
+                    smooth_fps = self._smooth_fps if self._smooth_fps > 0 else self._fps
                     self.overlay.update(
                         self.renderer, self.camera, self._fps,
                         self._render_mode.name, AVAILABLE_COLORMAPS[self._cmap_idx],
@@ -1032,7 +1026,6 @@ class DataFlyerApp:
         self._smooth_frame_ms = 0.0
         self._last_lod_adjust = 0.0
         self._pid_integral = 0.0
-        self._pid_prev_error = 0.0
         self._refine_budget = 0
         self._refine_saved_lod = None
         self._refine_saved_budget = None

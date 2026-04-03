@@ -308,10 +308,10 @@ class SplatRenderer:
         self.auto_lod = True  # auto-tune LOD to maintain target FPS while moving
         self.target_fps = 15.0  # target FPS for auto-LOD
         self.auto_lod_smooth = 1.0  # EMA smoothing timescale in seconds
-        self.pid_Kp = 4.0  # PID proportional gain (log2-units/sec per unit error)
+        self.pid_Kp = 0.5  # PID proportional gain (log2-units/sec per unit error)
+        self.pid_Kd = 0.0  # PID derivative gain
         self.pid_Ki = 0.0  # PID integral gain
-        self.pid_Kd = 0.0  # PID derivative gain (0 recommended — D amplifies noise)
-        self.cull_interval = 0.5  # seconds between culls while moving
+        self.cull_interval = 0.0  # seconds between culls while moving (0 = every frame)
         self._needs_grid_rebuild = False
 
     def set_particles(self, positions, hsml, masses, quantity=None):

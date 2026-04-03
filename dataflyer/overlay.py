@@ -400,7 +400,7 @@ class DevOverlay(Panel):
         if renderer.auto_lod:
             items.append(("slider", "Target FPS", renderer.target_fps, 1.0, 60.0, "target_fps"))
             items.append(("slider", "LOD Smooth (s)", renderer.auto_lod_smooth, 0.05, 2.0, "auto_lod_smooth"))
-            items.append(("slider", "PID Kp", renderer.pid_Kp, 0.0, 5.0, "pid_Kp"))
+            items.append(("slider", "PID Kp", renderer.pid_Kp, 0.0, 10.0, "pid_Kp"))
             items.append(("slider", "PID Ki", renderer.pid_Ki, 0.0, 2.0, "pid_Ki"))
             items.append(("slider", "PID Kd", renderer.pid_Kd, 0.0, 2.0, "pid_Kd"))
         items.append(("text", ""))
