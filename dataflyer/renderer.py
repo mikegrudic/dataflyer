@@ -297,7 +297,7 @@ class SplatRenderer:
         self.use_tree = True
         self.tree_min_particles = 0  # only build tree if N > this threshold
         self.tree_n_cells = 64  # grid cells per side (legacy, unused with adaptive octree)
-        self.tree_leaf_size = 32  # max particles per leaf cell
+        self.tree_leaf_size = 1024  # max particles per leaf cell
         self.use_importance_sampling = False
         self.KERNELS = ["cubic_spline", "wendland_c2", "gaussian", "quartic", "sphere"]
         self.kernel = "cubic_spline"

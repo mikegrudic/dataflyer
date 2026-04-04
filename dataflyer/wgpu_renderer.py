@@ -103,7 +103,7 @@ class WGPURenderer:
         self.use_tree = True
         self.tree_min_particles = 0
         self.tree_n_cells = 64  # legacy, unused with adaptive octree
-        self.tree_leaf_size = 32
+        self.tree_leaf_size = 1024
         self.use_importance_sampling = False
         self.kernel = "cubic_spline"
         self.use_hybrid_rendering = True

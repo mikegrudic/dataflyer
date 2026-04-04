@@ -77,18 +77,15 @@ def _find_leaf_depth(sorted_codes, n, leaf_size, max_depth):
     - average particles/cell >= leaf_size (don't over-subdivide), OR
     - total cells <= 4M (GPU dispatch limit)
     """
-    MAX_LEAVES = 4_000_000
     best = 1
     for d in range(1, max_depth + 1):
         shift = np.uint64(3 * (max_depth - d))
         cell_codes = sorted_codes >> shift
         n_cells = 1 + np.count_nonzero(cell_codes[1:] != cell_codes[:-1])
-        if n_cells > MAX_LEAVES:
-            break  # too many cells, use previous depth
-        best = d
         avg_per_cell = n / n_cells
-        if avg_per_cell <= leaf_size:
+        if avg_per_cell < leaf_size:
             break  # cells are small enough
+        best = d
     return best
 
 
