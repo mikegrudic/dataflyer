@@ -118,13 +118,13 @@ class GPUCompute:
         self._n_levels = len(grid.levels)
         self._max_output = max_output
 
-        nc3 = grid.n_cells ** 3
+        # n_leaves = number of finest-level cells (was nc^3 for uniform grid)
+        n_leaves = grid.levels[0]["nc"]
 
         # Upload per-level data (small, <10MB total)
         self._level_bufs = []
         for lv in grid.levels:
-            nc = lv["nc"]
-            n = nc ** 3
+            n = lv["nc"]  # number of nodes at this level
             hd = float(lv["half_diag"])
 
             centers4 = np.zeros((n, 4), dtype=np.float32)
@@ -139,8 +139,10 @@ class GPUCompute:
             cov_packed[0::2, :3] = lv["cov"][:, :3]  # xx, xy, xz
             cov_packed[1::2, :3] = lv["cov"][:, 3:]  # yy, yz, zz
 
+            # Upload parent_idx buffer (for adaptive octree parent lookup)
+            parent_idx = lv.get("parent_idx", np.zeros(max(n, 1), dtype=np.uint32))
             level_data = {
-                "nc": nc,
+                "n_nodes": n,
                 "mass": dev.create_buffer_with_data(
                     data=lv["mass"].astype(np.float32), usage=buf_usage),
                 "hsml": dev.create_buffer_with_data(
@@ -155,6 +157,8 @@ class GPUCompute:
                 "cov_gpu": dev.create_buffer_with_data(data=cov_packed, usage=buf_usage),
                 "mh2_gpu": dev.create_buffer_with_data(
                     data=lv["mh2"].astype(np.float32), usage=buf_usage),
+                "parent_idx": dev.create_buffer_with_data(
+                    data=parent_idx.astype(np.uint32), usage=buf_usage),
                 "cs": lv["cs"].copy(),
                 "half_diag": hd,
                 # Numpy copies for upload_weights refresh
@@ -200,14 +204,15 @@ class GPUCompute:
                 size=max_output * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC),
         }
 
-        # Work buffers
+        # Work buffers (sized for leaf cells)
+        self._n_leaves = n_leaves
         self._cell_out_counts_buf = dev.create_buffer(
-            size=nc3 * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
+            size=n_leaves * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
         self._counters_buf = dev.create_buffer(
             size=16, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST)
 
         # Prefix sum block sums
-        n_blocks_1 = _div_ceil(nc3, WG_SIZE)
+        n_blocks_1 = _div_ceil(n_leaves, WG_SIZE)
         n_blocks_2 = _div_ceil(n_blocks_1, WG_SIZE)
         self._scan_block_sums_1 = dev.create_buffer(
             size=max(n_blocks_1 * 4, 4), usage=wgpu.BufferUsage.STORAGE)
@@ -225,9 +230,9 @@ class GPUCompute:
             "cov": dev.create_buffer(size=MAX_SUMMARIES * 2 * 16, usage=out_usage),  # 2 vec4 per summary
         }
         # Per-level summary count buffer (reused for each level's prefix sum)
-        max_level_nc3 = max(lv["nc"] ** 3 for lv in grid.levels)
+        max_level_nodes = max(lv["nc"] for lv in grid.levels)
         self._summary_counts_buf = dev.create_buffer(
-            size=max_level_nc3 * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
+            size=max_level_nodes * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
         self._summary_counters_buf = dev.create_buffer(
             size=16, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST)
         self._summary_params_buf = dev.create_buffer(
@@ -303,8 +308,7 @@ class GPUCompute:
         # Re-upload per-level data that depends on mass/qty
         for i, lv in enumerate(grid.levels):
             lb = self._level_bufs[i]
-            nc = lb["nc"]
-            n = nc ** 3
+            n = lb["n_nodes"]
             dev.queue.write_buffer(lb["mass"], 0, lv["mass"].astype(np.float32).tobytes())
             dev.queue.write_buffer(lb["hsml"], 0, lv["hsml"].astype(np.float32).tobytes())
             # Summary GPU buffers
@@ -327,10 +331,11 @@ class GPUCompute:
         _bg = _make_bind_group
         _pipe = _make_compute_pipeline
 
-        # --- Frustum cull pipeline ---
+        # --- Frustum cull pipeline (7 bindings: params, mass, hsml, centers, parent_decision, decision, parent_idx) ---
         self._cull_bgl = _bgl(dev, [
             "uniform", "read-only-storage", "read-only-storage",
-            "read-only-storage", "read-only-storage", "storage"])
+            "read-only-storage", "read-only-storage", "storage",
+            "read-only-storage"])
         self._cull_pipeline = _pipe(dev, [self._cull_bgl], self._cull_module, "main")
 
         # --- Compute stride pipeline ---
@@ -374,7 +379,7 @@ class GPUCompute:
         self._gather_bg2 = _bg(dev, self._gather_bgl2,
                                [ob["pos"], ob["hsml"], ob["mass"], ob["qty"]])
 
-        # Pre-build per-level cull bind groups
+        # Pre-build per-level cull bind groups (7 bindings including parent_idx)
         self._per_level_cull_bgs = []
         for li in range(self._n_levels):
             lb = self._level_bufs[li]
@@ -384,7 +389,8 @@ class GPUCompute:
             )
             self._per_level_cull_bgs.append(_bg(dev, self._cull_bgl, [
                 self._per_level_cull_params[li], lb["mass"], lb["hsml"],
-                lb["centers"], parent_decision_buf, lb["decision"]]))
+                lb["centers"], parent_decision_buf, lb["decision"],
+                lb["parent_idx"]]))
 
         # Pre-build per-level summary bind groups
         self._per_level_summary_bg0s = []
@@ -407,19 +413,16 @@ class GPUCompute:
                       read back from CPU since summaries are few and need covariance assembly.
         """
         dev = self.device
-        nc = self._n_cells
-        nc3 = nc ** 3
+        n_leaves = self._n_leaves
         fov_rad = float(np.radians(camera.fov))
         pix_per_rad = viewport_width / (2.0 * np.tan(fov_rad / 2))
 
         # === Pass 1: Multi-level frustum cull + LOD (batched) ===
-        # Write all per-level params upfront, then one submit with all dispatches.
         for li in range(self._n_levels - 1, -1, -1):
             lb = self._level_bufs[li]
-            level_nc = lb["nc"]
+            n_nodes = lb["n_nodes"]
             is_coarsest = 1 if li == self._n_levels - 1 else 0
             is_finest = 1 if li == 0 else 0
-            parent_nc = self._level_bufs[li + 1]["nc"] if li < self._n_levels - 1 else 0
             params_data = struct.pack(
                 "fff f fff f fff f fff f ffff IIII",
                 *camera.position, 0.0,
@@ -427,40 +430,39 @@ class GPUCompute:
                 *camera.right, 0.0,
                 *camera.up, 0.0,
                 fov_rad, camera.aspect, pix_per_rad, float(lod_pixels),
-                is_coarsest, is_finest, parent_nc, level_nc,
+                is_coarsest, is_finest, n_nodes, 0,
             )
             dev.queue.write_buffer(self._per_level_cull_params[li], 0, params_data)
 
         encoder = dev.create_command_encoder()
         for li in range(self._n_levels - 1, -1, -1):
-            level_nc3 = self._level_bufs[li]["nc"] ** 3
+            n_nodes_li = self._level_bufs[li]["n_nodes"]
             cpass = encoder.begin_compute_pass()
             cpass.set_pipeline(self._cull_pipeline)
             cpass.set_bind_group(0, self._per_level_cull_bgs[li])
-            cpass.dispatch_workgroups(_div_ceil(level_nc3, WG_SIZE))
+            cpass.dispatch_workgroups(_div_ceil(n_nodes_li, WG_SIZE))
             cpass.end()
         dev.queue.submit([encoder.finish()])
 
         # === GPU Summary Gather (batched, atomic offset) ===
-        # Write all per-level summary params, clear counter, one submit with all levels
         dev.queue.write_buffer(self._summary_counters_buf, 0, struct.pack("IIII", 0, 0, 0, 0))
         for li in range(self._n_levels - 1, 0, -1):
             lb = self._level_bufs[li]
             cs = lb["cs"]
             dev.queue.write_buffer(self._per_level_summary_params[li], 0,
-                                   struct.pack("IfffffII", lb["nc"] ** 3, summary_overlap,
+                                   struct.pack("IfffffII", lb["n_nodes"], summary_overlap,
                                                float(cs[0]**2), float(cs[1]**2),
                                                float(cs[2]**2), 0, 0, 0))
 
         encoder = dev.create_command_encoder()
         for li in range(self._n_levels - 1, 0, -1):
-            level_nc3 = self._level_bufs[li]["nc"] ** 3
+            n_nodes_li = self._level_bufs[li]["n_nodes"]
             cpass = encoder.begin_compute_pass()
             cpass.set_pipeline(self._summary_gather_pipeline)
             cpass.set_bind_group(0, self._per_level_summary_bg0s[li])
             cpass.set_bind_group(1, self._per_level_summary_bg1s[li])
             cpass.set_bind_group(2, self._summary_out_bg)
-            cpass.dispatch_workgroups(_div_ceil(level_nc3, WG_SIZE))
+            cpass.dispatch_workgroups(_div_ceil(n_nodes_li, WG_SIZE))
             cpass.end()
         dev.queue.submit([encoder.finish()])
 
@@ -474,7 +476,7 @@ class GPUCompute:
             self._grow_output_buffers(budget)
 
         dev.queue.write_buffer(self._gather_params_buf, 0,
-                               struct.pack("IIII", nc3, budget, 0, 1))
+                               struct.pack("IIII", n_leaves, budget, 0, 1))
 
         finest_decision_buf = self._level_bufs[0]["decision"]
         gather_bg0 = _make_bind_group(dev, self._gather_bgl0, [
@@ -483,7 +485,7 @@ class GPUCompute:
         gather_bgs = [gather_bg0, self._gather_bg1, self._gather_bg2]
 
         # Count particles
-        self._dispatch(self._count_pipeline, gather_bgs, _div_ceil(nc3, WG_SIZE))
+        self._dispatch(self._count_pipeline, gather_bgs, _div_ceil(n_leaves, WG_SIZE))
 
         # Read total visible, compute stride on CPU
         counter_data = dev.queue.read_buffer(self._counters_buf, size=16)
@@ -492,11 +494,11 @@ class GPUCompute:
 
         # Apply stride
         dev.queue.write_buffer(self._gather_params_buf, 0,
-                               struct.pack("IIII", nc3, budget, total_visible, stride))
-        self._dispatch(self._apply_stride_pipeline, gather_bgs, _div_ceil(nc3, WG_SIZE))
+                               struct.pack("IIII", n_leaves, budget, total_visible, stride))
+        self._dispatch(self._apply_stride_pipeline, gather_bgs, _div_ceil(n_leaves, WG_SIZE))
 
         # Prefix sum
-        self._prefix_sum(self._cell_out_counts_buf, nc3)
+        self._prefix_sum(self._cell_out_counts_buf, n_leaves)
 
         # Read n_output from apply_stride
         counter_data2 = dev.queue.read_buffer(self._counters_buf, size=16)
@@ -504,7 +506,7 @@ class GPUCompute:
         n_output = min(n_output, self._max_output)
 
         # === Pass 5: Gather particles ===
-        self._dispatch(self._gather_pipeline, gather_bgs, _div_ceil(nc3, WG_SIZE))
+        self._dispatch(self._gather_pipeline, gather_bgs, _div_ceil(n_leaves, WG_SIZE))
 
         # Read n_summaries
         sc_data = dev.queue.read_buffer(self._summary_counters_buf, size=4)
