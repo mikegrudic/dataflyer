@@ -118,13 +118,10 @@ class GPUCompute:
         self._n_levels = len(grid.levels)
         self._max_output = max_output
 
-        # n_leaves = number of finest-level cells (was nc^3 for uniform grid)
-        n_leaves = grid.levels[0]["nc"]
-
         # Upload per-level data (small, <10MB total)
         self._level_bufs = []
         for lv in grid.levels:
-            n = lv["nc"]  # number of nodes at this level
+            n = len(lv["mass"])  # number of nodes at this level
             hd = float(lv["half_diag"])
 
             centers4 = np.zeros((n, 4), dtype=np.float32)
@@ -139,8 +136,18 @@ class GPUCompute:
             cov_packed[0::2, :3] = lv["cov"][:, :3]  # xx, xy, xz
             cov_packed[1::2, :3] = lv["cov"][:, 3:]  # yy, yz, zz
 
-            # Upload parent_idx buffer (for adaptive octree parent lookup)
-            parent_idx = lv.get("parent_idx", np.zeros(max(n, 1), dtype=np.uint32))
+            # Upload parent_idx buffer (maps each node to its parent in the parent level).
+            # AdaptiveOctree provides this directly; for SpatialGrid we compute it
+            # from the 3D grid structure: parent_idx = (ix/2)*pnc^2 + (iy/2)*pnc + (iz/2)
+            if "parent_idx" in lv:
+                parent_idx = lv["parent_idx"]
+            else:
+                nc = lv["nc"]  # cells per side (SpatialGrid convention)
+                pnc = nc // 2 if nc > 2 else 1
+                ix = np.arange(n, dtype=np.uint32) // (nc * nc)
+                iy = (np.arange(n, dtype=np.uint32) // nc) % nc
+                iz = np.arange(n, dtype=np.uint32) % nc
+                parent_idx = (ix // 2) * pnc * pnc + (iy // 2) * pnc + (iz // 2)
             level_data = {
                 "n_nodes": n,
                 "mass": dev.create_buffer_with_data(
@@ -205,6 +212,7 @@ class GPUCompute:
         }
 
         # Work buffers (sized for leaf cells)
+        n_leaves = len(grid.levels[0]["mass"])
         self._n_leaves = n_leaves
         self._cell_out_counts_buf = dev.create_buffer(
             size=n_leaves * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
@@ -230,7 +238,7 @@ class GPUCompute:
             "cov": dev.create_buffer(size=MAX_SUMMARIES * 2 * 16, usage=out_usage),  # 2 vec4 per summary
         }
         # Per-level summary count buffer (reused for each level's prefix sum)
-        max_level_nodes = max(lv["nc"] for lv in grid.levels)
+        max_level_nodes = max(len(lv["mass"]) for lv in grid.levels)
         self._summary_counts_buf = dev.create_buffer(
             size=max_level_nodes * 4, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
         self._summary_counters_buf = dev.create_buffer(
