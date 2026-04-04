@@ -1087,7 +1087,7 @@ def _run_wgpu_benchmark(n_frames, window, canvas_context, device, renderer, came
     kf_labels = [kf[3] for kf in keyframes]
     np.savez(outfile,
              frame_time_ms=frame_times, cull_time_ms=cull_times,
-             n_visible=np.array(n_vis_list), phase=phases,
+             n_visible=np.array(n_vis_list), phase=np.array(phase_list),
              keyframe_idx=np.array(kf_idx_list),
              keyframe_labels=np.array(kf_labels),
              lod_pixels=np.array(lod_list),
