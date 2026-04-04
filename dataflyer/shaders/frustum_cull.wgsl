@@ -22,13 +22,13 @@ struct CullParams {
     lod_pixels: f32,
     is_coarsest: u32,     // 1 if this is the coarsest level
     is_finest: u32,       // 1 if this is the finest level
-    parent_nc: u32,       // cells per side at parent level (0 if coarsest)
-    nc: u32,              // cells per side at this level
+    n_nodes: u32,         // number of nodes at this level
+    _pad4: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: CullParams;
 
-// Grid level data for this level
+// Level data for this level
 @group(0) @binding(1) var<storage, read> cell_mass: array<f32>;
 @group(0) @binding(2) var<storage, read> cell_hsml: array<f32>;
 @group(0) @binding(3) var<storage, read> cell_centers: array<vec4<f32>>;  // xyz + half_diag in w
@@ -39,12 +39,13 @@ struct CullParams {
 // This level's decision buffer (write)
 @group(0) @binding(5) var<storage, read_write> decision: array<u32>;
 
+// Parent index for each node (maps to parent level's array)
+@group(0) @binding(6) var<storage, read> node_parent_idx: array<u32>;
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
-    let nc = params.nc;
-    let nc3 = nc * nc * nc;
-    if (idx >= nc3) { return; }
+    if (idx >= params.n_nodes) { return; }
 
     // Default: hidden
     decision[idx] = 0u;
@@ -54,15 +55,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // If not coarsest: check if parent was REFINE
     if (params.is_coarsest == 0u) {
-        let pnc = params.parent_nc;
-        let ix = idx / (nc * nc);
-        let iy = (idx / nc) % nc;
-        let iz = idx % nc;
-        let px = ix / 2u;
-        let py = iy / 2u;
-        let pz = iz / 2u;
-        let parent_idx = px * pnc * pnc + py * pnc + pz;
-        if (parent_decision[parent_idx] != 2u) { return; }
+        let pidx = node_parent_idx[idx];
+        if (parent_decision[pidx] != 2u) { return; }
     }
 
     let center = cell_centers[idx].xyz;

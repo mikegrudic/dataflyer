@@ -6,7 +6,7 @@
 //   2. gather_particles: copy particles to compacted output using prefix-summed offsets
 
 struct GatherParams {
-    nc3: u32,              // total cells at finest level (64^3 = 262144)
+    n_leaves: u32,         // total leaf cells at finest level
     budget: u32,           // max output particles
     total_visible: u32,    // filled by count pass (atomic)
     stride: u32,           // global stride (filled after count pass)
@@ -44,7 +44,7 @@ struct GatherParams {
 @compute @workgroup_size(256)
 fn count_particles(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cell = gid.x;
-    if (cell >= gather_params.nc3) { return; }
+    if (cell >= gather_params.n_leaves) { return; }
 
     if (decision[cell] != 3u) {
         cell_out_counts[cell] = 0u;
@@ -62,7 +62,7 @@ fn count_particles(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(256)
 fn apply_stride(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cell = gid.x;
-    if (cell >= gather_params.nc3) { return; }
+    if (cell >= gather_params.n_leaves) { return; }
 
     let n = cell_out_counts[cell];
     if (n == 0u) { return; }
@@ -77,7 +77,7 @@ fn apply_stride(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(256)
 fn gather_particles(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cell = gid.x;
-    if (cell >= gather_params.nc3) { return; }
+    if (cell >= gather_params.n_leaves) { return; }
 
     if (decision[cell] != 3u) { return; }
 

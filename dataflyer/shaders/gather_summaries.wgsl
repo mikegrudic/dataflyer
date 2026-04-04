@@ -2,7 +2,7 @@
 // Uses atomic counter for output offset — no prefix sum needed.
 
 struct SummaryParams {
-    nc3: u32,
+    n_nodes: u32,
     summary_overlap: f32,
     cs_x2: f32,
     cs_y2: f32,
@@ -34,7 +34,7 @@ struct SummaryParams {
 @compute @workgroup_size(256)
 fn gather_summaries(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cell = gid.x;
-    if (cell >= params.nc3) { return; }
+    if (cell >= params.n_nodes) { return; }
     if (decision[cell] != 1u) { return; }
 
     let mass = src_mass[cell];
