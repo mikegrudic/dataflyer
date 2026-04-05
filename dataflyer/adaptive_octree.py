@@ -73,19 +73,30 @@ def _morton_decode(code):
 def _find_leaf_depth(sorted_codes, n, leaf_size, max_depth):
     """Find the optimal uniform leaf depth from sorted Morton codes.
 
-    Picks the deepest depth where:
-    - average particles/cell >= leaf_size (don't over-subdivide), OR
-    - total cells <= 4M (GPU dispatch limit)
+    Keeps subdividing until the largest cell has <= leaf_size particles,
+    or until we would exceed 4M cells.
     """
+    MAX_LEAVES = 500_000
     best = 1
     for d in range(1, max_depth + 1):
         shift = np.uint64(3 * (max_depth - d))
         cell_codes = sorted_codes >> shift
-        n_cells = 1 + np.count_nonzero(cell_codes[1:] != cell_codes[:-1])
-        avg_per_cell = n / n_cells
-        if avg_per_cell < leaf_size:
-            break  # cells are small enough
+        # Find cell boundaries
+        changes = np.empty(n, dtype=np.bool_)
+        changes[0] = True
+        changes[1:] = cell_codes[1:] != cell_codes[:-1]
+        starts = np.where(changes)[0]
+        n_cells = len(starts)
+        if n_cells > MAX_LEAVES:
+            break
         best = d
+        # Check if largest cell fits
+        ends = np.empty(n_cells, dtype=np.int64)
+        ends[:-1] = starts[1:]
+        ends[-1] = n
+        max_count = int((ends - starts).max())
+        if max_count <= leaf_size:
+            break
     return best
 
 
