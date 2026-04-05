@@ -126,7 +126,11 @@ class GPUCompute:
 
             centers4 = np.zeros((n, 4), dtype=np.float32)
             centers4[:, :3] = lv["centers"]
-            centers4[:, 3] = hd
+            # Per-cell half_diag for variable-depth leaves, scalar for uniform levels
+            if "_per_cell_half_diag" in lv:
+                centers4[:, 3] = lv["_per_cell_half_diag"]
+            else:
+                centers4[:, 3] = hd
 
             buf_usage = wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST
             # Pack summary data for GPU gather

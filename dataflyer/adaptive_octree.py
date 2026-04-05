@@ -70,128 +70,180 @@ def _morton_decode(code):
 
 # ---- Fast tree build from sorted Morton codes ----
 
-def _find_leaf_depth(sorted_codes, n, leaf_size, max_depth):
-    """Find the optimal uniform leaf depth from sorted Morton codes.
+def _build_adaptive_leaves(sorted_codes, n, leaf_size, max_depth):
+    """Build variable-depth leaves: subdivide only cells with >leaf_size particles.
 
-    Keeps subdividing until the largest cell has <= leaf_size particles,
-    or until we would exceed 4M cells.
+    Returns: (leaf_codes, leaf_depths, cell_start) where each leaf has its own depth.
+    leaf_codes are Morton codes at max_depth resolution.
     """
-    MAX_LEAVES = 500_000
-    best = 1
-    for d in range(1, max_depth + 1):
+    # Start at depth 1: all particles in cells at depth 1
+    # Iteratively subdivide cells exceeding leaf_size
+    # Particle ranges are contiguous in sorted_codes, so cell boundaries
+    # can be found by shifts at each depth.
+
+    # Track which particles are in "done" (leaf) cells vs "pending" (need subdivision)
+    # Use a list of (start, end, depth, code_at_depth) per cell
+    # Initialize at depth 1
+    shift = np.uint64(3 * (max_depth - 1))
+    codes_d = sorted_codes >> shift
+    changes = np.empty(n, dtype=np.bool_)
+    changes[0] = True
+    changes[1:] = codes_d[1:] != codes_d[:-1]
+    starts = np.where(changes)[0]
+    ends = np.empty(len(starts), dtype=np.int64)
+    ends[:-1] = starts[1:]
+    ends[-1] = n
+
+    # Each cell: (start, end, depth)
+    pending = []
+    leaves = []  # (start, end, depth, morton_code_at_max_depth)
+    for i in range(len(starts)):
+        count = ends[i] - starts[i]
+        if count <= leaf_size:
+            leaves.append((int(starts[i]), int(ends[i]), 1))
+        else:
+            pending.append((int(starts[i]), int(ends[i]), 1))
+
+    for d in range(2, max_depth + 1):
+        if not pending:
+            break
         shift = np.uint64(3 * (max_depth - d))
-        cell_codes = sorted_codes >> shift
-        # Find cell boundaries
-        changes = np.empty(n, dtype=np.bool_)
-        changes[0] = True
-        changes[1:] = cell_codes[1:] != cell_codes[:-1]
-        starts = np.where(changes)[0]
-        n_cells = len(starts)
-        if n_cells > MAX_LEAVES:
-            break
-        best = d
-        # Check if largest cell fits
-        ends = np.empty(n_cells, dtype=np.int64)
-        ends[:-1] = starts[1:]
-        ends[-1] = n
-        max_count = int((ends - starts).max())
-        if max_count <= leaf_size:
-            break
-    return best
+        new_pending = []
+        for (s, e, _dep) in pending:
+            # Subdivide this cell's particles at depth d
+            sub_codes = sorted_codes[s:e] >> shift
+            sub_changes = np.empty(e - s, dtype=np.bool_)
+            sub_changes[0] = True
+            sub_changes[1:] = sub_codes[1:] != sub_codes[:-1]
+            sub_starts = np.where(sub_changes)[0] + s
+            sub_ends = np.empty(len(sub_starts), dtype=np.int64)
+            sub_ends[:-1] = sub_starts[1:]
+            sub_ends[-1] = e
+            for j in range(len(sub_starts)):
+                count = sub_ends[j] - sub_starts[j]
+                if count <= leaf_size or d == max_depth:
+                    leaves.append((int(sub_starts[j]), int(sub_ends[j]), d))
+                else:
+                    new_pending.append((int(sub_starts[j]), int(sub_ends[j]), d))
+        pending = new_pending
+
+    # Any remaining pending cells become leaves at max_depth
+    for (s, e, _dep) in pending:
+        leaves.append((s, e, max_depth))
+
+    # Sort leaves by their start index (maintains Morton order)
+    leaves.sort(key=lambda x: x[0])
+
+    # Build cell_start CSR and leaf codes
+    n_leaves = len(leaves)
+    cell_start = np.empty(n_leaves + 1, dtype=np.int64)
+    leaf_depths = np.empty(n_leaves, dtype=np.int32)
+    leaf_codes = np.empty(n_leaves, dtype=np.uint64)
+    for i, (s, e, d) in enumerate(leaves):
+        cell_start[i] = s
+        leaf_depths[i] = d
+        # Store the Morton code at the leaf's own depth
+        leaf_codes[i] = sorted_codes[s] >> np.uint64(3 * (max_depth - d))
+    cell_start[n_leaves] = n
+
+    return leaf_codes, leaf_depths, cell_start
 
 
 def _build_tree(sorted_codes, n, leaf_size, max_depth, pmin, box):
-    """Build octree levels from sorted Morton codes.
+    """Build adaptive octree from sorted Morton codes.
 
-    Uses a uniform leaf depth where cells average ~leaf_size particles,
-    then builds parent levels bottom-up.
-
-    Returns: (levels, cell_start) where levels[0] is finest (leaves).
+    Variable-depth leaves: dense regions subdivide deeper, sparse regions stop early.
+    Returns: (levels, cell_start) where levels[0] is finest (all leaves).
     """
-    leaf_depth = _find_leaf_depth(sorted_codes, n, leaf_size, max_depth)
-    leaf_shift = np.uint64(3 * (max_depth - leaf_depth))
+    leaf_codes, leaf_depths, cell_start = _build_adaptive_leaves(
+        sorted_codes, n, leaf_size, max_depth)
+    n_leaves = len(leaf_codes)
+    actual_max_depth = int(leaf_depths.max()) if n_leaves > 0 else 1
 
-    # Build leaf cell_start (CSR) from sorted codes at leaf depth
-    leaf_codes = sorted_codes >> leaf_shift
-    changes = np.empty(n, dtype=np.bool_)
-    changes[0] = True
-    changes[1:] = leaf_codes[1:] != leaf_codes[:-1]
-    leaf_starts_idx = np.where(changes)[0]
-    n_leaves = len(leaf_starts_idx)
+    # Compute leaf centers (each leaf has its own depth → its own cell size)
+    leaf_centers = np.empty((n_leaves, 3), dtype=np.float32)
+    leaf_half_diag = np.empty(n_leaves, dtype=np.float32)
+    for i in range(n_leaves):
+        d = leaf_depths[i]
+        cs = box / (2 ** d)
+        ix, iy, iz = _morton_decode(leaf_codes[i])
+        leaf_centers[i, 0] = pmin[0] + (ix + 0.5) * cs[0]
+        leaf_centers[i, 1] = pmin[1] + (iy + 0.5) * cs[1]
+        leaf_centers[i, 2] = pmin[2] + (iz + 0.5) * cs[2]
+        leaf_half_diag[i] = float(np.linalg.norm(cs) * 0.5)
 
-    cell_start = np.empty(n_leaves + 1, dtype=np.int64)
-    cell_start[:n_leaves] = leaf_starts_idx
-    cell_start[n_leaves] = n
-    unique_leaf_codes = leaf_codes[leaf_starts_idx]
+    # Use median cell size for the level "cs" (used for summary overlap padding)
+    median_depth = int(np.median(leaf_depths))
+    median_cs = (box / (2 ** median_depth)).astype(np.float32)
 
-    # Build levels from leaves up to root.
-    # levels[0] = finest (leaves), levels[-1] = coarsest (root).
-    # Each non-leaf level stores child_offset (index into child level).
-    # Each non-root level stores parent_idx (index into parent level).
+    # Build levels bottom-up. Level 0 = all leaves (variable depth).
+    # Coarser levels group leaves by their parent Morton codes.
     levels = []
-    cur_codes = unique_leaf_codes
+    levels.append({
+        "nc": n_leaves,
+        "depth": actual_max_depth,  # nominal depth for the level
+        "cs": median_cs,
+        "half_diag": float(np.median(leaf_half_diag)),
+        "centers": leaf_centers,
+        "cell_codes": leaf_codes,
+        "_per_cell_half_diag": leaf_half_diag,  # variable per cell
+    })
 
-    for d in range(leaf_depth, -1, -1):
-        n_nodes = len(cur_codes)
+    # Build coarser levels: group by parent Morton code at each depth
+    cur_codes = leaf_codes
+    cur_depths = leaf_depths
+
+    for d in range(actual_max_depth - 1, -1, -1):
+        # Parent code: for leaves at depth > d, shift to depth d
+        # For leaves at depth <= d, they ARE the parent (or ancestor)
+        parent_codes = np.empty(len(cur_codes), dtype=np.uint64)
+        for i in range(len(cur_codes)):
+            if cur_depths[i] > d:
+                # Shift from leaf depth to depth d
+                shift = np.uint64(3 * (cur_depths[i] - d))
+                parent_codes[i] = cur_codes[i] >> shift
+            else:
+                # This leaf is at or above depth d — use its own code shifted
+                shift = np.uint64(3 * (cur_depths[i] - d)) if cur_depths[i] > d else np.uint64(0)
+                parent_codes[i] = cur_codes[i] >> shift if cur_depths[i] > d else cur_codes[i]
+
+        unique_parents, inverse = np.unique(parent_codes, return_inverse=True)
+        n_parents = len(unique_parents)
+
+        child_offset = np.empty(n_parents, dtype=np.uint32)
+        parent_idx = np.empty(len(cur_codes), dtype=np.uint32)
+        ci = 0
+        for pi in range(n_parents):
+            child_offset[pi] = ci
+            while ci < len(cur_codes) and inverse[ci] == pi:
+                parent_idx[ci] = pi
+                ci += 1
+
+        levels[-1]["parent_idx"] = parent_idx
+
         cell_size = box / (2 ** d) if d > 0 else box.copy()
         half_diag = float(np.linalg.norm(cell_size) * 0.5)
-        centers = _compute_centers_from_codes(cur_codes, d, pmin, cell_size)
+        centers = _compute_centers_from_codes(unique_parents, d, pmin, cell_size)
 
-        level = {
-            "nc": n_nodes,
+        levels.append({
+            "nc": n_parents,
             "depth": d,
             "cs": cell_size.astype(np.float32),
             "half_diag": half_diag,
             "centers": centers,
-            "cell_codes": cur_codes,
-        }
-        levels.append(level)
-
-        if d == 0:
-            break
-
-        # Compute parent codes and mapping
-        parent_codes_all = cur_codes >> np.uint64(3)
-        unique_parents, inverse = np.unique(parent_codes_all, return_inverse=True)
-        n_parents = len(unique_parents)
-
-        child_offset = np.empty(n_parents, dtype=np.uint32)
-        parent_idx = np.empty(n_nodes, dtype=np.uint32)
-        ci = 0
-        for pi in range(n_parents):
-            child_offset[pi] = ci
-            while ci < n_nodes and inverse[ci] == pi:
-                parent_idx[ci] = pi
-                ci += 1
-
-        # Store parent_idx on current (child) level
-        level["parent_idx"] = parent_idx
+            "cell_codes": unique_parents,
+            "child_offset": child_offset,
+        })
 
         cur_codes = unique_parents
-        # We'll attach child_offset when we create the parent level next iteration
+        # All parents are at depth d
+        cur_depths = np.full(n_parents, d, dtype=np.int32)
 
-    # Now attach child_offset to each non-leaf level.
-    # levels[i] is child of levels[i+1]. levels[i+1] needs child_offset into levels[i].
-    for i in range(len(levels) - 1):
-        child_lv = levels[i]
-        parent_lv = levels[i + 1]
-        # Recompute child_offset from child's parent_idx
-        n_parents = parent_lv["nc"]
-        n_children = child_lv["nc"]
-        child_offset = np.empty(n_parents, dtype=np.uint32)
-        pi_arr = child_lv["parent_idx"]
-        ci = 0
-        for pi in range(n_parents):
-            child_offset[pi] = ci
-            while ci < n_children and pi_arr[ci] == pi:
-                ci += 1
-        parent_lv["child_offset"] = child_offset
-
-    # Root has no parent; set dummy parent_idx
+    # Root has no parent
     if "parent_idx" not in levels[-1]:
         levels[-1]["parent_idx"] = np.zeros(levels[-1]["nc"], dtype=np.uint32)
 
-    return levels, cell_start, leaf_depth
+    return levels, cell_start, actual_max_depth
 
 
 @njit(parallel=True, cache=True)
