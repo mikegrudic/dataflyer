@@ -282,6 +282,29 @@ def _coarsen_from_children(child_offset, n_parents,
     return parent_mass, parent_mp, parent_mq, parent_mh2, parent_mxx
 
 
+@njit(cache=True)
+def _shuffle_within_cells(sort_order, cell_start):
+    """Fisher-Yates shuffle of sort_order within each cell.
+
+    Deterministic seed per cell (based on cell index) for reproducibility.
+    Modifies sort_order in-place.
+    """
+    n_cells = len(cell_start) - 1
+    for c in range(n_cells):
+        start = cell_start[c]
+        end = cell_start[c + 1]
+        n = end - start
+        if n <= 1:
+            continue
+        seed = np.uint64(c * 2654435761 + 1)
+        for i in range(n - 1, 0, -1):
+            seed = seed * np.uint64(6364136223846793005) + np.uint64(1442695040888963407)
+            j = int(seed >> np.uint64(33)) % (i + 1)
+            tmp = sort_order[start + i]
+            sort_order[start + i] = sort_order[start + j]
+            sort_order[start + j] = tmp
+
+
 # ---- Main class ----
 
 class AdaptiveOctree:
@@ -320,8 +343,17 @@ class AdaptiveOctree:
             sorted_codes, len(positions), leaf_size, max_depth, self.pmin, box)
         self.n_cells = self.levels[0]["nc"]
 
-        # Compute moments
+        # Shuffle particles within each cell so uniform stride ≈ random subsampling
+        _shuffle_within_cells(self.sort_order, self.cell_start)
+        so = self.sort_order
+        self.sorted_pos = positions[so].astype(np.float32)
+        self.sorted_hsml = hsml[so].astype(np.float32)
+        self.sorted_mass = masses[so].astype(np.float32)
+        self.sorted_qty = quantity[so].astype(np.float32)
+
+        # Compute moments and NN-based smoothing lengths
         self._compute_all_moments()
+        self._compute_nn_hsml()
 
     def _compute_all_moments(self):
         """Compute extensive and intensive moments for all levels."""
@@ -365,6 +397,39 @@ class AdaptiveOctree:
                 "hsml": cell_hsml, "qty": qty, "cov": cov,
                 "mxx": moments.mxx, "mh2": moments.mh2,
             })
+
+    def _compute_nn_hsml(self, n_ngb=32):
+        """Precompute neighbor-based smoothing lengths for all levels."""
+        from scipy.spatial import cKDTree
+
+        for lv in self.levels:
+            n = lv["nc"]
+            if n <= 1:
+                lv["hsml_nn"] = np.full(n, lv["half_diag"] * 2, dtype=np.float32)
+                continue
+            mask = lv["mass"] > 0
+            n_active = mask.sum()
+            if n_active <= n_ngb:
+                lv["hsml_nn"] = np.full(n, lv["half_diag"] * 2, dtype=np.float32)
+                continue
+            centers = lv["com"][mask]
+            k = min(n_ngb + 1, n_active)
+            tree = cKDTree(centers)
+            dist, _ = tree.query(centers, k=k)
+            nn_dist = dist[:, -1].astype(np.float32)
+            hsml_nn = np.full(n, lv["half_diag"] * 2, dtype=np.float32)
+            hsml_nn[mask] = nn_dist
+            lv["hsml_nn"] = hsml_nn
+
+    def set_nn_hsml(self, enabled):
+        """Swap between covariance-based and NN-based smoothing lengths."""
+        for lv in self.levels:
+            if enabled and "hsml_nn" in lv:
+                if "hsml_cov" not in lv:
+                    lv["hsml_cov"] = lv["hsml"].copy()
+                lv["hsml"] = lv["hsml_nn"].copy()
+            elif "hsml_cov" in lv:
+                lv["hsml"] = lv["hsml_cov"].copy()
 
     def update_weights(self, masses, quantity=None):
         """Re-weight the tree without rebuilding structure."""
