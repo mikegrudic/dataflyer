@@ -443,6 +443,10 @@ class DevOverlay(Panel):
         items.append(("slider", "Tree Min N", renderer.tree_min_particles, 0, 1e7, "tree_min_particles"))
         items.append(("slider", "Tree Cells", renderer.tree_n_cells, 8, 256, "tree_n_cells"))
         items.append(("slider", "Cull Interval", renderer.cull_interval, 0.0, 5.0, "cull_interval"))
+        items.append(("slider", "Max Particles (M)", renderer.max_render_particles / 1e6,
+                       0.1, max(renderer.n_total / 1e6, 1.0), "_max_render_M"))
+        items.append(("slider", "Max Refine (M)", renderer.max_refine_particles / 1e6,
+                       0.1, max(renderer.n_total / 1e6, 1.0), "_max_refine_M"))
         items.append(("text", f"Aniso splats: {renderer.n_aniso:,}"))
 
         if message:
@@ -475,12 +479,24 @@ class DevOverlay(Panel):
         if isinstance(base, tuple):
             # Slider
             action, key, vmin, vmax = base
-            cur = getattr(renderer, key, 1.0)
-            step = max((vmax - vmin) / 20, 0.01)
-            if action == "slider_dec":
-                setattr(renderer, key, max(vmin, cur - step))
+            if key in ("_max_render_M", "_max_refine_M"):
+                attr = "max_render_particles" if key == "_max_render_M" else "max_refine_particles"
+                cur = getattr(renderer, attr) / 1e6
+                step = max((vmax - vmin) / 20, 0.1)
+                if action == "slider_dec":
+                    cur = max(vmin, cur - step)
+                else:
+                    cur = min(vmax, cur + step)
+                val = max(1_000, int(cur * 1e6))
+                setattr(renderer, attr, val)
+                renderer._user_budget = renderer.max_render_particles
             else:
-                setattr(renderer, key, min(vmax, cur + step))
+                cur = getattr(renderer, key, 1.0)
+                step = max((vmax - vmin) / 20, 0.01)
+                if action == "slider_dec":
+                    setattr(renderer, key, max(vmin, cur - step))
+                else:
+                    setattr(renderer, key, min(vmax, cur + step))
             if key == "tree_min_particles":
                 renderer._needs_grid_rebuild = True
             elif key == "tree_n_cells":

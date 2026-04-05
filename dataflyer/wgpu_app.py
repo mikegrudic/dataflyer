@@ -23,7 +23,7 @@ from .field_ops import (resolve_field, compute_weights, compute_slot_fields,
 
 
 def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
-                 screenshot=None, benchmark=None, fullscreen=False):
+                 screenshot=None, benchmark=None, fullscreen=False, no_tree=False):
     """Run the DataFlyer application with the wgpu backend."""
     import os
     snapshot_path = os.path.abspath(snapshot_path)
@@ -114,23 +114,29 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     import threading
 
     gpu_compute = None
-    _bg = {"grid": None, "done": False}  # mutable container for thread result
+    _bg = {"grid": None, "done": False}
 
-    def _build_grid_bg():
-        try:
-            # Use renderer's _build_grid to respect use_adaptive_tree flag
-            renderer._all_pos = data.positions.astype(np.float32)
-            renderer._all_mass = weights.astype(np.float32)
-            renderer._all_hsml = data.hsml.astype(np.float32)
-            renderer._all_qty = weights.astype(np.float32)
-            _bg["grid"] = renderer._build_grid()
-        except Exception as e:
-            print(f"  Grid build failed: {e}")
+    if no_tree:
         _bg["done"] = True
+        renderer.use_tree = False
+        renderer.auto_lod = False
+        grid_thread = None
+        print("  --no-tree: bypassing tree/LOD/GPU compute")
+    else:
+        def _build_grid_bg():
+            try:
+                renderer._all_pos = data.positions.astype(np.float32)
+                renderer._all_mass = weights.astype(np.float32)
+                renderer._all_hsml = data.hsml.astype(np.float32)
+                renderer._all_qty = weights.astype(np.float32)
+                _bg["grid"] = renderer._build_grid()
+            except Exception as e:
+                print(f"  Grid build failed: {e}")
+            _bg["done"] = True
 
-    glfw.set_window_title(window, "DataFlyer [wgpu] | Building spatial grid...")
-    grid_thread = threading.Thread(target=_build_grid_bg, daemon=True)
-    grid_thread.start()
+        glfw.set_window_title(window, "DataFlyer [wgpu] | Building spatial grid...")
+        grid_thread = threading.Thread(target=_build_grid_bg, daemon=True)
+        grid_thread.start()
 
     # UI overlays
     from .wgpu_overlay import WGPUDevOverlay, WGPUUserMenu
@@ -246,11 +252,13 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 renderer.max_render_particles = min(
                     renderer.n_total, int(renderer.max_render_particles * 2))
                 user_budget = renderer.max_render_particles
+                renderer._user_budget = user_budget
                 print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
             elif key == glfw.KEY_COMMA:
                 renderer.max_render_particles = max(
                     1_000, renderer.max_render_particles // 2)
                 user_budget = renderer.max_render_particles
+                renderer._user_budget = user_budget
                 print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
             elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
                 _adjust_range(renderer, 0.8)
@@ -422,6 +430,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     last_cull_time = 0.0
     user_lod = renderer.lod_pixels
     user_budget = renderer.max_render_particles
+    renderer._user_budget = user_budget
     smooth_frame_ms = 0.0
     smooth_fps_ema = 0.0
     last_lod_adjust = 0.0
@@ -590,6 +599,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             )
 
         glfw.poll_events()
+
+        # Sync user settings from overlay slider changes
+        if hasattr(renderer, '_user_budget') and renderer._user_budget != user_budget:
+            user_budget = renderer._user_budget
 
         # Pick up background grid build when complete
         if _bg["done"] and _bg["grid"] is not None and renderer._grid is None:
@@ -884,7 +897,8 @@ def _run_wgpu_benchmark(n_frames, window, canvas_context, device, renderer, came
 
     # Wait for grid build
     print("  Waiting for spatial grid...")
-    grid_thread.join()
+    if grid_thread is not None:
+        grid_thread.join()
     if _bg["grid"] is not None and renderer._grid is None:
         renderer._grid = _bg["grid"]
         renderer.use_tree = True

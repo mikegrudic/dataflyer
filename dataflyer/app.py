@@ -962,13 +962,15 @@ def main():
     parser.add_argument("--backend", type=str, default="wgpu",
                         choices=["moderngl", "wgpu"],
                         help="Rendering backend (default: wgpu)")
+    parser.add_argument("--no-tree", action="store_true",
+                        help="Bypass tree building, GPU compute, and all LOD/culling logic")
     args = parser.parse_args()
 
     if args.backend == "wgpu":
         from .wgpu_app import run_wgpu_app
         run_wgpu_app(args.snapshot, width=args.width, height=args.height, fov=args.fov,
                      screenshot=args.screenshot, benchmark=args.benchmark,
-                     fullscreen=args.fullscreen)
+                     fullscreen=args.fullscreen, no_tree=args.no_tree)
         return
 
     app = DataFlyerApp(args.snapshot, width=args.width, height=args.height, fov=args.fov,

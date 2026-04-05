@@ -100,6 +100,7 @@ class WGPURenderer:
         self.lod_pixels = 16
         self.log_scale = 1
         self.max_render_particles = 4_000_000
+        self.max_refine_particles = 8_000_000
         self.use_tree = True
         self.use_adaptive_tree = True
         self.tree_min_particles = 0
