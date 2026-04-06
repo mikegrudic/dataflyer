@@ -138,7 +138,11 @@ class GPUCompute:
             "qty": dev.create_buffer(size=max_output * 4, usage=out_usage),
         }
 
-        # Upload positions (chunked to keep submits small)
+        # Upload positions (chunked to keep submits small). Pace each
+        # chunk with a blocking read_buffer so Metal's staging buffer
+        # never accumulates more than one chunk's worth of pending
+        # writes — otherwise the residual backlog wedges the next
+        # frame's encoder.finish() / queue.submit() in the render loop.
         CHUNK = 4_000_000
         pos4 = np.zeros((n, 4), dtype=np.float32)
         pos4[:, :3] = pos_src
@@ -146,6 +150,7 @@ class GPUCompute:
             end = min(start + CHUNK, n)
             dev.queue.write_buffer(
                 self._particle_bufs["pos"], start * 16, pos4[start:end].tobytes())
+            dev.queue.read_buffer(self._particle_bufs["pos"], size=4)
         for name, arr in [("hsml", hsml_src),
                           ("mass", mass_src),
                           ("qty", qty_src)]:
@@ -154,6 +159,7 @@ class GPUCompute:
                 dev.queue.write_buffer(
                     self._particle_bufs[name], start * 4,
                     arr[start:end].tobytes())
+                dev.queue.read_buffer(self._particle_bufs[name], size=4)
 
         # Build only the subsample pipeline (not the tree-LOD ones)
         self._build_subsample_pipeline()
@@ -179,6 +185,15 @@ class GPUCompute:
             size=16,
             usage=(wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
                    | wgpu.BufferUsage.COPY_DST))
+        # Indirect draw args: (vertex_count=4, instance_count, first_vertex=0,
+        # first_instance=0). instance_count is set each cull from the atomic
+        # counter via copy_buffer_to_buffer — no CPU readback needed.
+        self._subsample_indirect_buf = dev.create_buffer(
+            size=16,
+            usage=(wgpu.BufferUsage.INDIRECT | wgpu.BufferUsage.COPY_DST))
+        dev.queue.write_buffer(
+            self._subsample_indirect_buf, 0,
+            struct.pack("IIII", 4, 0, 0, 0))
         pb = self._particle_bufs
         ob = self._output_bufs
         self._subsample_bg0 = _bg(dev, self._subsample_bgl0, [
@@ -421,6 +436,10 @@ class GPUCompute:
             # the resolve shader, so we can skip uploading it entirely
             # and halve the staging traffic.
             qty_is_mass = qty_src is mass_src
+            # Pace each chunk with a blocking read_buffer so Metal's
+            # staging buffer never accumulates more than one chunk's
+            # worth of pending writes. Without this, the residual backlog
+            # wedges the next frame's encoder.finish() / queue.submit().
             for cb in chunks:
                 start, cn = cb["start"], cb["n"]
                 dev.queue.write_buffer(
@@ -428,13 +447,7 @@ class GPUCompute:
                 if not qty_is_mass:
                     dev.queue.write_buffer(
                         cb["qty"], 0, qty_f32[start:start + cn].tobytes())
-            # One blocking sync at the end forces all the queued writes to
-            # complete before we return to the render loop. Without this,
-            # the next dispatch_subsample_cull's read_buffer deadlocks
-            # behind ~1 GB of pending uploads. read_buffer here works
-            # because we are still inside the overlay click callback, not
-            # inside the render frame callback.
-            dev.queue.read_buffer(chunks[-1]["mass"], size=4)
+                dev.queue.read_buffer(cb["mass"], size=4)
         else:
             dev.queue.write_buffer(self._particle_bufs["mass"], 0, mass_f32.tobytes())
             dev.queue.write_buffer(self._particle_bufs["qty"], 0, qty_f32.tobytes())
@@ -734,9 +747,6 @@ class GPUCompute:
         h_scale = ratio ** (1.0 / 3.0)
         fov_rad = float(np.radians(camera.fov))
 
-        # Zero the counter
-        dev.queue.write_buffer(self._subsample_counter_buf, 0,
-                               struct.pack("IIII", 0, 0, 0, 0))
 
         # Pack params (96 bytes — vec3+pad ×4 = 64, then 8 floats/ints = 32)
         # Layout: cam_pos+pad, cam_fwd+pad, cam_right+pad, cam_up+pad,
@@ -763,19 +773,29 @@ class GPUCompute:
         wgy = _div_ceil(total_wg, wgx)
 
         encoder = dev.create_command_encoder()
+        # Clear counter via encoder (no CPU sync needed)
+        encoder.clear_buffer(self._subsample_counter_buf, 0, 16)
         cpass = encoder.begin_compute_pass()
         cpass.set_pipeline(self._subsample_pipeline)
         cpass.set_bind_group(0, self._subsample_bg0)
         cpass.set_bind_group(1, self._subsample_bg1)
         cpass.dispatch_workgroups(wgx, wgy)
         cpass.end()
+        # Copy counter into indirect_args[1] (instance_count slot) so the
+        # renderer's draw_indirect picks up the actual output count without
+        # any CPU readback (which deadlocks inside the canvas frame loop on
+        # Apple Metal).
+        encoder.copy_buffer_to_buffer(
+            self._subsample_counter_buf, 0,
+            self._subsample_indirect_buf, 4, 4)
         dev.queue.submit([encoder.finish()])
 
-        # Read back the counter to get the actual output count
-        counter_data = dev.queue.read_buffer(self._subsample_counter_buf, size=4)
-        n_out = struct.unpack("I", counter_data)[0]
-        n_out = min(n_out, self._max_output)
-        return n_out
+        # No CPU readback. Return max_output as a conservative HUD upper
+        # bound; actual draw count is GPU-side via the indirect buffer.
+        return max_output
+
+    def get_subsample_indirect_buf(self):
+        return getattr(self, "_subsample_indirect_buf", None)
 
     def _prefix_sum(self, buf, n, block_sums_1=None, block_sums_2=None):
         """Run multi-level prefix sum on a u32 storage buffer.

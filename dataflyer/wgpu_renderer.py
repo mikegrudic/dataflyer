@@ -441,7 +441,7 @@ class WGPURenderer:
             grid = AdaptiveOctree(
                 self._all_pos, self._all_mass, self._all_hsml, self._all_qty,
                 leaf_size=self.tree_leaf_size, defer_tree_build=defer)
-            label = "Adaptive octree" + (" (deferred)" if defer else "")
+            label = "Adaptive octree" + (" (subsample-only init)" if defer else "")
         else:
             from .spatial_grid import SpatialGrid
             grid = SpatialGrid(
@@ -652,6 +652,15 @@ class WGPURenderer:
                                               gpu_bufs["mass"], gpu_bufs["qty"]])
 
         self._set_identity_sort_index(n_particles)
+        # Default: direct draw. Subsample path overrides via
+        # set_particle_indirect_buf right after this call.
+        self._particle_indirect_buf = None
+
+    def set_particle_indirect_buf(self, indirect_buf):
+        """Enable GPU indirect drawing for the particle splat pass.
+        Pass None to revert to direct drawing with self.n_particles.
+        """
+        self._particle_indirect_buf = indirect_buf
 
     def _upload_aniso_summaries(self, pos, mass, qty, cov):
         """Upload anisotropic summary splat data."""
@@ -812,7 +821,11 @@ class WGPURenderer:
             render_pass.set_bind_group(0, self._camera_bg)
             render_pass.set_bind_group(1, self._particle_bg)
             render_pass.set_bind_group(2, self._sort_bg)
-            render_pass.draw(4, self.n_particles, 0, 0)
+            ind = getattr(self, "_particle_indirect_buf", None)
+            if ind is not None:
+                render_pass.draw_indirect(ind, 0)
+            else:
+                render_pass.draw(4, self.n_particles, 0, 0)
 
         # Draw anisotropic summary splats
         if self.n_aniso > 0 and self._aniso_bufs:

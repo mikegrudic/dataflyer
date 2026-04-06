@@ -562,8 +562,13 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 n_out = gpu_compute.dispatch_subsample_cull(
                     camera, stride,
                     max_output=int(renderer.max_render_particles))
+                # HUD count: estimate from stride. The actual draw count
+                # is GPU-side via the indirect buffer below.
+                hud_count = min(int(renderer.n_total // max(stride, 1)), n_out)
                 renderer.set_particle_buffers_from_gpu(
-                    gpu_compute.get_output_buffers(), n_out)
+                    gpu_compute.get_output_buffers(), hud_count)
+                renderer.set_particle_indirect_buf(
+                    gpu_compute.get_subsample_indirect_buf())
                 renderer.n_summaries = 0
                 renderer._upload_summary_arrays(
                     np.zeros((0, 3), np.float32), np.zeros(0, np.float32),

@@ -430,11 +430,14 @@ class AdaptiveOctree:
         self._box = box
 
         # Stash inputs in particle order; sorted/tree state is filled in
-        # _build_tree() if/when needed.
-        self._raw_pos = positions.astype(np.float32)
-        self._raw_mass = masses.astype(np.float32)
-        self._raw_hsml = hsml.astype(np.float32)
-        self._raw_qty = quantity.astype(np.float32)
+        # _build_tree() if/when needed. Avoid copies when dtype already
+        # matches (134M particles × 16 bytes = 2 GB for pos alone).
+        def _f32(a):
+            return a if a.dtype == np.float32 else a.astype(np.float32)
+        self._raw_pos = _f32(positions)
+        self._raw_mass = _f32(masses)
+        self._raw_hsml = _f32(hsml)
+        self._raw_qty = _f32(quantity)
 
         self.sort_order = None
         self.sorted_pos = None
@@ -446,17 +449,26 @@ class AdaptiveOctree:
         self.n_cells = 0
         self.is_adaptive = True
 
-        # Pre-shuffled views for the subsample LOD strategy. Built directly
-        # from the unsorted input — no Morton sort or tree needed.
-        rng = np.random.default_rng(0)
-        perm = rng.permutation(len(self._raw_pos))
-        self._shuffled_pos = self._raw_pos[perm]
-        self._shuffled_hsml = self._raw_hsml[perm]
-        self._shuffled_mass = self._raw_mass[perm]
-        self._shuffled_qty = self._raw_qty[perm]
-        self._shuffle_perm = perm
-
-        if not defer_tree_build:
+        if defer_tree_build:
+            # Subsample-only fast path: skip the shuffled views entirely.
+            # The GPU shader hashes particle indices directly to subsample,
+            # so no permutation is needed. Saves ~2 GB of copies + the
+            # permutation cost on 100M+ particle snapshots.
+            self._shuffled_pos = None
+            self._shuffled_hsml = None
+            self._shuffled_mass = None
+            self._shuffled_qty = None
+            self._shuffle_perm = None
+        else:
+            # Pre-shuffled views for any code path that strides through
+            # particles in linear order and needs decorrelated samples.
+            rng = np.random.default_rng(0)
+            perm = rng.permutation(len(self._raw_pos))
+            self._shuffled_pos = self._raw_pos[perm]
+            self._shuffled_hsml = self._raw_hsml[perm]
+            self._shuffled_mass = self._raw_mass[perm]
+            self._shuffled_qty = self._raw_qty[perm]
+            self._shuffle_perm = perm
             self._build_tree()
 
     def _build_tree(self):
@@ -865,6 +877,16 @@ class AdaptiveOctree:
         is large enough that walking the tree would cost more than just
         touching the strided particles directly.
         """
+        if self._shuffled_pos is None:
+            # Lazily build the shuffled views (skipped at init in
+            # subsample-only mode to save ~6 GB of copies on huge inputs).
+            rng = np.random.default_rng(0)
+            perm = rng.permutation(len(self._raw_pos))
+            self._shuffled_pos = self._raw_pos[perm]
+            self._shuffled_hsml = self._raw_hsml[perm]
+            self._shuffled_mass = self._raw_mass[perm]
+            self._shuffled_qty = self._raw_qty[perm]
+            self._shuffle_perm = perm
         sub_pos = self._shuffled_pos[::stride]
         sub_hsml = self._shuffled_hsml[::stride]
         sub_mass = self._shuffled_mass[::stride]
