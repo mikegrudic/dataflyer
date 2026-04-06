@@ -137,11 +137,14 @@ def project_vector(vec, projection, camera_forward):
         (N,) float32 array.
     """
     if projection == "LOS":
-        return (vec @ camera_forward).astype(np.float32)
+        out = vec @ camera_forward
     elif projection == "|v|":
-        return np.linalg.norm(vec, axis=1).astype(np.float32)
+        out = np.linalg.norm(vec, axis=1)
     else:  # |v|^2
-        return (vec * vec).sum(axis=1).astype(np.float32)
+        out = (vec * vec).sum(axis=1)
+    if out.dtype != np.float32:
+        out = out.astype(np.float32)
+    return out
 
 
 def combine_fields(w, w2, op):
@@ -182,10 +185,33 @@ def resolve_field(field_name, vector_fields, data_manager, projection, camera_fo
     Returns:
         (N,) float32 array.
     """
-    if field_name in vector_fields:
-        vec = data_manager.get_vector_field(field_name)
-        return project_vector(vec, projection, camera_forward)
-    return data_manager.get_field(field_name)
+    if field_name not in vector_fields:
+        return data_manager.get_field(field_name)
+
+    # Cache the projected scalar so repeat reweights at the same camera
+    # angle (e.g. switching Field 2 between two vector fields) don't
+    # recompute a 134M-element dot product every time.
+    cache = getattr(data_manager, "_projected_cache", None)
+    if cache is None:
+        cache = {}
+        data_manager._projected_cache = cache
+    if projection == "LOS":
+        # Quantize camera forward to defeat trivial float jitter.
+        q = tuple(int(round(c * 10000)) for c in camera_forward)
+        key = (field_name, "LOS", q)
+    else:
+        key = (field_name, projection)
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    vec = data_manager.get_vector_field(field_name)
+    out = project_vector(vec, projection, camera_forward)
+    cache[key] = out
+    # Bound the cache to avoid unbounded growth from camera angles.
+    if len(cache) > 32:
+        # Drop an arbitrary old entry.
+        cache.pop(next(iter(cache)))
+    return out
 
 
 def compute_weights(sd_field, sd_field2, sd_op, vector_fields, data_manager,

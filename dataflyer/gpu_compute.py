@@ -434,7 +434,7 @@ class GPUCompute:
             # behind ~1 GB of pending uploads. read_buffer here works
             # because we are still inside the overlay click callback, not
             # inside the render frame callback.
-            dev.queue.read_buffer(chunks[0]["mass"], size=4)
+            dev.queue.read_buffer(chunks[-1]["mass"], size=4)
         else:
             dev.queue.write_buffer(self._particle_bufs["mass"], 0, mass_f32.tobytes())
             dev.queue.write_buffer(self._particle_bufs["qty"], 0, qty_f32.tobytes())

@@ -77,6 +77,12 @@ class SnapshotData:
         # Apply cosmological corrections if needed
         data = self._cosmo_correct(data, ptype, field)
 
+        # Cache as float32 so subsequent get_field/get_vector_field calls
+        # don't have to re-cast (Velocities is ~1.5 GB at float32 — doing
+        # it twice doubles the cost of every reweight).
+        if data.dtype != np.float32:
+            data = data.astype(np.float32)
+
         self._cache[key] = data
         return data
 
@@ -150,12 +156,12 @@ class SnapshotData:
             base, idx_str = name[:-1].split("[", 1)
             col = int(idx_str)
             data = self._read_field("PartType0", base)
-            return data[:, col].astype(np.float32)
-        return self._read_field("PartType0", name).astype(np.float32)
+            return np.ascontiguousarray(data[:, col])
+        return self._read_field("PartType0", name)
 
     def get_vector_field(self, name):
         """Load a raw PartType0 vector field. Returns (N, 3) float32 array."""
-        return self._read_field("PartType0", name).astype(np.float32)
+        return self._read_field("PartType0", name)
 
     def close(self):
         self._file.close()
