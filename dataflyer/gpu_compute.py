@@ -61,6 +61,8 @@ class GPUCompute:
         self._cull_module = device.create_shader_module(code=_load_wgsl("frustum_cull.wgsl"))
         self._scan_module = device.create_shader_module(code=_load_wgsl("prefix_sum.wgsl"))
         self._gather_module = device.create_shader_module(code=_load_wgsl("gather.wgsl"))
+        self._subsample_module = device.create_shader_module(
+            code=_load_wgsl("subsample_cull.wgsl"))
 
         # Pipelines built lazily after upload (bind group layouts depend on data)
         self._cull_pipeline = None
@@ -94,6 +96,85 @@ class GPUCompute:
         cpass.dispatch_workgroups(workgroups, wy)
         cpass.end()
         self.device.queue.submit([encoder.finish()])
+
+    def upload_subsample_only(self, grid, max_output=4_000_000):
+        """Minimal upload for the brute-force subsample cull pipeline.
+
+        Only uploads the per-particle arrays (pos/hsml/mass/qty) and builds
+        the subsample compute pipeline. Skips all tree-level data, so it
+        works with any grid that has sorted_* arrays (e.g. AdaptiveOctree).
+        """
+        dev = self.device
+        n = len(grid.sorted_pos)
+        self._n_particles = n
+        self._max_output = max_output
+
+        particle_usage = (wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST
+                          | wgpu.BufferUsage.COPY_SRC)
+        self._particle_bufs = {
+            "pos": dev.create_buffer(size=n * 16, usage=particle_usage),
+            "hsml": dev.create_buffer(size=n * 4, usage=particle_usage),
+            "mass": dev.create_buffer(size=n * 4, usage=particle_usage),
+            "qty": dev.create_buffer(size=n * 4, usage=particle_usage),
+        }
+
+        out_usage = wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
+        self._output_bufs = {
+            "pos": dev.create_buffer(size=max_output * 16, usage=out_usage),
+            "hsml": dev.create_buffer(size=max_output * 4, usage=out_usage),
+            "mass": dev.create_buffer(size=max_output * 4, usage=out_usage),
+            "qty": dev.create_buffer(size=max_output * 4, usage=out_usage),
+        }
+
+        # Upload positions (chunked to keep submits small)
+        CHUNK = 4_000_000
+        pos4 = np.zeros((n, 4), dtype=np.float32)
+        pos4[:, :3] = grid.sorted_pos
+        for start in range(0, n, CHUNK):
+            end = min(start + CHUNK, n)
+            dev.queue.write_buffer(
+                self._particle_bufs["pos"], start * 16, pos4[start:end].tobytes())
+        for name, arr in [("hsml", grid.sorted_hsml),
+                          ("mass", grid.sorted_mass),
+                          ("qty", grid.sorted_qty)]:
+            for start in range(0, n, CHUNK):
+                end = min(start + CHUNK, n)
+                dev.queue.write_buffer(
+                    self._particle_bufs[name], start * 4,
+                    arr[start:end].tobytes())
+
+        # Build only the subsample pipeline (not the tree-LOD ones)
+        self._build_subsample_pipeline()
+        self._upload_ready = True
+
+    def _build_subsample_pipeline(self):
+        """Build just the brute-force subsample pipeline."""
+        dev = self.device
+        _bgl = _make_compute_bgl
+        _bg = _make_bind_group
+        _pipe = _make_compute_pipeline
+
+        self._subsample_bgl0 = _bgl(dev, [
+            "uniform", "read-only-storage", "read-only-storage",
+            "read-only-storage", "read-only-storage", "storage"])
+        self._subsample_bgl1 = _bgl(dev, ["storage"] * 4)
+        self._subsample_pipeline = _pipe(
+            dev, [self._subsample_bgl0, self._subsample_bgl1],
+            self._subsample_module, "main")
+        self._subsample_params_buf = dev.create_buffer(
+            size=96, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+        self._subsample_counter_buf = dev.create_buffer(
+            size=16,
+            usage=(wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
+                   | wgpu.BufferUsage.COPY_DST))
+        pb = self._particle_bufs
+        ob = self._output_bufs
+        self._subsample_bg0 = _bg(dev, self._subsample_bgl0, [
+            self._subsample_params_buf,
+            pb["pos"], pb["hsml"], pb["mass"], pb["qty"],
+            self._subsample_counter_buf])
+        self._subsample_bg1 = _bg(dev, self._subsample_bgl1, [
+            ob["pos"], ob["hsml"], ob["mass"], ob["qty"]])
 
     def upload_snapshot(self, grid, max_output=4_000_000):
         """Upload grid structure and sorted particle data to GPU (blocking)."""
@@ -412,6 +493,9 @@ class GPUCompute:
                 lb["com_gpu"], lb["hsml"], lb["mass"],
                 lb["qty_gpu"], lb["cov_gpu"], lb["mh2_gpu"]]))
 
+        # Brute-force subsample cull pipeline (shares particle/output buffers)
+        self._build_subsample_pipeline()
+
     def dispatch_cull(self, camera, max_particles, lod_pixels=4,
                       viewport_width=2048, summary_overlap=0.0):
         """Run GPU frustum cull + LOD + gather. Returns (n_particles, summary_data).
@@ -550,6 +634,86 @@ class GPUCompute:
             s_pos, s_hsml, s_mass, s_qty, s_cov = z3, z1, z1, z1, z6
 
         return n_output, total_visible, (s_pos, s_hsml, s_mass, s_qty, s_cov)
+
+    def grow_subsample_output(self, max_output):
+        """Reallocate output buffers and the subsample bind group if the
+        requested max_output exceeds the current capacity. Used when the
+        renderer's max_render_particles is bumped at runtime."""
+        if max_output <= self._max_output:
+            return
+        dev = self.device
+        out_usage = wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
+        self._output_bufs = {
+            "pos": dev.create_buffer(size=max_output * 16, usage=out_usage),
+            "hsml": dev.create_buffer(size=max_output * 4, usage=out_usage),
+            "mass": dev.create_buffer(size=max_output * 4, usage=out_usage),
+            "qty": dev.create_buffer(size=max_output * 4, usage=out_usage),
+        }
+        self._max_output = max_output
+        ob = self._output_bufs
+        self._subsample_bg1 = _make_bind_group(dev, self._subsample_bgl1, [
+            ob["pos"], ob["hsml"], ob["mass"], ob["qty"]])
+
+    def dispatch_subsample_cull(self, camera, stride):
+        """Brute-force per-particle frustum cull + stride subsample.
+
+        One compute dispatch over all sorted particles. Each thread tests
+        its particle, and if hash(idx) % stride == 0 AND in frustum, it
+        atomically writes to the output buffers.
+
+        Returns the number of particles written. Output buffers are the
+        existing self._output_bufs, ready for zero-copy rendering.
+        """
+        dev = self.device
+        n = self._n_particles
+        stride = max(int(stride), 1)
+
+        ratio = float(stride)
+        h_scale = ratio ** (1.0 / 3.0)
+        fov_rad = float(np.radians(camera.fov))
+
+        # Zero the counter
+        dev.queue.write_buffer(self._subsample_counter_buf, 0,
+                               struct.pack("IIII", 0, 0, 0, 0))
+
+        # Pack params (96 bytes — vec3+pad ×4 = 64, then 8 floats/ints = 32)
+        # Layout: cam_pos+pad, cam_fwd+pad, cam_right+pad, cam_up+pad,
+        #         fov_rad, aspect, stride, n_particles, h_scale, mass_scale,
+        #         max_output, _pad
+        params_data = struct.pack(
+            "fff f fff f fff f fff f ffII ffII",
+            float(camera.position[0]), float(camera.position[1]),
+            float(camera.position[2]), 0.0,
+            float(camera.forward[0]), float(camera.forward[1]),
+            float(camera.forward[2]), 0.0,
+            float(camera.right[0]), float(camera.right[1]),
+            float(camera.right[2]), 0.0,
+            float(camera.up[0]), float(camera.up[1]),
+            float(camera.up[2]), 0.0,
+            fov_rad, float(camera.aspect), stride, n,
+            h_scale, ratio, self._max_output, 0,
+        )
+        dev.queue.write_buffer(self._subsample_params_buf, 0, params_data)
+
+        # Wrap workgroup count into a 2D grid (max 65535 per dim).
+        total_wg = _div_ceil(n, WG_SIZE)
+        wgx = min(total_wg, 65535)
+        wgy = _div_ceil(total_wg, wgx)
+
+        encoder = dev.create_command_encoder()
+        cpass = encoder.begin_compute_pass()
+        cpass.set_pipeline(self._subsample_pipeline)
+        cpass.set_bind_group(0, self._subsample_bg0)
+        cpass.set_bind_group(1, self._subsample_bg1)
+        cpass.dispatch_workgroups(wgx, wgy)
+        cpass.end()
+        dev.queue.submit([encoder.finish()])
+
+        # Read back the counter to get the actual output count
+        counter_data = dev.queue.read_buffer(self._subsample_counter_buf, size=4)
+        n_out = struct.unpack("I", counter_data)[0]
+        n_out = min(n_out, self._max_output)
+        return n_out
 
     def _prefix_sum(self, buf, n, block_sums_1=None, block_sums_2=None):
         """Run multi-level prefix sum on a u32 storage buffer.

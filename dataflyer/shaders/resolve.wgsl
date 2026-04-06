@@ -14,6 +14,10 @@ struct ResolveParams {
 @group(0) @binding(3) var t_sq: texture_2d<f32>;
 @group(0) @binding(4) var t_colormap: texture_2d<f32>;
 @group(0) @binding(5) var s_colormap: sampler;
+// Half-resolution summary accumulation textures (added in additively)
+@group(0) @binding(6) var t_numerator_lo: texture_2d<f32>;
+@group(0) @binding(7) var t_denominator_lo: texture_2d<f32>;
+@group(0) @binding(8) var t_sq_lo: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -35,10 +39,34 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     return out;
 }
 
+// Manual bilinear sampling of a half-resolution texture from full-res pixel coords.
+fn sample_lo_bilinear(tex: texture_2d<f32>, full_coords: vec2<i32>) -> f32 {
+    let lo_dim_u = textureDimensions(tex, 0);
+    let lo_max = vec2<i32>(i32(lo_dim_u.x) - 1, i32(lo_dim_u.y) - 1);
+    // Map full-res pixel center to half-res continuous coordinates
+    let lo_uv = (vec2<f32>(full_coords) + vec2<f32>(0.5)) * 0.5 - vec2<f32>(0.5);
+    let lo_i = vec2<i32>(floor(lo_uv));
+    let f = lo_uv - vec2<f32>(lo_i);
+    let i0 = clamp(lo_i,                   vec2<i32>(0), lo_max);
+    let i1 = clamp(lo_i + vec2<i32>(1, 0), vec2<i32>(0), lo_max);
+    let i2 = clamp(lo_i + vec2<i32>(0, 1), vec2<i32>(0), lo_max);
+    let i3 = clamp(lo_i + vec2<i32>(1, 1), vec2<i32>(0), lo_max);
+    let v00 = textureLoad(tex, i0, 0).r;
+    let v10 = textureLoad(tex, i1, 0).r;
+    let v01 = textureLoad(tex, i2, 0).r;
+    let v11 = textureLoad(tex, i3, 0).r;
+    let v0 = mix(v00, v10, f.x);
+    let v1 = mix(v01, v11, f.x);
+    return mix(v0, v1, f.y);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let coords = vec2<i32>(in.position.xy);
-    let denom = textureLoad(t_denominator, coords, 0).r;
+    // Combine full-res particle accumulation with bilinearly upsampled
+    // half-res summary accumulation (additive).
+    let denom = textureLoad(t_denominator, coords, 0).r
+              + sample_lo_bilinear(t_denominator_lo, coords);
 
     if (denom < 1e-30) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
@@ -48,11 +76,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (params.mode == 0u) {
         val = denom;
     } else if (params.mode == 1u) {
-        let num = textureLoad(t_numerator, coords, 0).r;
+        let num = textureLoad(t_numerator, coords, 0).r
+                + sample_lo_bilinear(t_numerator_lo, coords);
         val = num / denom;
     } else {
-        let num = textureLoad(t_numerator, coords, 0).r;
-        let sq = textureLoad(t_sq, coords, 0).r;
+        let num = textureLoad(t_numerator, coords, 0).r
+                + sample_lo_bilinear(t_numerator_lo, coords);
+        let sq = textureLoad(t_sq, coords, 0).r
+               + sample_lo_bilinear(t_sq_lo, coords);
         let mean = num / denom;
         let mean_sq = sq / denom;
         val = sqrt(max(mean_sq - mean * mean, 0.0));

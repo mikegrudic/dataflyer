@@ -395,6 +395,12 @@ class DevOverlay(Panel):
 
         items = []
         n_vis = renderer.n_particles + renderer.n_big
+        n_aniso = getattr(renderer, "n_aniso", 0)
+        n_summaries = getattr(renderer, "n_summaries", n_aniso)
+        # In isotropic mode summaries are folded into n_particles; subtract
+        # so the breakdown isn't double-counted.
+        n_real_particles = max(n_vis - (n_summaries if n_aniso == 0 else 0), 0)
+        n_drawn = n_vis + n_aniso
         n_tot = renderer.n_total
         scale = "log" if renderer.log_scale else "linear"
 
@@ -402,6 +408,7 @@ class DevOverlay(Panel):
         pid_str = f"  (PID: {smooth_fps:.0f})" if smooth_fps > 0 else ""
         items.append(("text", f"FPS: {fps:.0f}{pid_str}"))
         items.append(("text", f"Particles: {n_vis:,} / {n_tot:,}"))
+        items.append(("text", f"Drawn: {n_drawn:,} ({n_real_particles:,} parts + {n_summaries:,} summaries)"))
         items.append(("text", f"LOD: {renderer.lod_pixels}px  Budget: {renderer.max_render_particles/1e6:.1f}M"))
         items.append(("text", f"Cull: {timings.get('cull',0)*1000:.0f}ms  Upload: {timings.get('upload',0)*1000:.0f}ms  Render: {timings.get('render',0)*1000:.0f}ms"))
         if renderer.log_scale:
@@ -435,13 +442,18 @@ class DevOverlay(Panel):
         items.append(("text", ""))
 
         items.append(("dropdown", "Kernel", renderer.kernel, renderer.KERNELS, "kernel"))
+        items.append(("dropdown", "LOD Strategy",
+                      getattr(renderer, "lod_strategy", "geometric"),
+                      getattr(renderer, "LOD_STRATEGIES",
+                              ["geometric", "particle_count", "subsample"]),
+                      "lod_strategy"))
         items.append(("text", ""))
 
         items.append(("slider", "Hsml Scale", renderer.hsml_scale, 0.1, 5.0, "hsml_scale"))
         items.append(("slider", "Summary Scale", renderer.summary_scale, 0.1, 10.0, "summary_scale"))
         items.append(("slider", "Summary Overlap", renderer.summary_overlap, 0.0, 1.0, "summary_overlap"))
         items.append(("slider", "Tree Min N", renderer.tree_min_particles, 0, 1e7, "tree_min_particles"))
-        items.append(("slider", "Tree Cells", renderer.tree_n_cells, 8, 256, "tree_n_cells"))
+        items.append(("slider", "Leaf Size", renderer.tree_leaf_size, 8, 4096, "tree_leaf_size"))
         items.append(("slider", "Cull Interval", renderer.cull_interval, 0.0, 5.0, "cull_interval"))
         items.append(("text", f"Aniso splats: {renderer.n_aniso:,}"))
 
@@ -483,11 +495,11 @@ class DevOverlay(Panel):
                 setattr(renderer, key, min(vmax, cur + step))
             if key == "tree_min_particles":
                 renderer._needs_grid_rebuild = True
-            elif key == "tree_n_cells":
-                # Snap to nearest power of 2
+            elif key == "tree_leaf_size":
+                # Snap to nearest power of 2 in [8, 4096]
                 import math
                 val = getattr(renderer, key)
-                p = max(3, min(8, round(math.log2(max(val, 8)))))  # 8..256
+                p = max(3, min(12, round(math.log2(max(val, 8)))))
                 setattr(renderer, key, int(2 ** p))
                 renderer._needs_grid_rebuild = True
             return True
@@ -507,6 +519,16 @@ class DevOverlay(Panel):
             key, value = widget[3], widget[4]
             if key == "kernel":
                 renderer.kernel = value
+            elif key == "lod_strategy":
+                renderer.lod_strategy = value
+                # Reset lod_pixels to a sensible default for the new strategy.
+                if value == "particle_count":
+                    renderer.lod_pixels = float(getattr(renderer, "tree_leaf_size", 64))
+                elif value == "subsample":
+                    renderer.lod_pixels = 1.0
+                else:  # geometric
+                    n = max(getattr(renderer, "n_total", 1), 1)
+                    renderer.lod_pixels = max(1.0, n ** (1.0 / 3.0) / 16.0)
             self._dropdown_open = None
             return True
 

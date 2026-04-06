@@ -87,11 +87,26 @@ class WGPURenderer:
             self._accum_format = ACCUM_FORMAT_FALLBACK
             print(f"  wgpu: float32-blendable not available, using {ACCUM_FORMAT_FALLBACK}")
 
+        # GPU timestamp queries (for measuring render pass duration).
+        # Disabled by default: synchronous read_buffer after submit stalls
+        # the CPU on the GPU queue, making the measurement reflect queue
+        # back-pressure rather than actual GPU work.
+        self._timestamp_supported = False  # set True manually to enable profiling
+        self._last_render_ms = 0.0
+        if self._timestamp_supported and "timestamp-query" in features:
+            self._ts_query_set = device.create_query_set(type="timestamp", count=2)
+            self._ts_resolve_buf = device.create_buffer(
+                size=16,
+                usage=wgpu.BufferUsage.QUERY_RESOLVE | wgpu.BufferUsage.COPY_SRC)
+        else:
+            self._timestamp_supported = False
+
         # Render state (matches SplatRenderer attributes)
         self.n_particles = 0
         self.n_total = 0
         self.n_big = 0
         self.n_aniso = 0
+        self.n_summaries = 0  # tracks summaries regardless of iso/aniso path
         self.n_stars = 0
         self.alpha_scale = 1.0
         self.qty_min = -1.0
@@ -104,7 +119,13 @@ class WGPURenderer:
         self.use_adaptive_tree = True
         self.tree_min_particles = 0
         self.tree_n_cells = 64  # legacy, unused with adaptive octree
-        self.tree_leaf_size = 1024
+        self.tree_leaf_size = 64
+        # LOD strategy: how the LOD knob translates into rendering decisions.
+        #   "geometric"      — summarize cells with h_pix <= lod_pixels (default)
+        #   "particle_count" — summarize cells with npart <= lod_pixels
+        #   "subsample"      — bypass tree LOD, use stride sampling on leaves
+        self.lod_strategy = "subsample"
+        self.LOD_STRATEGIES = ["geometric", "particle_count", "subsample"]
         self.use_importance_sampling = False
         self.kernel = "cubic_spline"
         self.use_hybrid_rendering = True
@@ -116,7 +137,7 @@ class WGPURenderer:
         self.bypass_cull = False
         self.auto_lod = True
         self.target_fps = 15.0
-        self.auto_lod_smooth = 0.05
+        self.auto_lod_smooth = 0.3
         self.pid_Kp = 0.5
         self.pid_Kd = 0.0
         self.pid_Ki = 0.0
@@ -141,13 +162,17 @@ class WGPURenderer:
         # GPU resources
         self._accum_textures = None  # (num, den, sq) texture triple
         self._accum_textures2 = None  # second set for composite
+        self._accum_textures_lo = None  # half-res for summary splats
         self._accum_size = (0, 0)
         self._accum_size2 = (0, 0)
+        self._accum_size_lo = (0, 0)
 
         # Particle storage buffers (SoA)
         self._particle_bufs = {}  # "pos", "hsml", "mass", "qty"
+        self._summary_bufs = {}  # parallel set for summary splats (half-res target)
         self._aniso_bufs = {}  # "pos", "mass", "qty", "cov"
         self._star_bufs = {}  # "pos", "mass"
+        self.n_summary_splats = 0  # count of summary splats in _summary_bufs
 
         # Colormap
         self._colormap_tex = None
@@ -293,6 +318,22 @@ class WGPURenderer:
                 },
                 {"binding": 4, "visibility": wgpu.ShaderStage.FRAGMENT, "texture": {"sample_type": "float"}},
                 {"binding": 5, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {"type": "filtering"}},
+                # Half-res summary accumulation textures
+                {
+                    "binding": 6,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {
+                    "binding": 7,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
+                {
+                    "binding": 8,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "unfilterable-float"},
+                },
             ]
         )
 
@@ -393,10 +434,14 @@ class WGPURenderer:
         t0 = time.perf_counter()
         if self.use_adaptive_tree:
             from .adaptive_octree import AdaptiveOctree
+            # Subsample mode only needs the sorted particle arrays, not the
+            # octree itself. Defer the expensive subdivision + moments build
+            # until the user switches to a tree-using strategy.
+            defer = (self.lod_strategy == "subsample")
             grid = AdaptiveOctree(
                 self._all_pos, self._all_mass, self._all_hsml, self._all_qty,
-                leaf_size=self.tree_leaf_size)
-            label = "Adaptive octree"
+                leaf_size=self.tree_leaf_size, defer_tree_build=defer)
+            label = "Adaptive octree" + (" (deferred)" if defer else "")
         else:
             from .spatial_grid import SpatialGrid
             grid = SpatialGrid(
@@ -429,6 +474,10 @@ class WGPURenderer:
         if self.bypass_cull:
             t0 = time.perf_counter()
             self._upload_arrays(self._all_pos, self._all_hsml, self._all_mass, self._all_qty, camera)
+            self._upload_summary_arrays(
+                np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                np.zeros(0, np.float32), np.zeros(0, np.float32))
+            self.n_summaries = 0
             self._last_upload_ms = (time.perf_counter() - t0) * 1000
             return
 
@@ -449,20 +498,25 @@ class WGPURenderer:
                 viewport_width=self._viewport_width,
                 summary_overlap=self.summary_overlap,
                 anisotropic=self.use_aniso_summaries,
+                summary_scale=self.summary_scale,
+                lod_strategy=self.lod_strategy,
             )
             self._last_cull_ms = (time.perf_counter() - t0) * 1000
             t0 = time.perf_counter()
             if len(result) == 9:
                 r_pos, r_hsml, r_mass, r_qty, s_pos, s_hsml, s_mass, s_qty, s_cov = result
+                self.n_summaries = len(s_pos)
                 if self.use_aniso_summaries:
                     self._upload_arrays(r_pos, r_hsml, r_mass, r_qty, camera)
                     self._upload_aniso_summaries(s_pos, s_mass, s_qty, s_cov)
+                    self._upload_summary_arrays(
+                        np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                        np.zeros(0, np.float32), np.zeros(0, np.float32))
                 else:
-                    pos = np.concatenate([r_pos, s_pos]) if len(r_pos) + len(s_pos) > 0 else r_pos
-                    hsml = np.concatenate([r_hsml, s_hsml]) if len(r_hsml) + len(s_hsml) > 0 else r_hsml
-                    mass = np.concatenate([r_mass, s_mass]) if len(r_mass) + len(s_mass) > 0 else r_mass
-                    qty = np.concatenate([r_qty, s_qty]) if len(r_qty) + len(s_qty) > 0 else r_qty
-                    self._upload_arrays(pos, hsml, mass, qty, camera)
+                    # Isotropic mode: keep summaries in a separate buffer
+                    # so they can be rendered to the half-res FBO.
+                    self._upload_arrays(r_pos, r_hsml, r_mass, r_qty, camera)
+                    self._upload_summary_arrays(s_pos, s_hsml, s_mass, s_qty)
                     self._upload_aniso_summaries(
                         np.zeros((0, 3), np.float32),
                         np.zeros(0, np.float32),
@@ -471,7 +525,11 @@ class WGPURenderer:
                     )
             else:
                 pos, hsml, mass, qty = result
+                self.n_summaries = 0
                 self._upload_arrays(pos, hsml, mass, qty, camera)
+                self._upload_summary_arrays(
+                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                    np.zeros(0, np.float32), np.zeros(0, np.float32))
                 self._upload_aniso_summaries(
                     np.zeros((0, 3), np.float32),
                     np.zeros(0, np.float32),
@@ -499,7 +557,39 @@ class WGPURenderer:
                 self._upload_arrays(
                     self._all_pos[idx], self._all_hsml[idx], self._all_mass[idx], self._all_qty[idx], camera
                 )
+            self._upload_summary_arrays(
+                np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                np.zeros(0, np.float32), np.zeros(0, np.float32))
+            self.n_summaries = 0
         self._last_upload_ms = (time.perf_counter() - t0) * 1000
+
+    def _upload_summary_arrays(self, pos, hsml, mass, qty):
+        """Upload summary splat arrays to a separate set of buffers
+        (rendered to the half-resolution accumulation textures)."""
+        n = len(mass)
+        self.n_summary_splats = n
+        if n == 0:
+            self._summary_bufs = {}
+            return
+
+        if self.hsml_scale != 1.0:
+            hsml = hsml * self.hsml_scale
+
+        dev = self.device
+        pos4 = np.zeros((n, 4), dtype=np.float32)
+        pos4[:, :3] = pos
+        self._summary_bufs = {
+            "pos": dev.create_buffer_with_data(data=pos4, usage=wgpu.BufferUsage.STORAGE),
+            "hsml": dev.create_buffer_with_data(data=hsml.astype(np.float32), usage=wgpu.BufferUsage.STORAGE),
+            "mass": dev.create_buffer_with_data(data=mass.astype(np.float32), usage=wgpu.BufferUsage.STORAGE),
+            "qty": dev.create_buffer_with_data(data=qty.astype(np.float32), usage=wgpu.BufferUsage.STORAGE),
+        }
+        sb = self._summary_bufs
+        self._summary_bg = _make_bind_group(
+            dev, self._splat_bgl1,
+            [sb["pos"], sb["hsml"], sb["mass"], sb["qty"]])
+        # Reuse identity sort buffer (grow if needed for summary count)
+        self._set_identity_sort_index(n)
 
     def _upload_arrays(self, pos, hsml, mass, qty, camera=None):
         """Upload particle arrays to GPU storage buffers."""
@@ -614,10 +704,15 @@ class WGPURenderer:
     def _ensure_fbo(self, width, height, which=1):
         """Create or resize accumulation textures."""
         if which == 1:
-            if self._accum_size == (width, height) and self._accum_textures is not None:
-                return
-            self._accum_textures = self._create_accum_textures(width, height)
-            self._accum_size = (width, height)
+            if self._accum_size != (width, height) or self._accum_textures is None:
+                self._accum_textures = self._create_accum_textures(width, height)
+                self._accum_size = (width, height)
+            # Half-resolution textures for summary splats
+            lo_w = max(1, width // 2)
+            lo_h = max(1, height // 2)
+            if self._accum_size_lo != (lo_w, lo_h) or self._accum_textures_lo is None:
+                self._accum_textures_lo = self._create_accum_textures(lo_w, lo_h)
+                self._accum_size_lo = (lo_w, lo_h)
         else:
             if self._accum_size2 == (width, height) and self._accum_textures2 is not None:
                 return
@@ -683,20 +778,33 @@ class WGPURenderer:
         rp.end()
 
     def _render_accum(self, camera, width, height, accum_textures):
-        """Render additive accumulation pass into given textures."""
+        """Render additive accumulation pass into given textures.
+
+        Renders:
+          - real particles + anisotropic summaries → full-res `accum_textures`
+          - isotropic summary splats → half-res `_accum_textures_lo`
+        """
         self._write_camera_uniforms(camera, width, height)
 
         dev = self.device
         encoder = dev.create_command_encoder()
 
+        # ---- Full-resolution pass: particles + aniso summaries ----
         views = accum_textures["views"]
-        render_pass = encoder.begin_render_pass(
+        rp_args = dict(
             color_attachments=[
                 {"view": views[0], "clear_value": (0, 0, 0, 0), "load_op": "clear", "store_op": "store"},
                 {"view": views[1], "clear_value": (0, 0, 0, 0), "load_op": "clear", "store_op": "store"},
                 {"view": views[2], "clear_value": (0, 0, 0, 0), "load_op": "clear", "store_op": "store"},
             ],
         )
+        if self._timestamp_supported:
+            rp_args["timestamp_writes"] = {
+                "query_set": self._ts_query_set,
+                "beginning_of_pass_write_index": 0,
+                "end_of_pass_write_index": 1,
+            }
+        render_pass = encoder.begin_render_pass(**rp_args)
 
         # Draw regular particles (all as instanced quads)
         if self.n_particles > 0 and self._particle_bufs and hasattr(self, "_sort_bg"):
@@ -708,7 +816,6 @@ class WGPURenderer:
 
         # Draw anisotropic summary splats
         if self.n_aniso > 0 and self._aniso_bufs:
-            # Update aniso params
             aniso_data = np.array([self.summary_scale, 0, 0, 0], dtype=np.float32)
             dev.queue.write_buffer(self._aniso_params_buf, 0, aniso_data.tobytes())
 
@@ -718,12 +825,44 @@ class WGPURenderer:
             render_pass.draw(4, self.n_aniso, 0, 0)
 
         render_pass.end()
+
+        # ---- Half-resolution pass: isotropic summary splats ----
+        # Write camera uniforms with the half-res viewport so the splat
+        # quad sizes are correct in pixel space.
+        if self._accum_textures_lo is not None:
+            lo_views = self._accum_textures_lo["views"]
+            lo_rp = encoder.begin_render_pass(color_attachments=[
+                {"view": lo_views[0], "clear_value": (0, 0, 0, 0), "load_op": "clear", "store_op": "store"},
+                {"view": lo_views[1], "clear_value": (0, 0, 0, 0), "load_op": "clear", "store_op": "store"},
+                {"view": lo_views[2], "clear_value": (0, 0, 0, 0), "load_op": "clear", "store_op": "store"},
+            ])
+            if self.n_summary_splats > 0 and self._summary_bufs and hasattr(self, "_summary_bg"):
+                lo_rp.set_pipeline(self._splat_pipeline)
+                lo_rp.set_bind_group(0, self._camera_bg)
+                lo_rp.set_bind_group(1, self._summary_bg)
+                lo_rp.set_bind_group(2, self._sort_bg)
+                lo_rp.draw(4, self.n_summary_splats, 0, 0)
+            lo_rp.end()
+
+        if self._timestamp_supported:
+            encoder.resolve_query_set(
+                self._ts_query_set, 0, 2, self._ts_resolve_buf, 0)
         dev.queue.submit([encoder.finish()])
+
+        if self._timestamp_supported:
+            try:
+                ts_data = dev.queue.read_buffer(self._ts_resolve_buf, size=16)
+                t0, t1 = np.frombuffer(ts_data, dtype=np.uint64)
+                if t1 > t0:
+                    self._last_render_ms = float(t1 - t0) * 1e-6
+            except Exception:
+                pass
 
     def render(self, camera, width, height):
         """Render particle splats via additive accumulation + resolve."""
         self._viewport_width = width
-        if (self.n_particles == 0 and self.n_big == 0 and self.n_aniso == 0) or self._colormap_tex is None:
+        if (self.n_particles == 0 and self.n_big == 0 and self.n_aniso == 0
+                and self.n_summary_splats == 0) or self._colormap_tex is None:
             return
 
         self._ensure_fbo(width, height, which=1)
@@ -742,7 +881,8 @@ class WGPURenderer:
         resolve_data = struct.pack("ffII", self.qty_min, self.qty_max, self.resolve_mode, self.log_scale)
         self.device.queue.write_buffer(self._resolve_params_buf, 0, resolve_data)
 
-        # Create resolve bind group (references accum textures)
+        # Create resolve bind group (references full-res + half-res accum textures)
+        lo_views = self._accum_textures_lo["views"]
         resolve_bg = self.device.create_bind_group(
             layout=self._resolve_bgl,
             entries=[
@@ -752,6 +892,9 @@ class WGPURenderer:
                 {"binding": 3, "resource": self._accum_textures["views"][2]},
                 {"binding": 4, "resource": self._colormap_tex.create_view()},
                 {"binding": 5, "resource": self._colormap_sampler},
+                {"binding": 6, "resource": lo_views[0]},
+                {"binding": 7, "resource": lo_views[1]},
+                {"binding": 8, "resource": lo_views[2]},
             ],
         )
 
@@ -823,9 +966,14 @@ class WGPURenderer:
         self._encode_star_overlay(encoder, screen_view)
         self.device.queue.submit([encoder.finish()])
 
-    def _read_accum_texture_r(self, texture):
-        """Read back an accumulation texture and return the red channel as float32 array."""
-        w, h = self._accum_size
+    def _read_accum_texture_r(self, texture, size=None):
+        """Read back an accumulation texture's red channel as float32 array.
+
+        Args:
+            texture: GPU texture to read.
+            size: optional (w, h) tuple. Defaults to `self._accum_size`.
+        """
+        w, h = size if size is not None else self._accum_size
         fmt = self._accum_format
 
         if fmt == "r32float":
@@ -851,7 +999,12 @@ class WGPURenderer:
             return np.frombuffer(data, dtype=np.float32)
 
     def read_accum_range(self):
-        """Read back accumulation textures and compute percentile range."""
+        """Read back accumulation textures and compute percentile range.
+
+        Reads BOTH the full-resolution (particles) and half-resolution
+        (summary splats) accumulation textures so the auto-range reflects
+        the union of all rendered content.
+        """
         if self._accum_textures is None:
             return self.qty_min, self.qty_max
 
@@ -859,27 +1012,64 @@ class WGPURenderer:
         if w == 0 or h == 0:
             return self.qty_min, self.qty_max
 
-        den = self._read_accum_texture_r(self._accum_textures["textures"][1])
+        den_hi = self._read_accum_texture_r(self._accum_textures["textures"][1])
+        den_lo = None
+        if self._accum_textures_lo is not None:
+            lo_w, lo_h = self._accum_size_lo
+            if lo_w > 0 and lo_h > 0:
+                den_lo = self._read_accum_texture_r(
+                    self._accum_textures_lo["textures"][1], size=(lo_w, lo_h))
 
         if self.resolve_mode == 2:
-            num = self._read_accum_texture_r(self._accum_textures["textures"][0])
-            sq = self._read_accum_texture_r(self._accum_textures["textures"][2])
-            mask = den > 1e-30
+            num_hi = self._read_accum_texture_r(self._accum_textures["textures"][0])
+            sq_hi = self._read_accum_texture_r(self._accum_textures["textures"][2])
+            mask_hi = den_hi > 1e-30
             with np.errstate(invalid="ignore"):
-                mean = np.where(mask, num / den, 0)
-                mean_sq = np.where(mask, sq / den, 0)
-            vals = np.sqrt(np.maximum(mean_sq - mean * mean, 0))[mask]
-            mass = den[mask]
+                mean = np.where(mask_hi, num_hi / den_hi, 0)
+                mean_sq = np.where(mask_hi, sq_hi / den_hi, 0)
+            vals_hi = np.sqrt(np.maximum(mean_sq - mean * mean, 0))[mask_hi]
+            mass_hi = den_hi[mask_hi]
+            vals_parts = [vals_hi]
+            mass_parts = [mass_hi]
+            if den_lo is not None:
+                num_lo = self._read_accum_texture_r(
+                    self._accum_textures_lo["textures"][0], size=self._accum_size_lo)
+                sq_lo = self._read_accum_texture_r(
+                    self._accum_textures_lo["textures"][2], size=self._accum_size_lo)
+                mask_lo = den_lo > 1e-30
+                with np.errstate(invalid="ignore"):
+                    mean_l = np.where(mask_lo, num_lo / den_lo, 0)
+                    mean_sq_l = np.where(mask_lo, sq_lo / den_lo, 0)
+                vals_lo = np.sqrt(np.maximum(mean_sq_l - mean_l * mean_l, 0))[mask_lo]
+                vals_parts.append(vals_lo)
+                mass_parts.append(den_lo[mask_lo])
+            vals = np.concatenate(vals_parts) if vals_parts else np.zeros(0, np.float32)
+            mass = np.concatenate(mass_parts) if mass_parts else np.zeros(0, np.float32)
         elif self.resolve_mode == 1:
-            num = self._read_accum_texture_r(self._accum_textures["textures"][0])
-            mask = den > 1e-30
+            num_hi = self._read_accum_texture_r(self._accum_textures["textures"][0])
+            mask_hi = den_hi > 1e-30
             with np.errstate(invalid="ignore"):
-                vals = np.where(mask, num / den, 0)
-            vals = vals[mask]
-            mass = den[mask]
+                v_hi = np.where(mask_hi, num_hi / den_hi, 0)[mask_hi]
+            vals_parts = [v_hi]
+            mass_parts = [den_hi[mask_hi]]
+            if den_lo is not None:
+                num_lo = self._read_accum_texture_r(
+                    self._accum_textures_lo["textures"][0], size=self._accum_size_lo)
+                mask_lo = den_lo > 1e-30
+                with np.errstate(invalid="ignore"):
+                    v_lo = np.where(mask_lo, num_lo / den_lo, 0)[mask_lo]
+                vals_parts.append(v_lo)
+                mass_parts.append(den_lo[mask_lo])
+            vals = np.concatenate(vals_parts)
+            mass = np.concatenate(mass_parts)
         else:
-            mask = den > 1e-30
-            vals = den[mask]
+            # Surface density: combine the denominator values from both buffers
+            mask_hi = den_hi > 1e-30
+            vals_parts = [den_hi[mask_hi]]
+            if den_lo is not None:
+                mask_lo = den_lo > 1e-30
+                vals_parts.append(den_lo[mask_lo])
+            vals = np.concatenate(vals_parts)
             mass = vals
 
         if len(vals) == 0:

@@ -58,6 +58,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     req_features = set()
     if "float32-blendable" in adapter.features:
         req_features.add("float32-blendable")
+    if "timestamp-query" in adapter.features:
+        req_features.add("timestamp-query")
 
     # Request max storage buffer size the adapter supports (need ~1.6 GB for 134M particles)
     max_ssbo = min(adapter.limits["max-storage-buffer-binding-size"], 2**32 - 1)
@@ -85,7 +87,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     # Camera
     camera = Camera(fov=fov, aspect=width / height)
     boxsize = data.header.get("BoxSize", None)
-    camera.auto_scale(data.positions, boxsize=boxsize)
+    camera.auto_scale(data.positions, masses=data.get_field("Masses"), boxsize=boxsize)
 
     # Renderer
     renderer = WGPURenderer(device, canvas_context, present_format)
@@ -428,6 +430,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     pid_prev_error = 0.0
     pid_integral = 0.0
     refine_budget = 0
+    # Last lod_pixels value at which the smoothed frame time was at or below
+    # target. Used to restart camera motion at a known-sustainable quality
+    # instead of starting at the user's manual LOD and overshooting.
+    last_sustainable_lod = renderer.lod_pixels
+    # Per-strategy memory of the last known-sustainable LOD value, so
+    # switching strategies doesn't carry an irrelevant value over.
+    last_sustainable_by_strategy = {}
+    auto_lod_warmup_frames = 0  # frames remaining where auto-LOD is suppressed
     refine_saved_lod = None
     refine_saved_budget = None
 
@@ -538,6 +548,26 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     def do_cull():
         """Run cull via GPU compute (zero-copy) or CPU fallback."""
         if gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False):
+            # Brute-force GPU subsample cull when subsample strategy is active
+            if getattr(renderer, "lod_strategy", "geometric") == "subsample":
+                t0 = time.perf_counter()
+                stride = max(int(renderer.lod_pixels), 1)
+                # Grow output buffers if user bumped budget at runtime.
+                if hasattr(gpu_compute, "grow_subsample_output"):
+                    gpu_compute.grow_subsample_output(int(renderer.max_render_particles))
+                n_out = gpu_compute.dispatch_subsample_cull(camera, stride)
+                renderer.set_particle_buffers_from_gpu(
+                    gpu_compute.get_output_buffers(), n_out)
+                renderer.n_summaries = 0
+                renderer._upload_summary_arrays(
+                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                    np.zeros(0, np.float32), np.zeros(0, np.float32))
+                renderer._upload_aniso_summaries(
+                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                    np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
+                renderer._last_cull_ms = (time.perf_counter() - t0) * 1000
+                renderer._last_upload_ms = 0.0
+                return
             n_out, n_vis, summary_data = gpu_compute.dispatch_cull(
                 camera, renderer.max_render_particles,
                 lod_pixels=renderer.lod_pixels,
@@ -546,11 +576,28 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             )
             # Zero-copy: point renderer at compute output buffers
             renderer.set_particle_buffers_from_gpu(gpu_compute.get_output_buffers(), n_out)
-            # Upload summaries (few, still CPU)
             s_pos, s_hsml, s_mass, s_qty, s_cov = summary_data
+            renderer.n_summaries = len(s_pos)
+
             if renderer.use_aniso_summaries and len(s_pos) > 0:
                 renderer._upload_aniso_summaries(s_pos, s_mass, s_qty, s_cov)
+                renderer._upload_summary_arrays(
+                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                    np.zeros(0, np.float32), np.zeros(0, np.float32))
+            elif len(s_pos) > 0:
+                # Isotropic: derive isotropic hsml from covariance trace and
+                # upload as half-res summary splats.
+                trace = s_cov[:, 0] + s_cov[:, 3] + s_cov[:, 5]
+                iso_hsml = (np.sqrt(np.maximum(trace, 1e-30) / 3.0)
+                            * 2.0 * renderer.summary_scale).astype(np.float32)
+                renderer._upload_summary_arrays(s_pos, iso_hsml, s_mass, s_qty)
+                renderer._upload_aniso_summaries(
+                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                    np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
             else:
+                renderer._upload_summary_arrays(
+                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                    np.zeros(0, np.float32), np.zeros(0, np.float32))
                 renderer._upload_aniso_summaries(
                     np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
                     np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
@@ -584,9 +631,16 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             fps_time = now
             n_vis = renderer.n_particles + renderer.n_aniso
             n_tot = renderer.n_total
+            init_msg = ""
+            if not _bg["done"]:
+                init_msg = " | Building spatial grid..."
+            elif renderer._grid is None:
+                init_msg = " | Loading grid..."
+            elif gpu_compute is None and renderer.n_total >= 10_000_000:
+                init_msg = " | Initializing GPU compute..."
             glfw.set_window_title(
                 window,
-                f"DataFlyer [wgpu] | {fps:.0f} fps | {n_vis/1e6:.1f}M/{n_tot/1e6:.1f}M"
+                f"DataFlyer [wgpu] | {fps:.0f} fps | {n_vis/1e6:.1f}M/{n_tot/1e6:.1f}M{init_msg}"
             )
 
         glfw.poll_events()
@@ -605,13 +659,27 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         # Only use GPU compute for datasets large enough to benefit (>10M particles)
         GPU_COMPUTE_THRESHOLD = 10_000_000
         if (not gpu_ready and gpu_compute is None and renderer._grid is not None
-                and renderer.n_total >= GPU_COMPUTE_THRESHOLD
-                and not getattr(renderer._grid, 'is_adaptive', False)):
+                and renderer.n_total >= GPU_COMPUTE_THRESHOLD):
+            is_adaptive = getattr(renderer._grid, 'is_adaptive', False)
+            in_subsample = (
+                getattr(renderer, 'lod_strategy', 'geometric') == 'subsample')
             try:
                 gpu_compute = GPUCompute(device)
-                gpu_compute.upload_snapshot(renderer._grid)
+                if is_adaptive or in_subsample:
+                    # Adaptive trees only support the brute-force subsample
+                    # pipeline (no per-cell tree-LOD GPU shaders). Size the
+                    # output buffer to match the user's max budget so a
+                    # high budget doesn't silently truncate output.
+                    gpu_compute.upload_subsample_only(
+                        renderer._grid,
+                        max_output=int(renderer.max_render_particles))
+                    print("  GPU subsample pipeline initialized (zero-copy)")
+                else:
+                    gpu_compute.upload_snapshot(
+                        renderer._grid,
+                        max_output=int(renderer.max_render_particles))
+                    print("  GPU compute pipeline initialized (zero-copy)")
                 gpu_ready = True
-                print("  GPU compute pipeline initialized (zero-copy)")
             except Exception as e:
                 print(f"  GPU compute init failed: {e}")
                 gpu_compute = None
@@ -645,8 +713,11 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     refine_saved_budget = None
                 refine_budget = 0
                 if not was_moving and renderer.auto_lod:
-                    renderer.lod_pixels = max(user_lod, 8)
-                    renderer.max_render_particles = min(user_budget, 2_000_000)
+                    strat = getattr(renderer, "lod_strategy", "geometric")
+                    resume_lod = last_sustainable_by_strategy.get(
+                        strat, last_sustainable_lod)
+                    renderer.lod_pixels = float(resume_lod)
+                    renderer.max_render_particles = user_budget
 
                 if not was_moving:
                     pid_integral = 0.0
@@ -661,24 +732,41 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     fps_inst = 1.0 / dt
                     smooth_fps_ema = (1 - a) * smooth_fps_ema + a * fps_inst
                     smooth_frame_ms = 1000.0 / max(smooth_fps_ema, 0.01)
-                # PID auto-LOD on log2(budget)
-                if renderer.auto_lod and smooth_frame_ms > 0 and dt > 0:
+                # Auto-LOD on log2(lod_pixels). Asymmetric responsiveness:
+                # instantaneous error for slowdowns, smoothed for headroom.
+                # Skip the first frame after resume; cap per-frame step.
+                if (renderer.auto_lod and smooth_frame_ms > 0 and dt > 0
+                        and was_moving):
                     target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-                    error = math.log2(max(smooth_frame_ms / target_ms, 0.01))
-                    pid_integral += error * dt
-                    pid_integral = max(-4.0, min(4.0, pid_integral))
-                    derivative = (error - pid_prev_error) / dt
+                    inst_frame_ms = dt * 1000.0
+                    err_inst = math.log2(max(inst_frame_ms / target_ms, 0.01))
+                    err_smooth = math.log2(max(smooth_frame_ms / target_ms, 0.01))
+                    if err_inst > 0:
+                        error = err_inst
+                        gain = 2.0
+                    else:
+                        error = min(err_smooth, 0.0)
+                        gain = 0.5
+                    step = gain * error * dt
+                    step = max(-1.0, min(1.0, step))
+                    log2_lod = math.log2(max(renderer.lod_pixels, 1.0))
+                    log2_lod += step
+                    strat = getattr(renderer, "lod_strategy", "geometric")
+                    if strat == "particle_count":
+                        log2_max = math.log2(max(renderer.n_total, 2))
+                    else:
+                        log2_max = 8.0
+                    log2_lod = max(0.0, min(log2_max, log2_lod))
+                    renderer.lod_pixels = float(2 ** log2_lod)
+                    renderer.max_render_particles = user_budget
+                    pid_integral = 0.0
                     pid_prev_error = error
-                    rate = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
-                    output = rate * dt
-                    log2_budget = math.log2(max(renderer.max_render_particles, 1_000))
-                    log2_budget -= output
-                    log2_n = math.log2(max(renderer.n_total, 1))
-                    log2_budget = max(math.log2(1_000), min(log2_n, log2_budget))
-                    renderer.max_render_particles = max(1_000, min(
-                        renderer.n_total, int(2 ** log2_budget)))
-                    frac = renderer.max_render_particles / max(renderer.n_total, 1)
-                    renderer.lod_pixels = max(1.0, min(256.0, 1.0 / max(frac, 0.004)))
+                    prev = last_sustainable_by_strategy.get(strat, renderer.lod_pixels)
+                    if err_smooth <= 0.0:
+                        last_sustainable_by_strategy[strat] = min(prev, renderer.lod_pixels)
+                    elif err_smooth > 0.5:
+                        last_sustainable_by_strategy[strat] = max(prev, renderer.lod_pixels)
+                    last_sustainable_lod = last_sustainable_by_strategy[strat]
 
             elif refine_budget < renderer.n_total:
                 if was_moving:
@@ -703,72 +791,127 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             refine_budget = 0
 
             if not was_moving and renderer.auto_lod:
-                # Just started moving — low-quality cull for responsive first frame
-                renderer.lod_pixels = max(user_lod, 4)
-                renderer.max_render_particles = min(user_budget, 4_000_000)
+                # Restart at the last sustainable LOD for the current
+                # strategy so we don't overshoot quality and trigger a
+                # corrective drop.
+                strat = getattr(renderer, "lod_strategy", "geometric")
+                resume_lod = last_sustainable_by_strategy.get(
+                    strat, last_sustainable_lod)
+                renderer.lod_pixels = float(resume_lod)
+                renderer.max_render_particles = user_budget
                 do_cull()
                 last_cull_time = now
+                # Suppress auto-LOD reaction for several frames to let the
+                # renderer / EMA stabilize after the LOD switch and avoid
+                # reacting to one-off resume cost.
+                auto_lod_warmup_frames = 4
 
             if not was_moving:
                 pid_integral = 0.0
                 smooth_fps_ema = max(renderer.target_fps, 1.0)
                 smooth_frame_ms = 1000.0 / smooth_fps_ema
 
-            # Smoothed frame time (unbiased EMA of frame rate)
+            # Smoothed frame time (unbiased EMA of frame rate). Skip
+            # accumulation while warming up so the EMA doesn't carry the
+            # one-off resume cost into post-warmup auto-LOD decisions.
             import math
             if dt > 0:
-                tau = max(renderer.auto_lod_smooth, 0.01)
-                a = min(1.0, dt / tau)
-                fps_inst = 1.0 / dt
-                smooth_fps_ema = (1 - a) * smooth_fps_ema + a * fps_inst
-                smooth_frame_ms = 1000.0 / max(smooth_fps_ema, 0.01)
-            # PID auto-LOD on log2(budget)
-            if renderer.auto_lod and smooth_frame_ms > 0 and dt > 0:
+                if auto_lod_warmup_frames > 0:
+                    auto_lod_warmup_frames -= 1
+                    smooth_fps_ema = max(renderer.target_fps, 1.0)
+                    smooth_frame_ms = 1000.0 / smooth_fps_ema
+                else:
+                    tau = max(renderer.auto_lod_smooth, 0.01)
+                    a = min(1.0, dt / tau)
+                    fps_inst = 1.0 / dt
+                    smooth_fps_ema = (1 - a) * smooth_fps_ema + a * fps_inst
+                    smooth_frame_ms = 1000.0 / max(smooth_fps_ema, 0.01)
+            # Auto-LOD on log2(lod_pixels). Pure proportional with asymmetric
+            # responsiveness: a single slow frame coarsens immediately, but
+            # quality bumps require sustained headroom (the EMA-smoothed
+            # frame time below target). Skip the first frame after
+            # resuming motion — that frame includes one-off cull/upload
+            # cost from the LOD change and would otherwise drive a spurious
+            # large coarsening step.
+            if (renderer.auto_lod and smooth_frame_ms > 0 and dt > 0
+                    and was_moving and auto_lod_warmup_frames == 0):
                 target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-                error = math.log2(max(smooth_frame_ms / target_ms, 0.01))
-                pid_integral += error * dt
-                pid_integral = max(-4.0, min(4.0, pid_integral))
-                derivative = (error - pid_prev_error) / dt
+                inst_frame_ms = dt * 1000.0
+                err_inst = math.log2(max(inst_frame_ms / target_ms, 0.01))
+                err_smooth = math.log2(max(smooth_frame_ms / target_ms, 0.01))
+                # Deadband around target to prevent drift from frame-time
+                # jitter. Within ±0.5 octaves (~0.7×–1.4× target) the
+                # controller does nothing.
+                DEADBAND = 0.5
+                # Coarsen on the smoothed error so single slow frames don't
+                # trigger drift. Brighten only on smoothed headroom too.
+                # Symmetric gain — asymmetric gains cause monotonic drift
+                # in the presence of frame-time noise.
+                if err_smooth > DEADBAND:
+                    error = err_smooth - DEADBAND
+                    gain = 1.0
+                elif err_smooth < -DEADBAND:
+                    error = err_smooth + DEADBAND
+                    gain = 1.0
+                else:
+                    error = 0.0
+                    gain = 0.0
+                step = gain * error * dt
+                step = max(-1.0, min(2.0, step))
+                log2_lod = math.log2(max(renderer.lod_pixels, 1.0))
+                log2_lod += step
+                # The LOD ceiling depends on the strategy: pixel size for
+                # geometric/subsample (1..256), particle count for
+                # particle_count (1..n_total).
+                strat = getattr(renderer, "lod_strategy", "geometric")
+                if strat == "particle_count":
+                    log2_max = math.log2(max(renderer.n_total, 2))
+                else:
+                    log2_max = 8.0  # 256
+                log2_lod = max(0.0, min(log2_max, log2_lod))
+                renderer.lod_pixels = float(2 ** log2_lod)
+                renderer.max_render_particles = user_budget
+                pid_integral = 0.0
                 pid_prev_error = error
-                output = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
-                log2_budget = math.log2(max(renderer.max_render_particles, 1_000))
-                log2_budget -= output
-                log2_n = math.log2(max(renderer.n_total, 1))
-                log2_budget = max(math.log2(1_000), min(log2_n, log2_budget))
-                renderer.max_render_particles = max(1_000, min(
-                    renderer.n_total, int(2 ** log2_budget)))
-                frac = renderer.max_render_particles / max(renderer.n_total, 1)
-                renderer.lod_pixels = max(1.0, min(256.0, 1.0 / max(frac, 0.004)))
+                # Track the smallest (finest) lod_pixels we've sustained at
+                # or below target FPS, per-strategy. Used as the restart
+                # value next time the camera starts moving.
+                prev = last_sustainable_by_strategy.get(strat, renderer.lod_pixels)
+                if err_smooth <= 0.0:
+                    last_sustainable_by_strategy[strat] = min(prev, renderer.lod_pixels)
+                elif err_smooth > 0.5:
+                    last_sustainable_by_strategy[strat] = max(prev, renderer.lod_pixels)
+                last_sustainable_lod = last_sustainable_by_strategy[strat]
 
             # Cull every frame while moving (PID controls budget to keep it fast)
             do_cull()
             last_cull_time = now
 
-        elif refine_budget < renderer.n_total:
+        elif renderer.lod_pixels > 1.0:
             # --- STOPPED: progressive refinement ---
-            if was_moving:
-                smooth_frame_ms = 0.0
-                refine_saved_lod = renderer.lod_pixels
-                refine_saved_budget = renderer.max_render_particles
-                refine_budget = max(user_budget, 4_000_000)
+            # Halve lod_pixels each frame toward a strategy-dependent floor.
+            # Geometric/particle_count refine to lod=1 (full detail).
+            # Subsample refines to a stride that fits the user_budget so
+            # rendering stays interactive even when fully refined.
+            strat = getattr(renderer, "lod_strategy", "geometric")
+            if strat == "subsample":
+                refine_floor = max(1.0, renderer.n_total / max(user_budget, 1))
+            else:
+                refine_floor = 1.0
 
-            if refine_budget == 0:
-                refine_budget = max(user_budget, 4_000_000)
-                refine_saved_lod = renderer.lod_pixels
-                refine_saved_budget = renderer.max_render_particles
+            if renderer.lod_pixels <= refine_floor:
+                pass  # already refined
+            else:
+                if was_moving:
+                    smooth_frame_ms = 0.0
+                    refine_saved_lod = renderer.lod_pixels
+                    refine_saved_budget = renderer.max_render_particles
+                    auto_lod_warmup_frames = 0
 
-            gpu_ready = getattr(gpu_compute, '_upload_ready', False)
-            max_refine = renderer.n_total if gpu_ready else min(renderer.n_total, 8_000_000)
-            refine_budget = min(refine_budget * 2, max_refine)
-            renderer.lod_pixels = 1
-            renderer.max_render_particles = refine_budget
+                renderer.lod_pixels = max(refine_floor, renderer.lod_pixels * 0.5)
+                renderer.max_render_particles = user_budget
 
-            do_cull()
-
-            # Restore settings (render uses data already uploaded)
-            if refine_saved_lod is not None:
-                renderer.lod_pixels = refine_saved_lod
-                renderer.max_render_particles = refine_saved_budget
+                do_cull()
 
         was_moving = moved
 
@@ -811,10 +954,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         # Update timing stats
         cull_s = getattr(renderer, '_last_cull_ms', 0) / 1000
         upload_s = getattr(renderer, '_last_upload_ms', 0) / 1000
+        render_s = getattr(renderer, '_last_render_ms', 0) / 1000
         alpha = 0.2
-        if cull_s > 0 or upload_s > 0:
+        if cull_s > 0 or upload_s > 0 or render_s > 0:
             _timings["cull"] = _timings["cull"] * (1 - alpha) + cull_s * alpha
             _timings["upload"] = _timings["upload"] * (1 - alpha) + upload_s * alpha
+            _timings["render"] = _timings["render"] * (1 - alpha) + render_s * alpha
 
         # Sync auto-range request from proxy
         if _state["_needs_auto_range"]:
@@ -839,9 +984,18 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 overlay._last_update_time = now
                 was_enabled = overlay.enabled
                 overlay.enabled = True
+                # Surface init progress in the dev overlay message line
+                init_status = ""
+                if not _bg["done"]:
+                    init_status = "Initializing: building spatial grid..."
+                elif renderer._grid is None:
+                    init_status = "Initializing: loading grid..."
+                elif gpu_compute is None and renderer.n_total >= 10_000_000:
+                    init_status = "Initializing: uploading to GPU compute..."
+                overlay_message = init_status if init_status else _last_message
                 overlay.update(
                     renderer, camera, fps, _render_mode.name,
-                    AVAILABLE_COLORMAPS[_state["_cmap_idx"]], _timings, _last_message,
+                    AVAILABLE_COLORMAPS[_state["_cmap_idx"]], _timings, overlay_message,
                     smooth_fps=smooth_fps_val,
                 )
                 overlay.enabled = was_enabled

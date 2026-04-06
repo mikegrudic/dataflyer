@@ -472,7 +472,8 @@ class SpatialGrid:
 
     def query_frustum_lod(self, camera, max_particles, lod_pixels=4,
                           importance_sampling=False, viewport_width=2048,
-                          summary_overlap=0.0):
+                          summary_overlap=0.0, anisotropic=False,
+                          summary_scale=1.0, lod_strategy="geometric", **kwargs):
         """Top-down multi-level LOD query.
 
         Traverses coarsest-to-finest. Cells subtending <= lod_pixels emit a
@@ -624,7 +625,7 @@ class SpatialGrid:
         else:
             r_pos, r_hsml, r_mass, r_qty = z3, z1, z1, z1
 
-        # Assemble summary output with anisotropic covariance
+        # Assemble summary output
         z6 = np.zeros((0, 6), dtype=np.float32)
         if summary_parts:
             s_pos = np.concatenate([p[0] for p in summary_parts]).astype(np.float32)
@@ -633,17 +634,24 @@ class SpatialGrid:
             s_qty = np.concatenate([p[3] for p in summary_parts]).astype(np.float32)
             s_cov = np.concatenate([p[4] for p in summary_parts]).astype(np.float32)
             s_mean_h2 = np.concatenate([p[5] for p in summary_parts]).astype(np.float32)
-            s_cs2 = np.concatenate([
-                np.broadcast_to((p[6]**2)[None, :], (len(p[0]), 3))
+            s_cs = np.concatenate([
+                np.broadcast_to(p[6][None, :], (len(p[0]), 3))
                 for p in summary_parts
             ]).astype(np.float32)
-            s_cov[:, 0] += 0.225 * s_mean_h2
-            s_cov[:, 3] += 0.225 * s_mean_h2
-            s_cov[:, 5] += 0.225 * s_mean_h2
-            alpha = summary_overlap
-            s_cov[:, 0] += alpha * s_cs2[:, 0]
-            s_cov[:, 3] += alpha * s_cs2[:, 1]
-            s_cov[:, 5] += alpha * s_cs2[:, 2]
+            s_cs2 = s_cs ** 2
+
+            if anisotropic:
+                s_cov[:, 0] += 0.225 * s_mean_h2
+                s_cov[:, 3] += 0.225 * s_mean_h2
+                s_cov[:, 5] += 0.225 * s_mean_h2
+                alpha = summary_overlap
+                s_cov[:, 0] += alpha * s_cs2[:, 0]
+                s_cov[:, 3] += alpha * s_cs2[:, 1]
+                s_cov[:, 5] += alpha * s_cs2[:, 2]
+            else:
+                # Isotropic: hsml = 2 * cell_width * summary_scale
+                s_hsml = (2.0 * summary_scale * s_cs[:, 0]).astype(np.float32)
+                s_cov[:] = 0
         else:
             s_pos, s_hsml, s_mass, s_qty, s_cov = z3, z1, z1, z1, z6
 

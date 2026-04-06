@@ -96,44 +96,128 @@ def _compute_centers_from_codes(codes, depth, pmin, cell_size):
 
 # ---- Adaptive subdivision ----
 
-def _adaptive_subdivide(sorted_codes, n, leaf_size, max_depth):
-    """Find all nodes via adaptive subdivision.
-
-    Returns:
-        leaves: list of (start, end, depth, code) for each leaf cell
-        internals: set of (depth, code) for each internal node
+@njit(cache=True)
+def _adaptive_subdivide_nb(sorted_codes, n, leaf_size, max_depth, max_nodes,
+                            out_leaf_start, out_leaf_end, out_leaf_depth, out_leaf_code,
+                            out_int_depth, out_int_code,
+                            stack_start, stack_end, stack_depth, stack_code):
+    """Numba-jitted adaptive subdivision. Writes leaves/internals into
+    pre-allocated output arrays. Returns (n_leaves, n_internals, ok).
+    Sets ok=0 if either output buffer overflows so the caller can retry.
     """
-    leaves = []
-    internals = set()
-    # Stack: (start_idx, end_idx, depth, code_at_depth)
-    stack = [(0, n, 0, np.uint64(0))]
+    n_leaves = 0
+    n_internals = 0
+    sp = 0
+    stack_start[sp] = 0
+    stack_end[sp] = n
+    stack_depth[sp] = 0
+    stack_code[sp] = np.uint64(0)
+    sp = 1
 
-    while stack:
-        start, end, depth, code = stack.pop()
+    while sp > 0:
+        sp -= 1
+        start = stack_start[sp]
+        end = stack_end[sp]
+        depth = stack_depth[sp]
+        code = stack_code[sp]
         count = end - start
         if count == 0:
             continue
         if count <= leaf_size or depth >= max_depth:
-            leaves.append((start, end, depth, int(code)))
+            if n_leaves >= max_nodes:
+                return n_leaves, n_internals, 0
+            out_leaf_start[n_leaves] = start
+            out_leaf_end[n_leaves] = end
+            out_leaf_depth[n_leaves] = depth
+            out_leaf_code[n_leaves] = code
+            n_leaves += 1
             continue
 
-        internals.add((depth, int(code)))
+        if n_internals >= max_nodes:
+            return n_leaves, n_internals, 0
+        out_int_depth[n_internals] = depth
+        out_int_code[n_internals] = code
+        n_internals += 1
 
-        # Subdivide into 8 children using Morton code structure.
-        # Particles in [start, end) have codes whose depth-d prefix == code.
-        # Children at depth d+1 have prefix code*8 + c for c in 0..7.
         remaining_bits = np.uint64(3 * (max_depth - depth - 1))
-        sub = sorted_codes[start:end]
-        for c in range(7, -1, -1):  # reverse order for DFS
-            child_code = np.uint64(int(code) * 8 + c)
+        # Push children in reverse order so child 0 is popped first (DFS).
+        for c in range(7, -1, -1):
+            child_code = code * np.uint64(8) + np.uint64(c)
             lo_full = child_code << remaining_bits
             hi_full = (child_code + np.uint64(1)) << remaining_bits
-            lo = start + int(np.searchsorted(sub, lo_full))
-            hi = start + int(np.searchsorted(sub, hi_full))
+            # Inline binary search [start, end) for first index with codes >= lo_full
+            lo_lo = start
+            lo_hi = end
+            while lo_lo < lo_hi:
+                mid = (lo_lo + lo_hi) >> 1
+                if sorted_codes[mid] < lo_full:
+                    lo_lo = mid + 1
+                else:
+                    lo_hi = mid
+            lo = lo_lo
+            # First index with codes >= hi_full
+            hi_lo = lo
+            hi_hi = end
+            while hi_lo < hi_hi:
+                mid = (hi_lo + hi_hi) >> 1
+                if sorted_codes[mid] < hi_full:
+                    hi_lo = mid + 1
+                else:
+                    hi_hi = mid
+            hi = hi_lo
             if hi > lo:
-                stack.append((lo, hi, depth + 1, child_code))
+                stack_start[sp] = lo
+                stack_end[sp] = hi
+                stack_depth[sp] = depth + 1
+                stack_code[sp] = child_code
+                sp += 1
 
-    return leaves, internals
+    return n_leaves, n_internals, 1
+
+
+def _adaptive_subdivide(sorted_codes, n, leaf_size, max_depth):
+    """Find all nodes via adaptive subdivision.
+
+    Returns dict of vectorized arrays:
+        leaf_start, leaf_end, leaf_depth, leaf_code
+        int_depth, int_code
+    """
+    # Worst case: every internal node spawns 8 children. Each leaf has at
+    # most leaf_size particles, so at minimum n/leaf_size leaves; in practice
+    # the count can be much higher with clustered data because some leaves
+    # contain just a single particle. Allocate generously, then retry larger
+    # if the buffer overflows.
+    max_nodes = max(16 * (n // max(leaf_size, 1) + 8), 1024)
+    while True:
+        out_leaf_start = np.empty(max_nodes, dtype=np.int64)
+        out_leaf_end = np.empty(max_nodes, dtype=np.int64)
+        out_leaf_depth = np.empty(max_nodes, dtype=np.int32)
+        out_leaf_code = np.empty(max_nodes, dtype=np.uint64)
+        out_int_depth = np.empty(max_nodes, dtype=np.int32)
+        out_int_code = np.empty(max_nodes, dtype=np.uint64)
+        stack_size = 8 * (max_depth + 2)
+        stack_start = np.empty(stack_size, dtype=np.int64)
+        stack_end = np.empty(stack_size, dtype=np.int64)
+        stack_depth = np.empty(stack_size, dtype=np.int32)
+        stack_code = np.empty(stack_size, dtype=np.uint64)
+
+        n_leaves, n_internals, ok = _adaptive_subdivide_nb(
+            sorted_codes, n, leaf_size, max_depth, max_nodes,
+            out_leaf_start, out_leaf_end, out_leaf_depth, out_leaf_code,
+            out_int_depth, out_int_code,
+            stack_start, stack_end, stack_depth, stack_code)
+        if ok:
+            break
+        max_nodes *= 2
+
+    return {
+        "leaf_start": out_leaf_start[:n_leaves].copy(),
+        "leaf_end": out_leaf_end[:n_leaves].copy(),
+        "leaf_depth": out_leaf_depth[:n_leaves].copy(),
+        "leaf_code": out_leaf_code[:n_leaves].copy(),
+        "int_depth": out_int_depth[:n_internals].copy(),
+        "int_code": out_int_code[:n_internals].copy(),
+    }
 
 
 def _build_adaptive_tree(sorted_codes, n, leaf_size, max_depth, pmin, box):
@@ -143,43 +227,58 @@ def _build_adaptive_tree(sorted_codes, n, leaf_size, max_depth, pmin, box):
     Leaves exist at variable depths; no leaf has more than leaf_size particles
     (unless capped by max_depth).
     """
-    leaves, internals = _adaptive_subdivide(sorted_codes, n, leaf_size, max_depth)
+    sub = _adaptive_subdivide(sorted_codes, n, leaf_size, max_depth)
+    leaf_start = sub["leaf_start"]
+    leaf_depth = sub["leaf_depth"]
+    leaf_code = sub["leaf_code"]
+    int_depth = sub["int_depth"]
+    int_code = sub["int_code"]
 
-    # Sort leaves by start index for a proper CSR
-    leaves.sort(key=lambda x: x[0])
-    n_leaves = len(leaves)
+    # Sort leaves by start index for a proper CSR (vectorized)
+    order = np.argsort(leaf_start, kind="stable")
+    leaf_start = leaf_start[order]
+    leaf_depth = leaf_depth[order]
+    leaf_code = leaf_code[order]
+    n_leaves = len(leaf_start)
     cell_start = np.empty(n_leaves + 1, dtype=np.int64)
-    for i, (s, e, d, c) in enumerate(leaves):
-        cell_start[i] = s
+    cell_start[:n_leaves] = leaf_start
     cell_start[n_leaves] = n
+    leaf_idx_in_csr = np.arange(n_leaves, dtype=np.int64)
 
-    # Map (depth, code) → leaf index for fast lookup
-    leaf_lookup = {}
-    for i, (s, e, d, c) in enumerate(leaves):
-        leaf_lookup[(d, c)] = i
-
-    # Collect all nodes by depth. Each node is (code, is_leaf, leaf_idx).
-    nodes_by_depth = {}
-    for i, (s, e, d, c) in enumerate(leaves):
-        nodes_by_depth.setdefault(d, []).append((c, True, i))
-    for d, c in internals:
-        nodes_by_depth.setdefault(d, []).append((c, False, -1))
-
-    # Sort each depth by Morton code
-    for d in nodes_by_depth:
-        nodes_by_depth[d].sort(key=lambda x: x[0])
-
-    # Build levels from finest depth to coarsest (root)
-    populated_depths = sorted(nodes_by_depth.keys(), reverse=True)
+    # Build levels from finest depth to coarsest (root). For each depth,
+    # gather (code, is_leaf, leaf_index_in_csr) entries from both leaves
+    # and internals using vectorized indexing.
+    populated_depths = sorted(set(int(d) for d in leaf_depth.tolist())
+                              | set(int(d) for d in int_depth.tolist()),
+                              reverse=True)
     levels = []
     depth_to_level_idx = {}
 
     for d in populated_depths:
-        nodes = nodes_by_depth[d]
-        nc = len(nodes)
-        codes = np.array([nd[0] for nd in nodes], dtype=np.uint64)
-        is_leaf = np.array([nd[1] for nd in nodes], dtype=np.bool_)
-        leaf_indices = np.array([nd[2] for nd in nodes], dtype=np.int64)
+        d32 = np.int32(d)
+        leaf_mask_at_d = leaf_depth == d32
+        int_mask_at_d = int_depth == d32
+
+        leaves_codes_d = leaf_code[leaf_mask_at_d]
+        leaves_idx_d = leaf_idx_in_csr[leaf_mask_at_d]
+        ints_codes_d = int_code[int_mask_at_d]
+
+        nc = len(leaves_codes_d) + len(ints_codes_d)
+        all_codes = np.empty(nc, dtype=np.uint64)
+        all_codes[:len(leaves_codes_d)] = leaves_codes_d
+        all_codes[len(leaves_codes_d):] = ints_codes_d
+        all_is_leaf = np.empty(nc, dtype=np.bool_)
+        all_is_leaf[:len(leaves_codes_d)] = True
+        all_is_leaf[len(leaves_codes_d):] = False
+        all_leaf_idx = np.empty(nc, dtype=np.int64)
+        all_leaf_idx[:len(leaves_codes_d)] = leaves_idx_d
+        all_leaf_idx[len(leaves_codes_d):] = -1
+
+        # Sort by Morton code (vectorized)
+        sort_order = np.argsort(all_codes, kind="stable")
+        codes = all_codes[sort_order]
+        is_leaf = all_is_leaf[sort_order]
+        leaf_indices = all_leaf_idx[sort_order]
 
         cell_size = box / (2 ** d) if d > 0 else box.copy()
         half_diag = float(np.linalg.norm(cell_size) * 0.5)
@@ -198,57 +297,44 @@ def _build_adaptive_tree(sorted_codes, n, leaf_size, max_depth, pmin, box):
         levels.append(level)
         depth_to_level_idx[d] = len(levels) - 1
 
-    # Build parent_idx: each node's parent is in the next coarser level
-    # Build code→index maps for each level for fast lookup
-    code_to_idx_by_level = {}
-    for li, lv in enumerate(levels):
-        code_to_idx_by_level[li] = {int(c): i for i, c in enumerate(lv["cell_codes"])}
-
+    # Build parent_idx for each non-root level using vectorized searchsorted.
+    # Since cell_codes are Morton-sorted at each level, parent_codes (= child >> 3)
+    # are also sorted (Morton property), so searchsorted on the parent level
+    # gives the parent indices directly.
     for li in range(len(levels) - 1):
         child_lv = levels[li]
         child_depth = child_lv["depth"]
         parent_depth = child_depth - 1
-        # Find the level containing the parent depth
         parent_li = depth_to_level_idx.get(parent_depth)
         if parent_li is None:
-            # Parent depth has no nodes — shouldn't happen with a connected tree
             child_lv["parent_idx"] = np.zeros(child_lv["nc"], dtype=np.uint32)
             continue
-        parent_code_map = code_to_idx_by_level[parent_li]
-        parent_codes = child_lv["cell_codes"] >> np.uint64(3)
-        parent_idx = np.array([parent_code_map[int(pc)] for pc in parent_codes],
-                              dtype=np.uint32)
+        parent_lv = levels[parent_li]
+        parent_codes_for_children = child_lv["cell_codes"] >> np.uint64(3)
+        # searchsorted assumes parent_lv["cell_codes"] is sorted, which it is.
+        parent_idx = np.searchsorted(
+            parent_lv["cell_codes"], parent_codes_for_children).astype(np.uint32)
         child_lv["parent_idx"] = parent_idx
 
-    # Root level has no parent
     levels[-1]["parent_idx"] = np.zeros(levels[-1]["nc"], dtype=np.uint32)
 
-    # Build child_offset: for each non-leaf node, index of first child in child level.
-    # Process from coarsest to finest: levels[-1] down to levels[1].
+    # Build child_offset via vectorized boundary detection on each child level's
+    # parent_idx (which is non-decreasing because the children are Morton-sorted).
     for li in range(len(levels) - 1, 0, -1):
         parent_lv = levels[li]
-        child_li = li - 1
-        child_lv = levels[child_li]
-
-        # Only works if child_depth == parent_depth + 1
+        child_lv = levels[li - 1]
         if child_lv["depth"] != parent_lv["depth"] + 1:
-            # Non-adjacent depths: no direct children
             parent_lv["child_offset"] = np.zeros(parent_lv["nc"], dtype=np.uint32)
             continue
 
         n_parents = parent_lv["nc"]
-        n_children = child_lv["nc"]
+        # For each parent index p (0..n_parents-1), child_offset[p] is the
+        # first child whose parent_idx >= p. searchsorted does this in one shot.
         pi_arr = child_lv["parent_idx"]
-
-        child_offset = np.empty(n_parents, dtype=np.uint32)
-        ci = 0
-        for pi in range(n_parents):
-            child_offset[pi] = ci
-            while ci < n_children and pi_arr[ci] == pi:
-                ci += 1
+        child_offset = np.searchsorted(
+            pi_arr, np.arange(n_parents, dtype=np.uint32), side="left").astype(np.uint32)
         parent_lv["child_offset"] = child_offset
 
-    # Finest level has no children
     if levels:
         levels[0].setdefault("child_offset", np.zeros(levels[0]["nc"], dtype=np.uint32))
 
@@ -327,7 +413,8 @@ class AdaptiveOctree:
     or max_depth is reached. Drop-in replacement for SpatialGrid.
     """
 
-    def __init__(self, positions, masses, hsml, quantity, leaf_size=1024, max_depth=15):
+    def __init__(self, positions, masses, hsml, quantity, leaf_size=1024,
+                 max_depth=15, defer_tree_build=False):
         self.leaf_size = leaf_size
         self.max_depth = max_depth
         pmin = positions.min(axis=0).astype(np.float64)
@@ -342,29 +429,67 @@ class AdaptiveOctree:
         box = np.full(3, max_extent, dtype=np.float64)
         self._box = box
 
+        # Stash inputs in particle order; sorted/tree state is filled in
+        # _build_tree() if/when needed.
+        self._raw_pos = positions.astype(np.float32)
+        self._raw_mass = masses.astype(np.float32)
+        self._raw_hsml = hsml.astype(np.float32)
+        self._raw_qty = quantity.astype(np.float32)
+
+        self.sort_order = None
+        self.sorted_pos = None
+        self.sorted_hsml = None
+        self.sorted_mass = None
+        self.sorted_qty = None
+        self.cell_start = None
+        self.levels = []
+        self.n_cells = 0
+        self.is_adaptive = True
+
+        # Pre-shuffled views for the subsample LOD strategy. Built directly
+        # from the unsorted input — no Morton sort or tree needed.
+        rng = np.random.default_rng(0)
+        perm = rng.permutation(len(self._raw_pos))
+        self._shuffled_pos = self._raw_pos[perm]
+        self._shuffled_hsml = self._raw_hsml[perm]
+        self._shuffled_mass = self._raw_mass[perm]
+        self._shuffled_qty = self._raw_qty[perm]
+        self._shuffle_perm = perm
+
+        if not defer_tree_build:
+            self._build_tree()
+
+    def _build_tree(self):
+        """Lazily build the Morton sort + adaptive octree + moments. Called
+        on demand the first time a tree-using LOD strategy is queried."""
+        if self.levels:
+            return  # already built
+
+        positions = self._raw_pos
+        masses = self._raw_mass
+        hsml = self._raw_hsml
+        quantity = self._raw_qty
+        box = self._box
+        max_depth = self.max_depth
+        leaf_size = self.leaf_size
+
         # Morton sort
         inv_box = 1.0 / box
         max_coord = 2 ** max_depth
         codes = _compute_morton_codes(
-            positions.astype(np.float32), self.pmin.astype(np.float64),
-            inv_box, max_coord)
+            positions, self.pmin.astype(np.float64), inv_box, max_coord)
         self.sort_order = np.argsort(codes)
         sorted_codes = codes[self.sort_order]
 
-        # Store sorted particle data
         so = self.sort_order
-        self.sorted_pos = positions[so].astype(np.float32)
-        self.sorted_hsml = hsml[so].astype(np.float32)
-        self.sorted_mass = masses[so].astype(np.float32)
-        self.sorted_qty = quantity[so].astype(np.float32)
+        self.sorted_pos = positions[so]
+        self.sorted_hsml = hsml[so]
+        self.sorted_mass = masses[so]
+        self.sorted_qty = quantity[so]
 
-        # Build tree structure
         self.levels, self.cell_start = _build_adaptive_tree(
             sorted_codes, len(positions), leaf_size, max_depth, self.pmin, box)
         self.n_cells = sum(1 for lv in self.levels for f in lv["is_leaf"] if f)
-        self.is_adaptive = True  # GPU compute not yet supported for adaptive trees
-
-        # Compute moments
         self._compute_all_moments()
 
     def _compute_all_moments(self):
@@ -413,11 +538,15 @@ class AdaptiveOctree:
                     child_moments.mh2, child_moments.mxx,
                     child_lv["nc"])
 
-                # Sum child particle counts for internal nodes
-                for pi in internal_mask:
-                    cs = co[pi]
-                    ce = co[pi + 1] if pi < nc - 1 else child_lv["nc"]
-                    npart[pi] = child_npart[cs:ce].sum()
+                # Sum child particle counts per parent via cumulative-sum
+                # diff (vectorized).
+                child_cumsum = np.concatenate(
+                    ([0], np.cumsum(child_npart, dtype=np.int64)))
+                co_ext = np.empty(nc + 1, dtype=np.int64)
+                co_ext[:nc] = co
+                co_ext[nc] = child_lv["nc"]
+                npart_all = child_cumsum[co_ext[1:]] - child_cumsum[co_ext[:-1]]
+                npart[internal_mask] = npart_all[internal_mask]
 
                 # Only overwrite internal nodes (leaves already filled)
                 moments.mass[internal_mask] = p_mass[internal_mask]
@@ -428,27 +557,9 @@ class AdaptiveOctree:
 
             com, qty, cov, cell_hsml = moments.derive()
 
-            # Compute hsml_max from largest eigenvalue of (cov + kernel padding).
-            # Used as the opening criterion when anisotropic summaries are active.
-            safe_mass = np.maximum(moments.mass, 1e-30)
-            mean_h2 = moments.mh2 / safe_mass
-            padded_cov = cov.copy()
-            padded_cov[:, 0] += 0.225 * mean_h2
-            padded_cov[:, 3] += 0.225 * mean_h2
-            padded_cov[:, 5] += 0.225 * mean_h2
-            mats = np.zeros((nc, 3, 3), dtype=np.float64)
-            mats[:, 0, 0] = padded_cov[:, 0]
-            mats[:, 0, 1] = mats[:, 1, 0] = padded_cov[:, 1]
-            mats[:, 0, 2] = mats[:, 2, 0] = padded_cov[:, 2]
-            mats[:, 1, 1] = padded_cov[:, 3]
-            mats[:, 1, 2] = mats[:, 2, 1] = padded_cov[:, 4]
-            mats[:, 2, 2] = padded_cov[:, 5]
-            evals_max = np.linalg.eigvalsh(mats)[:, -1]  # largest eigenvalue
-            hsml_max = np.sqrt(np.maximum(evals_max / 0.225, 1e-30)).astype(np.float32)
-
             lv.update({
                 "moments": moments, "mass": moments.mass, "com": com,
-                "hsml": cell_hsml, "hsml_max": hsml_max, "qty": qty, "cov": cov,
+                "hsml": cell_hsml, "qty": qty, "cov": cov,
                 "mxx": moments.mxx, "mh2": moments.mh2, "npart": npart,
             })
 
@@ -456,46 +567,72 @@ class AdaptiveOctree:
         """Re-weight the tree without rebuilding structure."""
         if quantity is None:
             quantity = masses
-        so = self.sort_order
-        self.sorted_mass = masses[so].astype(np.float32)
-        self.sorted_qty = quantity[so].astype(np.float32)
-        self._compute_all_moments()
+        # Update the raw arrays (used by the shuffle and any future tree build)
+        self._raw_mass = np.asarray(masses, dtype=np.float32)
+        self._raw_qty = np.asarray(quantity, dtype=np.float32)
+        # Refresh shuffled views with the new weights.
+        perm = self._shuffle_perm
+        self._shuffled_mass = self._raw_mass[perm]
+        self._shuffled_qty = self._raw_qty[perm]
+        # If the tree exists, refresh its moments too.
+        if self.sort_order is not None and self.levels:
+            so = self.sort_order
+            self.sorted_mass = self._raw_mass[so]
+            self.sorted_qty = self._raw_qty[so]
+            self._compute_all_moments()
 
     # ---- CPU query ----
 
     @staticmethod
-    def _classify_nodes(h_pix, is_leaf, is_root_level, lod_pixels):
-        """Decide which nodes to summarize vs refine.
+    def _classify_nodes(h_pix, is_leaf, is_root_level, lod_pixels,
+                        strategy="geometric", npart=None):
+        """Decide what to do with each node.
 
         Standalone subroutine for the node opening criterion. Easy to swap
         for experimentation.
 
         Args:
-            h_pix: per-node angular size in pixels (geometric, e.g. half_diag/dist).
-            is_leaf: bool array, True for leaf nodes.
-            is_root_level: True if this is the coarsest (root) level — forces
-                refinement of small root levels regardless of size.
-            lod_pixels: angular threshold; nodes smaller than this are summarized.
+            h_pix:    per-node angular size in pixels.
+            is_leaf:  bool array, True for leaf nodes.
+            is_root_level: True if this is the coarsest (root) level.
+            lod_pixels: LOD threshold (interpretation depends on strategy).
+            strategy: "geometric" → summarize when h_pix <= lod_pixels.
+                      "particle_count" → summarize when npart <= lod_pixels.
+            npart:    per-node particle count (required for "particle_count").
 
-        Returns:
-            (summary_sel, refine_sel) — bool arrays of equal length.
+        Returns (summary_sel, refine_sel, emit_sel) bool masks.
         """
         if is_root_level:
-            # Always refine root-level internal nodes; leaves get summarized
             refine_sel = ~is_leaf
             summary_sel = is_leaf
-        else:
+            emit_sel = np.zeros_like(is_leaf)
+            return summary_sel, refine_sel, emit_sel
+
+        if strategy == "particle_count":
+            small = npart <= lod_pixels
+        else:  # geometric (default)
             small = h_pix <= lod_pixels
-            # Leaves always summarize; internal nodes refine if large
-            summary_sel = small | is_leaf
-            refine_sel = ~small & ~is_leaf
-        return summary_sel, refine_sel
+
+        summary_sel = small
+        emit_sel = (~small) & is_leaf
+        refine_sel = (~small) & (~is_leaf)
+        return summary_sel, refine_sel, emit_sel
 
     def query_frustum_lod(self, camera, max_particles, lod_pixels=4,
                           importance_sampling=False, viewport_width=2048,
-                          summary_overlap=0.0, anisotropic=False, **kwargs):
+                          summary_overlap=0.0, anisotropic=False,
+                          summary_scale=1.0, lod_strategy="geometric", **kwargs):
         """Top-down multi-level LOD query. Returns same format as SpatialGrid."""
-        if lod_pixels <= 2 or len(self.levels) <= 1:
+        if lod_strategy == "subsample":
+            # Strategy 3: bypass the tree entirely. Take a uniform stride
+            # over all sorted particles, then frustum-cull the result.
+            # `lod_pixels` is interpreted as the stride, so the auto-LOD
+            # controller can vary the subsample rate.
+            return self._subsample_all(camera, max(int(lod_pixels), 1))
+        # Tree-using strategies: lazy-build the tree on first use.
+        if not self.levels:
+            self._build_tree()
+        if len(self.levels) <= 1:
             return self._frustum_cull_leaves(camera, max_particles, importance_sampling)
 
         cam_pos = camera.position
@@ -533,10 +670,12 @@ class AdaptiveOctree:
 
         # Classify coarsest level via the standalone opening criterion
         is_leaf = lv["is_leaf"]
-        summary_sel, refine_sel = self._classify_nodes(
-            h_pix, is_leaf, is_root_level=(lv["nc"] <= 8), lod_pixels=lod_pixels)
+        summary_sel, refine_sel, emit_sel = self._classify_nodes(
+            h_pix, is_leaf, is_root_level=(lv["nc"] <= 8),
+            lod_pixels=lod_pixels, strategy=lod_strategy, npart=lv.get("npart"))
         summary_mask = visible & has_mass & summary_sel
         refine_mask = visible & has_mass & refine_sel
+        emit_mask = visible & has_mass & emit_sel
 
         s_idx = np.where(summary_mask)[0]
         if len(s_idx) > 0:
@@ -546,6 +685,10 @@ class AdaptiveOctree:
                 lv["mh2"][s_idx] / np.maximum(lv["mass"][s_idx], 1e-30), lv["cs"],
                 lv["npart"][s_idx],
             ))
+
+        e_idx = np.where(emit_mask)[0]
+        if len(e_idx) > 0:
+            emit_leaf_indices.append(lv["leaf_indices"][e_idx])
 
         refine_cells = np.where(refine_mask)[0]
 
@@ -559,18 +702,30 @@ class AdaptiveOctree:
             hd = lv["half_diag"]
             is_leaf = lv["is_leaf"]
 
-            # Expand parents to children
-            child_indices = []
-            for pi in refine_cells:
-                cs = parent_lv["child_offset"][pi]
-                ce = (parent_lv["child_offset"][pi + 1]
-                      if pi < parent_lv["nc"] - 1 else lv["nc"])
-                for ci in range(cs, ce):
-                    child_indices.append(ci)
-
-            if not child_indices:
+            # Expand parents to children: vectorized child_offset[refine_cells]
+            # → ranges [cs[i], ce[i]) → flatten to a single child index array.
+            co = parent_lv["child_offset"]
+            n_p = parent_lv["nc"]
+            cs_arr = co[refine_cells].astype(np.int64)
+            # Compute exclusive end for each parent (next parent's start, or nc for last)
+            ends_full = np.empty(n_p + 1, dtype=np.int64)
+            ends_full[:n_p] = co
+            ends_full[n_p] = lv["nc"]
+            ce_arr = ends_full[refine_cells + 1]
+            counts = ce_arr - cs_arr
+            total = int(counts.sum())
+            if total == 0:
                 break
-            child_flat = np.array(child_indices, dtype=np.int64)
+            # Build flat child index array via a single repeat + arange-offset trick.
+            # child_flat[k] = cs_arr[i] + (k - prefix[i]) where prefix is cumsum of counts.
+            child_flat = np.empty(total, dtype=np.int64)
+            offsets = np.empty(len(counts) + 1, dtype=np.int64)
+            offsets[0] = 0
+            np.cumsum(counts, out=offsets[1:])
+            # Per-child base = cs_arr repeated by counts; then add local offset.
+            bases = np.repeat(cs_arr, counts)
+            local = np.arange(total, dtype=np.int64) - np.repeat(offsets[:-1], counts)
+            child_flat = bases + local
 
             valid = lv["mass"][child_flat] > 0
             child_flat = child_flat[valid]
@@ -584,8 +739,10 @@ class AdaptiveOctree:
             h_pix = hd / safe_dist * pix_per_rad
 
             child_is_leaf = is_leaf[child_flat]
-            summary_sel, refine_sel = self._classify_nodes(
-                h_pix, child_is_leaf, is_root_level=False, lod_pixels=lod_pixels)
+            child_npart = lv["npart"][child_flat] if "npart" in lv else None
+            summary_sel, refine_sel, emit_sel = self._classify_nodes(
+                h_pix, child_is_leaf, is_root_level=False,
+                lod_pixels=lod_pixels, strategy=lod_strategy, npart=child_npart)
 
             s_idx = child_flat[summary_sel]
             if len(s_idx) > 0:
@@ -595,6 +752,10 @@ class AdaptiveOctree:
                     lv["mh2"][s_idx] / np.maximum(lv["mass"][s_idx], 1e-30), lv["cs"],
                     lv["npart"][s_idx],
                 ))
+
+            e_idx = child_flat[emit_sel]
+            if len(e_idx) > 0:
+                emit_leaf_indices.append(lv["leaf_indices"][e_idx])
 
             refine_cells = child_flat[refine_sel]
 
@@ -607,7 +768,7 @@ class AdaptiveOctree:
         r_pos = r_hsml = r_mass = r_qty = z3, z1, z1, z1
 
         if emit_leaf_indices:
-            vis_cells = np.array(emit_leaf_indices, dtype=np.int64)
+            vis_cells = np.concatenate(emit_leaf_indices).astype(np.int64)
             n_summaries = sum(p[0].shape[0] for p in summary_parts) if summary_parts else 0
             budget = max(max_particles - n_summaries, max_particles // 2)
 
@@ -685,8 +846,8 @@ class AdaptiveOctree:
                 s_hsml = np.sqrt(np.maximum(
                     (1.0 / 0.225) * new_trace, 1e-30)).astype(np.float32)
             else:
-                # Isotropic mode: hsml = 2 * cell_width
-                s_hsml = (2.0 * s_cs[:, 0]).astype(np.float32)
+                # Isotropic mode: hsml = 2 * cell_width * summary_scale
+                s_hsml = (2.0 * summary_scale * s_cs[:, 0]).astype(np.float32)
                 # Zero out covariance (unused in isotropic path)
                 s_cov[:] = 0
         else:
@@ -696,6 +857,201 @@ class AdaptiveOctree:
             r_pos.astype(np.float32), r_hsml.astype(np.float32),
             r_mass.astype(np.float32), r_qty.astype(np.float32),
             s_pos, s_hsml, s_mass, s_qty, s_cov,
+        )
+
+    def _subsample_shuffled(self, camera, stride):
+        """Tree-free fast path: stride the pre-shuffled particle arrays and
+        frustum-cull the result. Cost O(n_total / stride). Used when stride
+        is large enough that walking the tree would cost more than just
+        touching the strided particles directly.
+        """
+        sub_pos = self._shuffled_pos[::stride]
+        sub_hsml = self._shuffled_hsml[::stride]
+        sub_mass = self._shuffled_mass[::stride]
+        sub_qty = self._shuffled_qty[::stride]
+
+        ratio = np.float32(stride)
+        h_scale = np.float32(stride ** (1.0 / 3.0))
+
+        cam_pos = camera.position
+        cam_fwd = camera.forward
+        cam_right = camera.right
+        cam_up = camera.up
+        fov_rad = np.radians(camera.fov)
+        half_tan = np.tan(fov_rad / 2)
+
+        depths = sub_pos @ cam_fwd - np.dot(cam_pos, cam_fwd)
+        rights = sub_pos @ cam_right - np.dot(cam_pos, cam_right)
+        ups = sub_pos @ cam_up - np.dot(cam_pos, cam_up)
+
+        scaled_h = sub_hsml * h_scale
+        front_depth = np.maximum(depths + scaled_h, 0)
+        lim_h = front_depth * half_tan * camera.aspect + scaled_h
+        lim_v = front_depth * half_tan + scaled_h
+        in_front = depths > -scaled_h
+        visible = in_front & (np.abs(rights) < lim_h) & (np.abs(ups) < lim_v)
+
+        idx = np.where(visible)[0]
+        r_pos = sub_pos[idx].astype(np.float32)
+        r_hsml = (sub_hsml[idx] * h_scale).astype(np.float32)
+        r_mass = (sub_mass[idx] * ratio).astype(np.float32)
+        r_qty = sub_qty[idx].astype(np.float32)
+
+        z3 = np.zeros((0, 3), dtype=np.float32)
+        z1 = np.zeros(0, dtype=np.float32)
+        z6 = np.zeros((0, 6), dtype=np.float32)
+        return (r_pos, r_hsml, r_mass, r_qty, z3, z1, z1, z1, z6)
+
+    def _subsample_all(self, camera, stride):
+        """Frustum-cull via the tree, then uniformly subsample the in-frustum
+        particles at the given stride.
+
+        Two paths:
+          - Large stride (≥ leaf_size): skip the tree entirely. Stride
+            directly through the pre-shuffled particle array, then frustum
+            cull. Cost is O(n_total / stride).
+          - Small stride: hierarchical tree cull → per-leaf strided gather.
+            Cost is O(N_visible_leaves + N_kept).
+
+        Mass × stride, hsml × stride^(1/3) keep integrated quantities and
+        screen footprint approximately preserved.
+        """
+        if stride < 1:
+            stride = 1
+
+        # Build tree if it hasn't been built yet (e.g. legacy code path)
+        if not self.levels:
+            self._build_tree()
+
+        # Large-stride fast path: bypass the tree, stride directly through
+        # the shuffled particle array and frustum-cull. The shuffled array
+        # ensures uniform random sampling. Threshold: stride must keep
+        # fewer particles than walking the tree's leaves would test.
+        if stride >= max(self.leaf_size, 64):
+            return self._subsample_shuffled(camera, stride)
+
+        z3 = np.zeros((0, 3), dtype=np.float32)
+        z1 = np.zeros(0, dtype=np.float32)
+        z6 = np.zeros((0, 6), dtype=np.float32)
+
+        # Hierarchical frustum cull: walk top-down. For each level we test
+        # only cells whose parent was visible. Cells fully in front and
+        # whose entire bounding sphere is inside the frustum can have all
+        # their descendants accepted without further testing.
+        cam_pos = camera.position
+        cam_fwd = camera.forward
+        cam_right = camera.right
+        cam_up = camera.up
+        fov_rad = np.radians(camera.fov)
+        half_tan = np.tan(fov_rad / 2)
+
+        # Cells to test at the current level. Start with all root nodes.
+        root_lv = self.levels[-1]
+        cur_cells = np.arange(root_lv["nc"], dtype=np.int64)
+        # Leaf cells accepted as "all in frustum" — accumulated across levels.
+        accepted_leaves = []
+
+        for li in range(len(self.levels) - 1, -1, -1):
+            lv = self.levels[li]
+            if len(cur_cells) == 0:
+                break
+            centers = lv["centers"][cur_cells]
+            hd = lv["half_diag"]  # scalar
+            hsml = lv["hsml"][cur_cells]
+            cell_extent = hd + np.minimum(hsml, 2 * hd)
+
+            depths = centers @ cam_fwd - np.dot(cam_pos, cam_fwd)
+            rights = centers @ cam_right - np.dot(cam_pos, cam_right)
+            ups = centers @ cam_up - np.dot(cam_pos, cam_up)
+
+            front_depth = np.maximum(depths + cell_extent, 0)
+            lim_h = front_depth * half_tan * camera.aspect + cell_extent
+            lim_v = front_depth * half_tan + cell_extent
+            in_front = depths > -cell_extent
+            visible = (in_front & (np.abs(rights) < lim_h)
+                       & (np.abs(ups) < lim_v))
+
+            # Check leaves first: visible leaves get accepted unconditionally.
+            is_leaf_arr = lv["is_leaf"][cur_cells]
+            leaf_visible = visible & is_leaf_arr
+            accepted_leaves.append(lv["leaf_indices"][cur_cells[leaf_visible]])
+
+            # Internal nodes: visible ones need their children tested.
+            internal_visible = visible & (~is_leaf_arr)
+            vis_internal_idx = cur_cells[internal_visible]
+            if li == 0 or len(vis_internal_idx) == 0:
+                cur_cells = np.zeros(0, dtype=np.int64)
+                continue
+
+            # Expand visible internal nodes to children at the next finer level.
+            child_lv = self.levels[li - 1]
+            co = lv["child_offset"]
+            n_p = lv["nc"]
+            cs_arr = co[vis_internal_idx].astype(np.int64)
+            ends_full = np.empty(n_p + 1, dtype=np.int64)
+            ends_full[:n_p] = co
+            ends_full[n_p] = child_lv["nc"]
+            ce_arr = ends_full[vis_internal_idx + 1]
+            counts = ce_arr - cs_arr
+            total = int(counts.sum())
+            if total == 0:
+                cur_cells = np.zeros(0, dtype=np.int64)
+                continue
+            bases = np.repeat(cs_arr, counts)
+            offsets = np.cumsum(counts) - counts
+            local = np.arange(total, dtype=np.int64) - np.repeat(offsets, counts)
+            cur_cells = bases + local
+
+        if accepted_leaves:
+            vis_leaves = np.concatenate(accepted_leaves).astype(np.int64)
+        else:
+            vis_leaves = np.zeros(0, dtype=np.int64)
+        if len(vis_leaves) == 0:
+            return (z3, z1, z1, z1, z3, z1, z1, z1, z6)
+
+        # Per-leaf subsample. For each visible leaf, keep every stride-th
+        # particle starting from a per-leaf offset that varies the phase
+        # so adjacent leaves don't all sample the same offset (avoids
+        # imprinting cell boundaries). Cost is O(N_visible / stride).
+        cs = self.cell_start[vis_leaves]
+        ce = self.cell_start[vis_leaves + 1]
+        counts = ce - cs
+        if counts.sum() == 0:
+            return (z3, z1, z1, z1, z3, z1, z1, z1, z6)
+
+        # Per-leaf phase offset (deterministic, decorrelated from cell index)
+        h = vis_leaves.astype(np.uint64)
+        h = (h ^ (h >> np.uint64(33))) * np.uint64(0xff51afd7ed558ccd)
+        h = (h ^ (h >> np.uint64(33))) * np.uint64(0xc4ceb9fe1a85ec53)
+        h = h ^ (h >> np.uint64(33))
+        phase = (h % np.uint64(stride)).astype(np.int64)
+
+        # Number of particles kept per leaf
+        kept_per_leaf = np.maximum(0, (counts - phase + stride - 1) // stride)
+        total_kept = int(kept_per_leaf.sum())
+        if total_kept == 0:
+            return (z3, z1, z1, z1, z3, z1, z1, z1, z6)
+
+        # Build flat array of kept particle indices via vectorized
+        # base + local arithmetic.
+        bases = np.repeat(cs + phase, kept_per_leaf)
+        offsets = np.cumsum(kept_per_leaf) - kept_per_leaf
+        local = (np.arange(total_kept, dtype=np.int64)
+                 - np.repeat(offsets, kept_per_leaf)) * stride
+        kept_sorted_idx = bases + local
+
+        ratio = np.float32(stride)
+        h_scale = np.float32(stride ** (1.0 / 3.0))
+
+        r_pos = self.sorted_pos[kept_sorted_idx]
+        r_hsml = (self.sorted_hsml[kept_sorted_idx] * h_scale).astype(np.float32)
+        r_mass = (self.sorted_mass[kept_sorted_idx] * ratio).astype(np.float32)
+        r_qty = self.sorted_qty[kept_sorted_idx]
+
+        return (
+            r_pos.astype(np.float32), r_hsml,
+            r_mass, r_qty.astype(np.float32),
+            z3, z1, z1, z1, z6,
         )
 
     def _frustum_cull_leaves(self, camera, max_particles, importance_sampling=False):
