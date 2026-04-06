@@ -125,40 +125,44 @@ class GPUCompute:
         SAFE_CHUNK_BYTES = 256 * 1024 * 1024
         chunk_n = SAFE_CHUNK_BYTES // 16
 
+        # Allocate buffers with mapped_at_creation=True so we can write
+        # particle data directly into device memory without going through
+        # Metal's staging-buffer queue (which on big snapshots stalls the
+        # render loop for several seconds while it drains).
         particle_usage = (wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST
                           | wgpu.BufferUsage.COPY_SRC)
         self._chunk_bufs = []
         for start in range(0, n, chunk_n):
             cn = min(chunk_n, n - start)
+            pos_buf = dev.create_buffer(
+                size=cn * 16, usage=particle_usage, mapped_at_creation=True)
+            pos4 = np.zeros((cn, 4), dtype=np.float32)
+            pos4[:, :3] = pos_src[start:start + cn]
+            pos_buf.write_mapped(pos4.tobytes())
+            pos_buf.unmap()
+
+            hsml_buf = dev.create_buffer(
+                size=cn * 4, usage=particle_usage, mapped_at_creation=True)
+            hsml_buf.write_mapped(hsml_src[start:start + cn].tobytes())
+            hsml_buf.unmap()
+
+            mass_buf = dev.create_buffer(
+                size=cn * 4, usage=particle_usage, mapped_at_creation=True)
+            mass_buf.write_mapped(mass_src[start:start + cn].tobytes())
+            mass_buf.unmap()
+
+            qty_buf = dev.create_buffer(
+                size=cn * 4, usage=particle_usage, mapped_at_creation=True)
+            qty_buf.write_mapped(qty_src[start:start + cn].tobytes())
+            qty_buf.unmap()
+
             self._chunk_bufs.append({
-                "pos": dev.create_buffer(size=cn * 16, usage=particle_usage),
-                "hsml": dev.create_buffer(size=cn * 4, usage=particle_usage),
-                "mass": dev.create_buffer(size=cn * 4, usage=particle_usage),
-                "qty": dev.create_buffer(size=cn * 4, usage=particle_usage),
-                "n": cn,
-                "start": start,
+                "pos": pos_buf, "hsml": hsml_buf,
+                "mass": mass_buf, "qty": qty_buf,
+                "n": cn, "start": start,
             })
         # Legacy alias used by upload_weights and a few other call sites.
         self._particle_bufs = self._chunk_bufs[0]
-
-        # Queue all chunk uploads. Metal handles staging concurrency
-        # internally; we only need one final blocking sync to ensure
-        # everything has landed before the render loop starts (otherwise
-        # the next encoder.finish() / queue.submit() wedges behind the
-        # pending uploads). The sync reads from the LAST chunk so all
-        # earlier chunks have completed by the time it returns.
-        for cb in self._chunk_bufs:
-            start, cn = cb["start"], cb["n"]
-            pos4 = np.zeros((cn, 4), dtype=np.float32)
-            pos4[:, :3] = pos_src[start:start + cn]
-            dev.queue.write_buffer(cb["pos"], 0, pos4.tobytes())
-            dev.queue.write_buffer(cb["hsml"], 0,
-                                   hsml_src[start:start + cn].tobytes())
-            dev.queue.write_buffer(cb["mass"], 0,
-                                   mass_src[start:start + cn].tobytes())
-            dev.queue.write_buffer(cb["qty"], 0,
-                                   qty_src[start:start + cn].tobytes())
-        dev.queue.read_buffer(self._chunk_bufs[-1]["pos"], size=4)
 
         self._upload_ready = True
 

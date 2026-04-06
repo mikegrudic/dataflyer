@@ -964,13 +964,34 @@ def main():
     parser.add_argument("--backend", type=str, default="wgpu",
                         choices=["moderngl", "wgpu"],
                         help="Rendering backend (default: wgpu)")
+    parser.add_argument("--profile", type=str, default=None, metavar="OUT",
+                        help="Profile the whole run with cProfile and dump "
+                             "stats to OUT (.pstats). View with snakeviz.")
     args = parser.parse_args()
 
     if args.backend == "wgpu":
         from .wgpu_app import run_wgpu_app
-        run_wgpu_app(args.snapshot, width=args.width, height=args.height, fov=args.fov,
-                     screenshot=args.screenshot, benchmark=args.benchmark,
-                     fullscreen=args.fullscreen)
+        if args.profile:
+            import cProfile
+            import pstats
+            pr = cProfile.Profile()
+            pr.enable()
+            try:
+                run_wgpu_app(args.snapshot, width=args.width, height=args.height,
+                             fov=args.fov, screenshot=args.screenshot,
+                             benchmark=args.benchmark, fullscreen=args.fullscreen)
+            finally:
+                pr.disable()
+                pr.dump_stats(args.profile)
+                stats = pstats.Stats(pr).sort_stats("cumulative")
+                print(f"\n=== top 40 by cumulative time ===")
+                stats.print_stats(40)
+                print(f"\nFull profile written to {args.profile}")
+                print(f"View with: snakeviz {args.profile}")
+        else:
+            run_wgpu_app(args.snapshot, width=args.width, height=args.height, fov=args.fov,
+                         screenshot=args.screenshot, benchmark=args.benchmark,
+                         fullscreen=args.fullscreen)
         return
 
     app = DataFlyerApp(args.snapshot, width=args.width, height=args.height, fov=args.fov,

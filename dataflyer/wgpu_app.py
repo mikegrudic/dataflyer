@@ -101,7 +101,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     weights = data.get_field("Masses")
     renderer.use_tree = False  # skip grid build for instant first frame
     renderer.set_particles(data.positions, data.hsml, weights)
-    renderer.update_visible(camera)
+
+    # In subsample mode, skip the eager CPU upload of all particles to the
+    # legacy renderer buffers — for 100M+ snapshots that uploads ~3 GB and
+    # blocks the canvas thread for 5+ seconds before the GPU compute path
+    # even starts. The window will show an empty frame until GPU init
+    # completes; that's much better than a long beachball.
+    if getattr(renderer, "lod_strategy", "geometric") != "subsample":
+        renderer.update_visible(camera)
 
     # Render + present first frame immediately so window is responsive
     try:
@@ -428,6 +435,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     last_cull_time = 0.0
     user_lod = renderer.lod_pixels
     user_budget = renderer.max_render_particles
+    # Per-frame instance cap for the compute-driven splat path. Initialized
+    # to 4M; afterwards adapted to the highest cap that sustained target FPS.
+    last_subsample_cap = 4_000_000
+    # Don't grow the cap before the user has moved the camera at least
+    # once — startup has no FPS history to validate growth against.
+    has_moved_ever = False
     smooth_frame_ms = 0.0
     smooth_fps_ema = 0.0
     last_lod_adjust = 0.0
@@ -605,7 +618,11 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
                     np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
         else:
-            renderer.update_visible(camera)
+            # CPU fallback when GPU compute isn't ready. Skip in subsample
+            # mode — uploading 100M+ particles to the legacy renderer
+            # buffers each frame is the entire startup beachball.
+            if getattr(renderer, "lod_strategy", "geometric") != "subsample":
+                renderer.update_visible(camera)
 
     # --- Benchmark mode ---
     if benchmark is not None:
@@ -652,8 +669,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         if _bg["done"] and _bg["grid"] is not None and renderer._grid is None:
             renderer._grid = _bg["grid"]
             renderer.use_tree = True
-            # Do one CPU cull to get initial visible data
-            renderer.update_visible(camera)
+            # Skip the one-shot CPU cull when subsample mode is active —
+            # it lazily allocates ~6 GB of shuffled views and on a 100M+
+            # snapshot blocks the canvas thread for many seconds. The GPU
+            # subsample path doesn't need it.
+            if getattr(renderer, "lod_strategy", "geometric") != "subsample":
+                renderer.update_visible(camera)
             needs_auto_range = True
             _bg["grid"] = None  # don't repeat
 
@@ -669,20 +690,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             try:
                 gpu_compute = GPUCompute(device)
                 if is_adaptive or in_subsample:
-                    # Adaptive trees only support the brute-force subsample
-                    # pipeline (no per-cell tree-LOD GPU shaders). Size the
-                    # output buffer to match the user's max budget so a
-                    # high budget doesn't silently truncate output.
                     gpu_compute.upload_subsample_only(
                         renderer._grid,
                         max_output=int(renderer.max_render_particles))
-                    # Compute-driven splat: hand the per-chunk source
-                    # buffers to the renderer; the splat_subsample
-                    # pipeline does the cull + stride test in the vertex
-                    # shader. No compute pass, no readback.
                     renderer.set_subsample_chunks(gpu_compute.get_chunk_bufs())
-                    # Seed the stride from the renderer's auto-LOD value so
-                    # the first frame doesn't dispatch all 100M+ instances.
                     renderer.set_subsample_stride(int(max(renderer.lod_pixels, 1)))
                     print("  GPU subsample pipeline initialized (zero-copy)")
                 else:
@@ -697,6 +708,45 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
         # Camera movement
         moved = camera.update(dt)
+
+        # Subsample per-frame instance cap. Init to 4M (used only at the
+        # very first frame); after that the cap learns the highest value
+        # that sustained the target FPS during motion ("last sustainable")
+        # and resets to that on motion start. Stopped frames grow the cap
+        # for progressive refinement, but only after the user has moved
+        # at least once and only when the previous frame met its target
+        # (so we never over-extend with no FPS history to validate).
+        if getattr(renderer, "lod_strategy", "geometric") == "subsample":
+            target_ms = 1000.0 / max(renderer.target_fps, 1.0)
+            if moved:
+                has_moved_ever = True
+                if not was_moving:
+                    renderer.set_subsample_max_per_frame(last_subsample_cap)
+                # Adapt last_subsample_cap from measured FPS while moving.
+                if smooth_frame_ms > 0:
+                    cur_cap = renderer._subsample_max_per_frame
+                    if smooth_frame_ms < target_ms * 0.9:
+                        last_subsample_cap = min(
+                            64_000_000, int(cur_cap * 1.1) + 1)
+                        renderer.set_subsample_max_per_frame(last_subsample_cap)
+                    elif smooth_frame_ms > target_ms * 1.2:
+                        last_subsample_cap = max(
+                            500_000, int(cur_cap * 0.85))
+                        renderer.set_subsample_max_per_frame(last_subsample_cap)
+                    else:
+                        last_subsample_cap = cur_cap
+            elif has_moved_ever:
+                # Stopped after at least one motion: refine progressively.
+                # Use the actual last-frame dt (smooth_frame_ms only updates
+                # during motion). Grow as long as the last frame stayed
+                # within a refinement budget; stop growing once individual
+                # frames cross that budget.
+                cur = getattr(renderer, "_subsample_max_per_frame", 4_000_000)
+                MAX_CAP = 200_000_000  # well above n_total/4 for SN_512
+                REFINE_FRAME_MS = 500.0  # tolerable per-refinement-frame time
+                last_ms = dt * 1000.0 if dt > 0 else 0.0
+                if 0 < last_ms <= REFINE_FRAME_MS and cur < MAX_CAP:
+                    renderer.set_subsample_max_per_frame(min(cur * 2, MAX_CAP))
 
         # GPU-side LOS projection: update qty buffer when camera rotates
         if (gpu_compute is not None and gpu_ready and gpu_compute.has_los_field()
@@ -955,7 +1005,6 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 renderer.render(camera, fb_w, fb_h)
             except Exception:
                 pass
-
         # Auto-range on first frame
         if needs_auto_range and not _state["_composite"]:
             lo, hi = renderer.read_accum_range()

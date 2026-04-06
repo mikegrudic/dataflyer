@@ -275,6 +275,9 @@ class WGPURenderer:
         # once after upload; None means "use the legacy direct path".
         self._subsample_chunks = None
         self._subsample_stride = 1
+        # Per-frame instance cap. wgpu_app raises it gradually after the
+        # camera stops (refinement) and resets it on motion.
+        self._subsample_max_per_frame = 4_000_000
         self._aniso_bg0 = _make_bind_group(dev, self._aniso_bgl0,
                                            [self._camera_buf, self._aniso_params_buf])
         self._star_bg0 = _make_bind_group(dev, self._star_bgl0,
@@ -704,6 +707,13 @@ class WGPURenderer:
         """Set the stride used by the compute-driven splat path."""
         self._subsample_stride = max(int(stride), 1)
 
+    def set_subsample_max_per_frame(self, max_inst):
+        """Set the per-frame instance cap for the compute-driven splat
+        path. wgpu_app raises this gradually as refinement progresses
+        and resets it on camera motion.
+        """
+        self._subsample_max_per_frame = max(int(max_inst), 1)
+
     def _write_subsample_params(self, camera, stride):
         """Write each chunk's params uniform. Must be called BEFORE
         beginning the render pass (write_buffer cannot run mid-pass).
@@ -893,27 +903,40 @@ class WGPURenderer:
         render_pass = encoder.begin_render_pass(**rp_args)
 
         # Draw regular particles (all as instanced quads)
-        if self._subsample_chunks is not None:
+        if (self._subsample_chunks is None and
+                getattr(self, "lod_strategy", "geometric") == "subsample"):
+            # In subsample mode the legacy direct draw would dispatch
+            # n_particles instances (often 30M+) before the chunk
+            # bind groups are set up. Skip drawing entirely until the
+            # GPU init has wired up the per-chunk source buffers.
+            pass
+        elif self._subsample_chunks is not None:
             # Compute-driven splat: one draw per chunk, dispatching only
             # ceil(n / stride) instances. The vertex shader picks one
             # particle per instance via hash and frustum-tests it.
+            #
+            # Hard cap on per-frame instances: 32M point splats overwhelm
+            # Apple Metal's vertex stage. Honor the LOD-controlled stride
+            # but raise it further if the budget would still exceed the
+            # cap. mass_scale must be raised to match so the visualization
+            # stays unbiased.
+            cap = self._subsample_max_per_frame
             stride = max(self._subsample_stride, 1)
+            n_total = sum(ck["n"] for ck in self._subsample_chunks)
+            requested = (n_total + stride - 1) // stride
+            if requested > cap:
+                stride = max(stride, (n_total + cap - 1) // cap)
+                # Re-pack params with the bumped stride so mass_scale matches.
+                self._subsample_stride = stride
+                self._write_subsample_params(camera, stride)
             render_pass.set_pipeline(self._splat_subsample_pipeline)
-            total_inst = 0
             for ck in self._subsample_chunks:
                 instances = (ck["n"] + stride - 1) // stride
                 if instances == 0:
                     continue
-                total_inst += instances
                 render_pass.set_bind_group(0, ck["bg0"])
                 render_pass.set_bind_group(1, ck["bg1"])
                 render_pass.draw(4, instances, 0, 0)
-            if not hasattr(self, "_diag_frame"):
-                self._diag_frame = 0
-            self._diag_frame += 1
-            if self._diag_frame <= 10:
-                print(f"  [diag] frame {self._diag_frame}: stride={stride} "
-                      f"total_instances={total_inst}", flush=True)
         elif self.n_particles > 0 and self._particle_bufs and hasattr(self, "_sort_bg"):
             render_pass.set_pipeline(self._splat_pipeline)
             render_pass.set_bind_group(0, self._camera_bg)
