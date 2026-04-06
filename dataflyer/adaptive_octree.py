@@ -919,15 +919,12 @@ class AdaptiveOctree:
         if stride < 1:
             stride = 1
 
-        # Build tree if it hasn't been built yet (e.g. legacy code path)
-        if not self.levels:
-            self._build_tree()
-
-        # Large-stride fast path: bypass the tree, stride directly through
-        # the shuffled particle array and frustum-cull. The shuffled array
-        # ensures uniform random sampling. Threshold: stride must keep
-        # fewer particles than walking the tree's leaves would test.
-        if stride >= max(self.leaf_size, 64):
+        # Tree-free fast path: stride directly through the shuffled
+        # particle array and frustum-cull. Always available because the
+        # shuffled views are built at construction time without the tree.
+        # Used for large strides (cheaper than walking the tree) and as
+        # the only path when the tree has been deferred.
+        if stride >= max(self.leaf_size, 64) or not self.levels:
             return self._subsample_shuffled(camera, stride)
 
         z3 = np.zeros((0, 3), dtype=np.float32)

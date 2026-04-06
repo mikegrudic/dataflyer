@@ -100,12 +100,24 @@ class GPUCompute:
     def upload_subsample_only(self, grid, max_output=4_000_000):
         """Minimal upload for the brute-force subsample cull pipeline.
 
-        Only uploads the per-particle arrays (pos/hsml/mass/qty) and builds
-        the subsample compute pipeline. Skips all tree-level data, so it
-        works with any grid that has sorted_* arrays (e.g. AdaptiveOctree).
+        Uses the grid's raw particle arrays (no Morton sort, no tree).
+        Works with deferred-build AdaptiveOctree where sorted_* are None.
         """
         dev = self.device
-        n = len(grid.sorted_pos)
+
+        # Prefer raw (unsorted) arrays if available, else sorted.
+        pos_src = getattr(grid, "_raw_pos", None)
+        if pos_src is None:
+            pos_src = grid.sorted_pos
+            hsml_src = grid.sorted_hsml
+            mass_src = grid.sorted_mass
+            qty_src = grid.sorted_qty
+        else:
+            hsml_src = grid._raw_hsml
+            mass_src = grid._raw_mass
+            qty_src = grid._raw_qty
+
+        n = len(pos_src)
         self._n_particles = n
         self._max_output = max_output
 
@@ -129,14 +141,14 @@ class GPUCompute:
         # Upload positions (chunked to keep submits small)
         CHUNK = 4_000_000
         pos4 = np.zeros((n, 4), dtype=np.float32)
-        pos4[:, :3] = grid.sorted_pos
+        pos4[:, :3] = pos_src
         for start in range(0, n, CHUNK):
             end = min(start + CHUNK, n)
             dev.queue.write_buffer(
                 self._particle_bufs["pos"], start * 16, pos4[start:end].tobytes())
-        for name, arr in [("hsml", grid.sorted_hsml),
-                          ("mass", grid.sorted_mass),
-                          ("qty", grid.sorted_qty)]:
+        for name, arr in [("hsml", hsml_src),
+                          ("mass", mass_src),
+                          ("qty", qty_src)]:
             for start in range(0, n, CHUNK):
                 end = min(start + CHUNK, n)
                 dev.queue.write_buffer(
@@ -390,9 +402,20 @@ class GPUCompute:
         """
         dev = self.device
 
-        # Re-upload sorted mass/qty
-        dev.queue.write_buffer(self._particle_bufs["mass"], 0, grid.sorted_mass.tobytes())
-        dev.queue.write_buffer(self._particle_bufs["qty"], 0, grid.sorted_qty.tobytes())
+        # Re-upload mass/qty. In subsample-only mode the particle buffers
+        # come from the grid's raw arrays (no Morton sort), so use those
+        # if sorted_* are not populated. Cast to float32 to match the
+        # buffer's element size.
+        mass_src = grid.sorted_mass if grid.sorted_mass is not None else grid._raw_mass
+        qty_src = grid.sorted_qty if grid.sorted_qty is not None else grid._raw_qty
+        mass_f32 = np.ascontiguousarray(mass_src, dtype=np.float32)
+        qty_f32 = np.ascontiguousarray(qty_src, dtype=np.float32)
+        dev.queue.write_buffer(self._particle_bufs["mass"], 0, mass_f32.tobytes())
+        dev.queue.write_buffer(self._particle_bufs["qty"], 0, qty_f32.tobytes())
+
+        # Subsample-only mode has no level buffers — skip per-level upload.
+        if not self._level_bufs:
+            return
 
         # Re-upload per-level data that depends on mass/qty
         for i, lv in enumerate(grid.levels):
@@ -638,7 +661,17 @@ class GPUCompute:
     def grow_subsample_output(self, max_output):
         """Reallocate output buffers and the subsample bind group if the
         requested max_output exceeds the current capacity. Used when the
-        renderer's max_render_particles is bumped at runtime."""
+        renderer's max_render_particles is bumped at runtime.
+
+        Caps max_output to fit within the device's max storage buffer
+        size. The largest per-element entry is pos (16 bytes), so the
+        cap is max-storage-buffer-binding-size / 16.
+        """
+        try:
+            max_buf = int(self.device.limits["max-storage-buffer-binding-size"])
+        except Exception:
+            max_buf = 2**31
+        max_output = min(max_output, max_buf // 16)
         if max_output <= self._max_output:
             return
         dev = self.device
@@ -654,19 +687,22 @@ class GPUCompute:
         self._subsample_bg1 = _make_bind_group(dev, self._subsample_bgl1, [
             ob["pos"], ob["hsml"], ob["mass"], ob["qty"]])
 
-    def dispatch_subsample_cull(self, camera, stride):
+    def dispatch_subsample_cull(self, camera, stride, max_output=None):
         """Brute-force per-particle frustum cull + stride subsample.
 
-        One compute dispatch over all sorted particles. Each thread tests
-        its particle, and if hash(idx) % stride == 0 AND in frustum, it
-        atomically writes to the output buffers.
-
-        Returns the number of particles written. Output buffers are the
-        existing self._output_bufs, ready for zero-copy rendering.
+        Tests all particles. Particles passing the hash stride filter AND
+        the frustum test atomically write to the output buffers, but the
+        atomic write stops once `max_output` in-frustum particles have
+        been emitted. So the budget caps the in-frustum count sent to
+        the renderer.
         """
         dev = self.device
         n = self._n_particles
         stride = max(int(stride), 1)
+        if max_output is None:
+            max_output = self._max_output
+        else:
+            max_output = min(int(max_output), self._max_output)
 
         ratio = float(stride)
         h_scale = ratio ** (1.0 / 3.0)
@@ -691,7 +727,7 @@ class GPUCompute:
             float(camera.up[0]), float(camera.up[1]),
             float(camera.up[2]), 0.0,
             fov_rad, float(camera.aspect), stride, n,
-            h_scale, ratio, self._max_output, 0,
+            h_scale, ratio, max_output, 0,
         )
         dev.queue.write_buffer(self._subsample_params_buf, 0, params_data)
 

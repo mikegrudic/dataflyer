@@ -245,8 +245,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 user_lod = renderer.lod_pixels
                 print(f"LOD: {renderer.lod_pixels}px (faster)")
             elif key == glfw.KEY_PERIOD:
+                # Cap max budget at 128M particles to stay within safe
+                # GPU buffer / dispatch limits on commodity hardware.
+                MAX_BUDGET = 128_000_000
                 renderer.max_render_particles = min(
-                    renderer.n_total, int(renderer.max_render_particles * 2))
+                    renderer.n_total, MAX_BUDGET,
+                    int(renderer.max_render_particles * 2))
                 user_budget = renderer.max_render_particles
                 print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
             elif key == glfw.KEY_COMMA:
@@ -555,7 +559,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 # Grow output buffers if user bumped budget at runtime.
                 if hasattr(gpu_compute, "grow_subsample_output"):
                     gpu_compute.grow_subsample_output(int(renderer.max_render_particles))
-                n_out = gpu_compute.dispatch_subsample_cull(camera, stride)
+                n_out = gpu_compute.dispatch_subsample_cull(
+                    camera, stride,
+                    max_output=int(renderer.max_render_particles))
                 renderer.set_particle_buffers_from_gpu(
                     gpu_compute.get_output_buffers(), n_out)
                 renderer.n_summaries = 0
@@ -732,28 +738,31 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     fps_inst = 1.0 / dt
                     smooth_fps_ema = (1 - a) * smooth_fps_ema + a * fps_inst
                     smooth_frame_ms = 1000.0 / max(smooth_fps_ema, 0.01)
-                # Auto-LOD on log2(lod_pixels). Asymmetric responsiveness:
-                # instantaneous error for slowdowns, smoothed for headroom.
-                # Skip the first frame after resume; cap per-frame step.
+                # Auto-LOD on log2(lod_pixels). Symmetric proportional with
+                # deadband to prevent drift from frame-time jitter.
                 if (renderer.auto_lod and smooth_frame_ms > 0 and dt > 0
                         and was_moving):
                     target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-                    inst_frame_ms = dt * 1000.0
-                    err_inst = math.log2(max(inst_frame_ms / target_ms, 0.01))
                     err_smooth = math.log2(max(smooth_frame_ms / target_ms, 0.01))
-                    if err_inst > 0:
-                        error = err_inst
-                        gain = 2.0
+                    DEADBAND = 0.5
+                    if err_smooth > DEADBAND:
+                        error = err_smooth - DEADBAND
+                        gain = 1.0
+                    elif err_smooth < -DEADBAND:
+                        error = err_smooth + DEADBAND
+                        gain = 1.0
                     else:
-                        error = min(err_smooth, 0.0)
-                        gain = 0.5
+                        error = 0.0
+                        gain = 0.0
                     step = gain * error * dt
-                    step = max(-1.0, min(1.0, step))
+                    step = max(-1.0, min(2.0, step))
                     log2_lod = math.log2(max(renderer.lod_pixels, 1.0))
                     log2_lod += step
                     strat = getattr(renderer, "lod_strategy", "geometric")
                     if strat == "particle_count":
                         log2_max = math.log2(max(renderer.n_total, 2))
+                    elif strat == "subsample":
+                        log2_max = math.log2(max(renderer.n_total // 1000, 2))
                     else:
                         log2_max = 8.0
                     log2_lod = max(0.0, min(log2_max, log2_lod))
@@ -861,11 +870,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 log2_lod = math.log2(max(renderer.lod_pixels, 1.0))
                 log2_lod += step
                 # The LOD ceiling depends on the strategy: pixel size for
-                # geometric/subsample (1..256), particle count for
-                # particle_count (1..n_total).
+                # geometric (1..256), particle count for particle_count
+                # (1..n_total), stride for subsample (up to ~n_total/1000
+                # so the strategy can adapt to extreme scenes).
                 strat = getattr(renderer, "lod_strategy", "geometric")
                 if strat == "particle_count":
                     log2_max = math.log2(max(renderer.n_total, 2))
+                elif strat == "subsample":
+                    log2_max = math.log2(max(renderer.n_total // 1000, 2))
                 else:
                     log2_max = 8.0  # 256
                 log2_lod = max(0.0, min(log2_max, log2_lod))
