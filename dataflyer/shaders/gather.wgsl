@@ -98,6 +98,7 @@ fn gather_particles(@builtin(global_invocation_id) gid: vec3<u32>) {
     var k = start;
     while (k < end) {
         let out_idx = out_start + j;
+        if (out_idx >= gather_params.budget) { break; }
         out_pos[out_idx] = src_pos[k];
         out_hsml[out_idx] = src_hsml[k] * h_scale;
         out_mass[out_idx] = src_mass[k] * ratio;

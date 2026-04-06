@@ -649,6 +649,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
                 if not was_moving:
                     pid_integral = 0.0
+                    smooth_fps_ema = max(renderer.target_fps, 1.0)
+                    smooth_frame_ms = 1000.0 / smooth_fps_ema
 
                 # Smoothed frame time (unbiased EMA of frame rate)
                 import math
@@ -708,6 +710,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
             if not was_moving:
                 pid_integral = 0.0
+                smooth_fps_ema = max(renderer.target_fps, 1.0)
+                smooth_frame_ms = 1000.0 / smooth_fps_ema
 
             # Smoothed frame time (unbiased EMA of frame rate)
             import math

@@ -539,6 +539,8 @@ class DataFlyerApp:
             if not self._was_moving:
                 self._pid_integral = 0.0
                 self._pid_prev_error = 0.0
+                self._smooth_fps = max(self.renderer.target_fps, 1.0)
+                self._smooth_frame_ms = 1000.0 / self._smooth_fps
                 if self.renderer.auto_lod:
                     # Start moving with conservative settings; PID will adjust
                     self.renderer.lod_pixels = max(self._user_lod, 4)

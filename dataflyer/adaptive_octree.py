@@ -290,7 +290,10 @@ class AdaptiveOctree:
     Drop-in replacement for SpatialGrid with the same public interface.
     """
 
-    def __init__(self, positions, masses, hsml, quantity, leaf_size=32, max_depth=10):
+    def __init__(self, positions, masses, hsml, quantity, leaf_size=32, max_depth=None):
+        if max_depth is None:
+            import math
+            max_depth = max(1, math.ceil(math.log2(max(len(positions), 1) ** (1/3) / 2)))
         self.leaf_size = leaf_size
         self.max_depth = max_depth
         self.pmin = positions.min(axis=0).astype(np.float32)

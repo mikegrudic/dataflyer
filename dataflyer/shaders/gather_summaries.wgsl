@@ -7,7 +7,7 @@ struct SummaryParams {
     cs_x2: f32,
     cs_y2: f32,
     cs_z2: f32,
-    _p1: u32,
+    max_summaries: u32,
     _p2: u32,
     _p3: u32,
 };
@@ -42,6 +42,7 @@ fn gather_summaries(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Claim output slot via atomic counter
     let out_idx = atomicAdd(&counters[0], 1u);
+    if (out_idx >= params.max_summaries) { return; }
 
     out_pos[out_idx] = src_com[cell];
     out_mass[out_idx] = mass;

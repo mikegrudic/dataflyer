@@ -458,9 +458,9 @@ class GPUCompute:
             lb = self._level_bufs[li]
             cs = lb["cs"]
             dev.queue.write_buffer(self._per_level_summary_params[li], 0,
-                                   struct.pack("IfffffII", lb["n_nodes"], summary_overlap,
+                                   struct.pack("IffffIII", lb["n_nodes"], summary_overlap,
                                                float(cs[0]**2), float(cs[1]**2),
-                                               float(cs[2]**2), 0, 0, 0))
+                                               float(cs[2]**2), self._max_summaries, 0, 0))
 
         encoder = dev.create_command_encoder()
         for li in range(self._n_levels - 1, 0, -1):
@@ -498,7 +498,7 @@ class GPUCompute:
         # Read total visible, compute stride on CPU
         counter_data = dev.queue.read_buffer(self._counters_buf, size=16)
         total_visible = struct.unpack("I", counter_data[:4])[0]
-        stride = max(1, total_visible // budget) if total_visible > budget else 1
+        stride = max(1, _div_ceil(total_visible, budget)) if total_visible > budget else 1
 
         # Apply stride
         dev.queue.write_buffer(self._gather_params_buf, 0,
