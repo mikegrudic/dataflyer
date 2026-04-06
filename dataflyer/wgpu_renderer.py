@@ -188,6 +188,8 @@ class WGPURenderer:
 
         # Shader modules (render shaders include common.wgsl for Camera, quad_corner, eval_kernel)
         self._splat_shader = dev.create_shader_module(code=_load_wgsl("splat_quad.wgsl", include_common=True))
+        self._splat_subsample_shader = dev.create_shader_module(
+            code=_load_wgsl("splat_subsample.wgsl", include_common=True))
         self._aniso_shader = dev.create_shader_module(code=_load_wgsl("splat_aniso.wgsl", include_common=True))
         self._resolve_shader = dev.create_shader_module(code=_load_wgsl("resolve.wgsl"))
         self._composite_shader = dev.create_shader_module(code=_load_wgsl("composite.wgsl"))
@@ -217,6 +219,7 @@ class WGPURenderer:
             size=32, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
         )
 
+
         # Bind group layouts
         VF = wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT
         V = wgpu.ShaderStage.VERTEX
@@ -224,6 +227,11 @@ class WGPURenderer:
         # Uniform-only layouts
         self._splat_bgl0 = dev.create_bind_group_layout(entries=[
             {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}}])
+        # Subsample splat: camera + cull params (both vertex+fragment so the
+        # fragment side can read camera.kernel_id).
+        self._splat_subsample_bgl0 = dev.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}},
+            {"binding": 1, "visibility": V, "buffer": {"type": "uniform"}}])
         self._aniso_bgl0 = dev.create_bind_group_layout(entries=[
             {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}},
             {"binding": 1, "visibility": V, "buffer": {"type": "uniform"}}])
@@ -238,6 +246,10 @@ class WGPURenderer:
         # Pipeline layouts
         self._splat_layout = dev.create_pipeline_layout(
             bind_group_layouts=[self._splat_bgl0, self._splat_bgl1, self._splat_bgl2])
+        # Subsample splat shares splat_bgl1 (pos/hsml/mass/qty) but uses
+        # splat_subsample_bgl0 (camera + cull params) and no sort group.
+        self._splat_subsample_layout = dev.create_pipeline_layout(
+            bind_group_layouts=[self._splat_subsample_bgl0, self._splat_bgl1])
         self._aniso_layout = dev.create_pipeline_layout(
             bind_group_layouts=[self._aniso_bgl0, self._aniso_bgl1])
         self._star_layout = dev.create_pipeline_layout(
@@ -247,6 +259,9 @@ class WGPURenderer:
         accum_targets = [{"format": self._accum_format, "blend": _additive_blend()}] * 3
         self._splat_pipeline = _make_render_pipeline(
             dev, self._splat_layout, self._splat_shader, accum_targets)
+        self._splat_subsample_pipeline = _make_render_pipeline(
+            dev, self._splat_subsample_layout, self._splat_subsample_shader,
+            accum_targets)
         self._aniso_pipeline = _make_render_pipeline(
             dev, self._aniso_layout, self._aniso_shader, accum_targets)
         self._star_pipeline = _make_render_pipeline(
@@ -255,6 +270,11 @@ class WGPURenderer:
 
         # Static bind groups
         self._camera_bg = _make_bind_group(dev, self._splat_bgl0, [self._camera_buf])
+        # Subsample chunks: list of dicts {bg0, bg1, params_buf, n, start}
+        # for the splat_subsample pipeline. Set via set_subsample_chunks()
+        # once after upload; None means "use the legacy direct path".
+        self._subsample_chunks = None
+        self._subsample_stride = 1
         self._aniso_bg0 = _make_bind_group(dev, self._aniso_bgl0,
                                            [self._camera_buf, self._aniso_params_buf])
         self._star_bg0 = _make_bind_group(dev, self._star_bgl0,
@@ -652,15 +672,68 @@ class WGPURenderer:
                                               gpu_bufs["mass"], gpu_bufs["qty"]])
 
         self._set_identity_sort_index(n_particles)
-        # Default: direct draw. Subsample path overrides via
-        # set_particle_indirect_buf right after this call.
-        self._particle_indirect_buf = None
 
-    def set_particle_indirect_buf(self, indirect_buf):
-        """Enable GPU indirect drawing for the particle splat pass.
-        Pass None to revert to direct drawing with self.n_particles.
+    def set_subsample_chunks(self, chunks):
+        """Configure compute-driven splat: render directly from per-chunk
+        source particle buffers, with hash-stride + frustum cull happening
+        in the vertex shader.
+
+        Args:
+            chunks: list of dicts {"pos","hsml","mass","qty","n","start"}
+                from GPUCompute, or None to disable.
         """
-        self._particle_indirect_buf = indirect_buf
+        if chunks is None:
+            self._subsample_chunks = None
+            return
+        dev = self.device
+        out = []
+        for cb in chunks:
+            params_buf = dev.create_buffer(
+                size=96, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+            bg0 = _make_bind_group(dev, self._splat_subsample_bgl0,
+                                   [self._camera_buf, params_buf])
+            bg1 = _make_bind_group(dev, self._splat_bgl1,
+                                   [cb["pos"], cb["hsml"], cb["mass"], cb["qty"]])
+            out.append({
+                "bg0": bg0, "bg1": bg1, "params_buf": params_buf,
+                "n": int(cb["n"]), "start": int(cb["start"]),
+            })
+        self._subsample_chunks = out
+
+    def set_subsample_stride(self, stride):
+        """Set the stride used by the compute-driven splat path."""
+        self._subsample_stride = max(int(stride), 1)
+
+    def _write_subsample_params(self, camera, stride):
+        """Write each chunk's params uniform. Must be called BEFORE
+        beginning the render pass (write_buffer cannot run mid-pass).
+        """
+        if self._subsample_chunks is None:
+            return
+        import struct as _struct
+        ratio = float(stride)
+        h_scale = ratio ** (1.0 / 3.0)
+        mass_scale = ratio  # each sampled particle stands in for `stride`
+        fov_rad = float(np.radians(camera.fov))
+        cam_bytes = _struct.pack(
+            "fff f fff f fff f fff f",
+            float(camera.position[0]), float(camera.position[1]),
+            float(camera.position[2]), 0.0,
+            float(camera.forward[0]), float(camera.forward[1]),
+            float(camera.forward[2]), 0.0,
+            float(camera.right[0]), float(camera.right[1]),
+            float(camera.right[2]), 0.0,
+            float(camera.up[0]), float(camera.up[1]),
+            float(camera.up[2]), 0.0,
+        )
+        for ck in self._subsample_chunks:
+            tail = _struct.pack(
+                "ffII ffII",
+                fov_rad, float(camera.aspect), int(stride), int(ck["n"]),
+                h_scale, mass_scale, 0, 0,
+            )
+            self.device.queue.write_buffer(
+                ck["params_buf"], 0, cam_bytes + tail)
 
     def _upload_aniso_summaries(self, pos, mass, qty, cov):
         """Upload anisotropic summary splat data."""
@@ -795,6 +868,10 @@ class WGPURenderer:
         """
         self._write_camera_uniforms(camera, width, height)
 
+        # Subsample params must be written before the render pass begins.
+        if self._subsample_chunks is not None:
+            self._write_subsample_params(camera, self._subsample_stride)
+
         dev = self.device
         encoder = dev.create_command_encoder()
 
@@ -816,16 +893,33 @@ class WGPURenderer:
         render_pass = encoder.begin_render_pass(**rp_args)
 
         # Draw regular particles (all as instanced quads)
-        if self.n_particles > 0 and self._particle_bufs and hasattr(self, "_sort_bg"):
+        if self._subsample_chunks is not None:
+            # Compute-driven splat: one draw per chunk, dispatching only
+            # ceil(n / stride) instances. The vertex shader picks one
+            # particle per instance via hash and frustum-tests it.
+            stride = max(self._subsample_stride, 1)
+            render_pass.set_pipeline(self._splat_subsample_pipeline)
+            total_inst = 0
+            for ck in self._subsample_chunks:
+                instances = (ck["n"] + stride - 1) // stride
+                if instances == 0:
+                    continue
+                total_inst += instances
+                render_pass.set_bind_group(0, ck["bg0"])
+                render_pass.set_bind_group(1, ck["bg1"])
+                render_pass.draw(4, instances, 0, 0)
+            if not hasattr(self, "_diag_frame"):
+                self._diag_frame = 0
+            self._diag_frame += 1
+            if self._diag_frame <= 10:
+                print(f"  [diag] frame {self._diag_frame}: stride={stride} "
+                      f"total_instances={total_inst}", flush=True)
+        elif self.n_particles > 0 and self._particle_bufs and hasattr(self, "_sort_bg"):
             render_pass.set_pipeline(self._splat_pipeline)
             render_pass.set_bind_group(0, self._camera_bg)
             render_pass.set_bind_group(1, self._particle_bg)
             render_pass.set_bind_group(2, self._sort_bg)
-            ind = getattr(self, "_particle_indirect_buf", None)
-            if ind is not None:
-                render_pass.draw_indirect(ind, 0)
-            else:
-                render_pass.draw(4, self.n_particles, 0, 0)
+            render_pass.draw(4, self.n_particles, 0, 0)
 
         # Draw anisotropic summary splats
         if self.n_aniso > 0 and self._aniso_bufs:

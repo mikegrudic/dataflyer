@@ -552,23 +552,15 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     def do_cull():
         """Run cull via GPU compute (zero-copy) or CPU fallback."""
         if gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False):
-            # Brute-force GPU subsample cull when subsample strategy is active
+            # Compute-driven splat: cull happens inside the vertex shader
+            # against the source per-chunk buffers. Nothing to do here
+            # except update the renderer's stride; per-frame _render_accum
+            # writes the cull params and dispatches one draw per chunk.
             if getattr(renderer, "lod_strategy", "geometric") == "subsample":
-                t0 = time.perf_counter()
                 stride = max(int(renderer.lod_pixels), 1)
-                # Grow output buffers if user bumped budget at runtime.
-                if hasattr(gpu_compute, "grow_subsample_output"):
-                    gpu_compute.grow_subsample_output(int(renderer.max_render_particles))
-                n_out = gpu_compute.dispatch_subsample_cull(
-                    camera, stride,
-                    max_output=int(renderer.max_render_particles))
-                # HUD count: estimate from stride. The actual draw count
-                # is GPU-side via the indirect buffer below.
-                hud_count = min(int(renderer.n_total // max(stride, 1)), n_out)
-                renderer.set_particle_buffers_from_gpu(
-                    gpu_compute.get_output_buffers(), hud_count)
-                renderer.set_particle_indirect_buf(
-                    gpu_compute.get_subsample_indirect_buf())
+                renderer.set_subsample_stride(stride)
+                # HUD count: estimate from stride.
+                renderer.n_particles = int(renderer.n_total // max(stride, 1))
                 renderer.n_summaries = 0
                 renderer._upload_summary_arrays(
                     np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
@@ -576,7 +568,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 renderer._upload_aniso_summaries(
                     np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
                     np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
-                renderer._last_cull_ms = (time.perf_counter() - t0) * 1000
+                renderer._last_cull_ms = 0.0
                 renderer._last_upload_ms = 0.0
                 return
             n_out, n_vis, summary_data = gpu_compute.dispatch_cull(
@@ -684,6 +676,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     gpu_compute.upload_subsample_only(
                         renderer._grid,
                         max_output=int(renderer.max_render_particles))
+                    # Compute-driven splat: hand the per-chunk source
+                    # buffers to the renderer; the splat_subsample
+                    # pipeline does the cull + stride test in the vertex
+                    # shader. No compute pass, no readback.
+                    renderer.set_subsample_chunks(gpu_compute.get_chunk_bufs())
+                    # Seed the stride from the renderer's auto-LOD value so
+                    # the first frame doesn't dispatch all 100M+ instances.
+                    renderer.set_subsample_stride(int(max(renderer.lod_pixels, 1)))
                     print("  GPU subsample pipeline initialized (zero-copy)")
                 else:
                     gpu_compute.upload_snapshot(

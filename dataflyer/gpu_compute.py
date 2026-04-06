@@ -61,8 +61,6 @@ class GPUCompute:
         self._cull_module = device.create_shader_module(code=_load_wgsl("frustum_cull.wgsl"))
         self._scan_module = device.create_shader_module(code=_load_wgsl("prefix_sum.wgsl"))
         self._gather_module = device.create_shader_module(code=_load_wgsl("gather.wgsl"))
-        self._subsample_module = device.create_shader_module(
-            code=_load_wgsl("subsample_cull.wgsl"))
 
         # Pipelines built lazily after upload (bind group layouts depend on data)
         self._cull_pipeline = None
@@ -98,14 +96,16 @@ class GPUCompute:
         self.device.queue.submit([encoder.finish()])
 
     def upload_subsample_only(self, grid, max_output=4_000_000):
-        """Minimal upload for the brute-force subsample cull pipeline.
+        """Allocate per-chunk source particle buffers for the compute-driven
+        splat path (splat_subsample.wgsl). The renderer's vertex shader
+        reads these directly and culls/strides inline — no compute pass,
+        no output buffer, no readback.
 
-        Uses the grid's raw particle arrays (no Morton sort, no tree).
-        Works with deferred-build AdaptiveOctree where sorted_* are None.
+        Source particles are split into chunks well under Apple Metal's
+        practical 1 GB per-binding limit (largest entry is pos at 16 B).
         """
         dev = self.device
 
-        # Prefer raw (unsorted) arrays if available, else sorted.
         pos_src = getattr(grid, "_raw_pos", None)
         if pos_src is None:
             pos_src = grid.sorted_pos
@@ -119,89 +119,54 @@ class GPUCompute:
 
         n = len(pos_src)
         self._n_particles = n
-        self._max_output = max_output
+        self._max_output = max_output  # legacy field; unused by splat path
+
+        # 256 MB per binding cap → 16 M particles per chunk for pos.
+        SAFE_CHUNK_BYTES = 256 * 1024 * 1024
+        chunk_n = SAFE_CHUNK_BYTES // 16
 
         particle_usage = (wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST
                           | wgpu.BufferUsage.COPY_SRC)
-        self._particle_bufs = {
-            "pos": dev.create_buffer(size=n * 16, usage=particle_usage),
-            "hsml": dev.create_buffer(size=n * 4, usage=particle_usage),
-            "mass": dev.create_buffer(size=n * 4, usage=particle_usage),
-            "qty": dev.create_buffer(size=n * 4, usage=particle_usage),
-        }
+        self._chunk_bufs = []
+        for start in range(0, n, chunk_n):
+            cn = min(chunk_n, n - start)
+            self._chunk_bufs.append({
+                "pos": dev.create_buffer(size=cn * 16, usage=particle_usage),
+                "hsml": dev.create_buffer(size=cn * 4, usage=particle_usage),
+                "mass": dev.create_buffer(size=cn * 4, usage=particle_usage),
+                "qty": dev.create_buffer(size=cn * 4, usage=particle_usage),
+                "n": cn,
+                "start": start,
+            })
+        # Legacy alias used by upload_weights and a few other call sites.
+        self._particle_bufs = self._chunk_bufs[0]
 
-        out_usage = wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
-        self._output_bufs = {
-            "pos": dev.create_buffer(size=max_output * 16, usage=out_usage),
-            "hsml": dev.create_buffer(size=max_output * 4, usage=out_usage),
-            "mass": dev.create_buffer(size=max_output * 4, usage=out_usage),
-            "qty": dev.create_buffer(size=max_output * 4, usage=out_usage),
-        }
+        # Queue all chunk uploads. Metal handles staging concurrency
+        # internally; we only need one final blocking sync to ensure
+        # everything has landed before the render loop starts (otherwise
+        # the next encoder.finish() / queue.submit() wedges behind the
+        # pending uploads). The sync reads from the LAST chunk so all
+        # earlier chunks have completed by the time it returns.
+        for cb in self._chunk_bufs:
+            start, cn = cb["start"], cb["n"]
+            pos4 = np.zeros((cn, 4), dtype=np.float32)
+            pos4[:, :3] = pos_src[start:start + cn]
+            dev.queue.write_buffer(cb["pos"], 0, pos4.tobytes())
+            dev.queue.write_buffer(cb["hsml"], 0,
+                                   hsml_src[start:start + cn].tobytes())
+            dev.queue.write_buffer(cb["mass"], 0,
+                                   mass_src[start:start + cn].tobytes())
+            dev.queue.write_buffer(cb["qty"], 0,
+                                   qty_src[start:start + cn].tobytes())
+        dev.queue.read_buffer(self._chunk_bufs[-1]["pos"], size=4)
 
-        # Upload positions (chunked to keep submits small). Pace each
-        # chunk with a blocking read_buffer so Metal's staging buffer
-        # never accumulates more than one chunk's worth of pending
-        # writes — otherwise the residual backlog wedges the next
-        # frame's encoder.finish() / queue.submit() in the render loop.
-        CHUNK = 4_000_000
-        pos4 = np.zeros((n, 4), dtype=np.float32)
-        pos4[:, :3] = pos_src
-        for start in range(0, n, CHUNK):
-            end = min(start + CHUNK, n)
-            dev.queue.write_buffer(
-                self._particle_bufs["pos"], start * 16, pos4[start:end].tobytes())
-            dev.queue.read_buffer(self._particle_bufs["pos"], size=4)
-        for name, arr in [("hsml", hsml_src),
-                          ("mass", mass_src),
-                          ("qty", qty_src)]:
-            for start in range(0, n, CHUNK):
-                end = min(start + CHUNK, n)
-                dev.queue.write_buffer(
-                    self._particle_bufs[name], start * 4,
-                    arr[start:end].tobytes())
-                dev.queue.read_buffer(self._particle_bufs[name], size=4)
-
-        # Build only the subsample pipeline (not the tree-LOD ones)
-        self._build_subsample_pipeline()
         self._upload_ready = True
 
-    def _build_subsample_pipeline(self):
-        """Build just the brute-force subsample pipeline."""
-        dev = self.device
-        _bgl = _make_compute_bgl
-        _bg = _make_bind_group
-        _pipe = _make_compute_pipeline
-
-        self._subsample_bgl0 = _bgl(dev, [
-            "uniform", "read-only-storage", "read-only-storage",
-            "read-only-storage", "read-only-storage", "storage"])
-        self._subsample_bgl1 = _bgl(dev, ["storage"] * 4)
-        self._subsample_pipeline = _pipe(
-            dev, [self._subsample_bgl0, self._subsample_bgl1],
-            self._subsample_module, "main")
-        self._subsample_params_buf = dev.create_buffer(
-            size=96, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
-        self._subsample_counter_buf = dev.create_buffer(
-            size=16,
-            usage=(wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
-                   | wgpu.BufferUsage.COPY_DST))
-        # Indirect draw args: (vertex_count=4, instance_count, first_vertex=0,
-        # first_instance=0). instance_count is set each cull from the atomic
-        # counter via copy_buffer_to_buffer — no CPU readback needed.
-        self._subsample_indirect_buf = dev.create_buffer(
-            size=16,
-            usage=(wgpu.BufferUsage.INDIRECT | wgpu.BufferUsage.COPY_DST))
-        dev.queue.write_buffer(
-            self._subsample_indirect_buf, 0,
-            struct.pack("IIII", 4, 0, 0, 0))
-        pb = self._particle_bufs
-        ob = self._output_bufs
-        self._subsample_bg0 = _bg(dev, self._subsample_bgl0, [
-            self._subsample_params_buf,
-            pb["pos"], pb["hsml"], pb["mass"], pb["qty"],
-            self._subsample_counter_buf])
-        self._subsample_bg1 = _bg(dev, self._subsample_bgl1, [
-            ob["pos"], ob["hsml"], ob["mass"], ob["qty"]])
+    def get_chunk_bufs(self):
+        """Return the per-chunk source buffers used by the compute-driven
+        splat path. Each entry is a dict with keys pos/hsml/mass/qty/n/start.
+        """
+        return getattr(self, "_chunk_bufs", None)
 
     def upload_snapshot(self, grid, max_output=4_000_000):
         """Upload grid structure and sorted particle data to GPU (blocking)."""
@@ -696,106 +661,6 @@ class GPUCompute:
             s_pos, s_hsml, s_mass, s_qty, s_cov = z3, z1, z1, z1, z6
 
         return n_output, total_visible, (s_pos, s_hsml, s_mass, s_qty, s_cov)
-
-    def grow_subsample_output(self, max_output):
-        """Reallocate output buffers and the subsample bind group if the
-        requested max_output exceeds the current capacity. Used when the
-        renderer's max_render_particles is bumped at runtime.
-
-        Caps max_output to fit within the device's max storage buffer
-        size. The largest per-element entry is pos (16 bytes), so the
-        cap is max-storage-buffer-binding-size / 16.
-        """
-        try:
-            max_buf = int(self.device.limits["max-storage-buffer-binding-size"])
-        except Exception:
-            max_buf = 2**31
-        max_output = min(max_output, max_buf // 16)
-        if max_output <= self._max_output:
-            return
-        dev = self.device
-        out_usage = wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
-        self._output_bufs = {
-            "pos": dev.create_buffer(size=max_output * 16, usage=out_usage),
-            "hsml": dev.create_buffer(size=max_output * 4, usage=out_usage),
-            "mass": dev.create_buffer(size=max_output * 4, usage=out_usage),
-            "qty": dev.create_buffer(size=max_output * 4, usage=out_usage),
-        }
-        self._max_output = max_output
-        ob = self._output_bufs
-        self._subsample_bg1 = _make_bind_group(dev, self._subsample_bgl1, [
-            ob["pos"], ob["hsml"], ob["mass"], ob["qty"]])
-
-    def dispatch_subsample_cull(self, camera, stride, max_output=None):
-        """Brute-force per-particle frustum cull + stride subsample.
-
-        Tests all particles. Particles passing the hash stride filter AND
-        the frustum test atomically write to the output buffers, but the
-        atomic write stops once `max_output` in-frustum particles have
-        been emitted. So the budget caps the in-frustum count sent to
-        the renderer.
-        """
-        dev = self.device
-        n = self._n_particles
-        stride = max(int(stride), 1)
-        if max_output is None:
-            max_output = self._max_output
-        else:
-            max_output = min(int(max_output), self._max_output)
-
-        ratio = float(stride)
-        h_scale = ratio ** (1.0 / 3.0)
-        fov_rad = float(np.radians(camera.fov))
-
-
-        # Pack params (96 bytes — vec3+pad ×4 = 64, then 8 floats/ints = 32)
-        # Layout: cam_pos+pad, cam_fwd+pad, cam_right+pad, cam_up+pad,
-        #         fov_rad, aspect, stride, n_particles, h_scale, mass_scale,
-        #         max_output, _pad
-        params_data = struct.pack(
-            "fff f fff f fff f fff f ffII ffII",
-            float(camera.position[0]), float(camera.position[1]),
-            float(camera.position[2]), 0.0,
-            float(camera.forward[0]), float(camera.forward[1]),
-            float(camera.forward[2]), 0.0,
-            float(camera.right[0]), float(camera.right[1]),
-            float(camera.right[2]), 0.0,
-            float(camera.up[0]), float(camera.up[1]),
-            float(camera.up[2]), 0.0,
-            fov_rad, float(camera.aspect), stride, n,
-            h_scale, ratio, max_output, 0,
-        )
-        dev.queue.write_buffer(self._subsample_params_buf, 0, params_data)
-
-        # Wrap workgroup count into a 2D grid (max 65535 per dim).
-        total_wg = _div_ceil(n, WG_SIZE)
-        wgx = min(total_wg, 65535)
-        wgy = _div_ceil(total_wg, wgx)
-
-        encoder = dev.create_command_encoder()
-        # Clear counter via encoder (no CPU sync needed)
-        encoder.clear_buffer(self._subsample_counter_buf, 0, 16)
-        cpass = encoder.begin_compute_pass()
-        cpass.set_pipeline(self._subsample_pipeline)
-        cpass.set_bind_group(0, self._subsample_bg0)
-        cpass.set_bind_group(1, self._subsample_bg1)
-        cpass.dispatch_workgroups(wgx, wgy)
-        cpass.end()
-        # Copy counter into indirect_args[1] (instance_count slot) so the
-        # renderer's draw_indirect picks up the actual output count without
-        # any CPU readback (which deadlocks inside the canvas frame loop on
-        # Apple Metal).
-        encoder.copy_buffer_to_buffer(
-            self._subsample_counter_buf, 0,
-            self._subsample_indirect_buf, 4, 4)
-        dev.queue.submit([encoder.finish()])
-
-        # No CPU readback. Return max_output as a conservative HUD upper
-        # bound; actual draw count is GPU-side via the indirect buffer.
-        return max_output
-
-    def get_subsample_indirect_buf(self):
-        return getattr(self, "_subsample_indirect_buf", None)
 
     def _prefix_sum(self, buf, n, block_sums_1=None, block_sums_2=None):
         """Run multi-level prefix sum on a u32 storage buffer.
