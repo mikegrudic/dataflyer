@@ -427,6 +427,19 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     prev_lod_pixels = None
     prev_n_particles = None
     prev_fb_size = (0, 0)
+    # Number of consecutive idle frames seen. We only start sleeping
+    # after a few in a row so a transient `moved=False` frame in the
+    # middle of a slow rotation doesn't introduce a visible stutter.
+    idle_streak = 0
+    IDLE_STREAK_THRESHOLD = 6
+    # Throttle LOS-projection recomputes during motion. _apply_render_mode
+    # does a full CPU LOS projection over every particle and can take
+    # hundreds of ms on big snapshots, so firing it every ~1.15° rotation
+    # step would tank the framerate. While the camera is moving we cap
+    # the rate; once the camera stops the gate opens immediately so the
+    # final image is fresh.
+    last_los_recompute_time = 0.0
+    LOS_MOVING_THROTTLE_S = 0.15
 
     # Progressive refinement / auto-LOD state
     was_moving = False
@@ -455,7 +468,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     # Pre-sort and cache slot weight arrays (done once per slot config change)
     _slot_sorted = [None, None]  # (slot_id, sorted_mass, sorted_qty) per slot
 
-    def _ensure_slot_sorted(slot_idx):
+    def _ensure_slot_sorted(slot_idx, freeze_los_key=False):
         """Ensure sorted mass/qty arrays are cached for this slot. Returns (mass, qty).
 
         For LOS vector qty fields, qty was historically a placeholder — the
@@ -464,6 +477,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         here. The result is correct at the current camera orientation and
         becomes stale on rotation; the canvas loop calls _apply_render_mode
         again when LOS staleness is detected.
+
+        `freeze_los_key=True` makes the cache key ignore the current
+        camera direction for LOS vector slots (any cached entry, regardless
+        of which forward it was computed at, will be reused). The
+        per-frame composite render path uses this during camera motion to
+        avoid a ~1.5 s/frame CPU reprojection on every micro-rotation —
+        the stale projection is acceptable while the user is rotating;
+        once they stop, the gate opens and the next frame refreshes once.
         """
         sl = _state["_slot"][slot_idx]
         # When the slot uses an LOS-projected vector field, the cached
@@ -475,7 +496,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                            or sl.get("weight2", "None") in _state["_vector_fields"]
                            or (sl["mode"] in ("WeightedAverage", "WeightedVariance")
                                and sl["data"] in _state["_vector_fields"])))
-        if is_los_vec:
+        if is_los_vec and not freeze_los_key:
             fwd_key = tuple(int(round(c * 256)) for c in camera.forward)
         else:
             fwd_key = None
@@ -506,13 +527,21 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         _slot_sorted[slot_idx] = (slot_id, sm, sq)
         return sm, sq
 
-    def _render_composite_frame(fb_w, fb_h, encoder=None, screen_view=None):
+    def _render_composite_frame(fb_w, fb_h, encoder=None, screen_view=None,
+                                freeze_los_key=False):
         """Render two fields into separate FBOs and composite them.
 
         If `encoder` and `screen_view` are provided, all sub-passes (two
         accum passes + one composite resolve) are appended to the shared
         encoder and the caller submits. Otherwise the legacy path runs
         each sub-call with its own encoder+submit.
+
+        `freeze_los_key=True` (passed from the main loop while the
+        camera is rotating) makes the LOS vector slot cache ignore the
+        current camera forward, so we don't pay a ~1.5 s/frame CPU
+        reprojection on every micro-rotation. The cached LOS field is
+        slightly stale during motion; on stop the gate opens and the
+        next frame recomputes once with the fresh forward.
         """
         renderer._ensure_fbo(fb_w, fb_h, which=1)
         renderer._ensure_fbo(fb_w, fb_h, which=2)
@@ -527,7 +556,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 # cached for the *current* camera direction (the cache
                 # key includes a quantized fwd for LOS slots), then
                 # upload to the slot's per-chunk buffers and render.
-                sorted_mass, sorted_qty = _ensure_slot_sorted(i)
+                sorted_mass, sorted_qty = _ensure_slot_sorted(
+                    i, freeze_los_key=freeze_los_key)
                 slot_id = _slot_sorted[i][0]
                 slot_chunks = gpu_compute.upload_subsample_slot(
                     i, slot_id, sorted_mass, sorted_qty)
@@ -682,16 +712,17 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     min(int(cur * 1.4) + 1, MAX_CAP))
 
         # LOS projection is computed on the CPU at _apply_render_mode
-        # time (subsample mode has no GPU LOS path). Re-fire it when the
-        # camera has rotated enough to invalidate the cached projection.
+        # time (subsample mode has no GPU LOS path). Re-fire it only on
+        # stationary frames — _apply_render_mode is too expensive (full
+        # CPU LOS pass over every particle) to run during motion on
+        # large snapshots.
         if not moved:
             if is_los_stale(_state["_render_mode_name"], _state["_wa_data_field"],
                             _state["_sd_field"], _state.get("_sd_field2", "None"),
                             _vector_fields, _state["_vector_projection"],
                             _state.get("_los_camera_fwd"), camera.forward):
                 app_proxy._apply_render_mode(auto_range=True)
-                # LOS projection just rotated — force a re-render even if
-                # the idle-frame snapshot would otherwise short-circuit.
+                last_los_recompute_time = now
                 dirty = True
 
         # --- Cull / progressive refinement / auto-LOD ---
@@ -916,14 +947,24 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         )
 
         if not frame_dirty:
-            # Nothing changed: skip render/encode/submit. Sleep briefly to
-            # avoid 100% CPU. glfw.poll_events at the top of the next
-            # iteration picks up new input. Don't increment frame_count
-            # for skipped frames so the FPS counter doesn't get inflated
-            # by no-op iterations.
-            frame_count = max(frame_count - 1, 0)
-            time.sleep(0.005)
-            continue
+            # Require a few consecutive idle frames before we actually
+            # start sleeping. A single `moved=False` tick in the middle
+            # of a slow rotation (e.g. between mouse-delta events) would
+            # otherwise insert a 5ms sleep and cause visible stutter,
+            # most noticeably in LOS variance / composite modes whose
+            # CPU-cached projection already updates coarsely.
+            idle_streak += 1
+            if idle_streak >= IDLE_STREAK_THRESHOLD:
+                # Don't increment frame_count for slept frames so the
+                # FPS counter isn't inflated by no-op iterations.
+                frame_count = max(frame_count - 1, 0)
+                time.sleep(0.005)
+                continue
+            # Otherwise fall through and render anyway (cheap, since
+            # nothing changed the GPU work is essentially the same as
+            # the last frame).
+        else:
+            idle_streak = 0
 
         # Render. Time the call wall-clock — most of this is
         # get_current_texture blocking on the swapchain present, which
@@ -950,7 +991,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 if _state["_composite"]:
                     _render_composite_frame(
                         fb_w, fb_h,
-                        encoder=_frame_encoder, screen_view=_frame_screen_view)
+                        encoder=_frame_encoder, screen_view=_frame_screen_view,
+                        freeze_los_key=moved)
                 else:
                     renderer.render(
                         camera, fb_w, fb_h,
