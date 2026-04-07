@@ -706,17 +706,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         if moved:
             has_moved_ever = True
             if not was_moving:
-                # Stationary refinement may have pushed the cap up to
-                # ~n_total. The first motion frame must NOT inherit
-                # that — it would block for hundreds of ms while the
-                # GPU drains the in-flight refined accum and the user
-                # would perceive motion-start as frozen. Hard-reset to
-                # a small interactive cap; the cap-growth loop below
-                # walks back up to last_subsample_cap over the next
-                # few frames as long as the GPU keeps up.
-                MOTION_RESUME_CAP = 4_000_000
-                resume_cap = min(last_subsample_cap, MOTION_RESUME_CAP)
-                renderer.set_subsample_max_per_frame(resume_cap)
+                # Resume from the last cap proven sustainable for
+                # interactive motion. The on_submitted_work_done_sync
+                # call after each stationary frame guarantees no
+                # refinement frame is in flight, so this cap takes
+                # effect on the very next render with zero drain wait.
+                renderer.set_subsample_max_per_frame(last_subsample_cap)
                 # Reset the smoothed render-time EMA so the just-elapsed
                 # multi-second stationary frame doesn't poison the
                 # cap-grow gate for the first few motion frames.
@@ -727,7 +722,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     last_subsample_cap = min(subsample_cap_ceiling, int(cur_cap * 1.1) + 1)
                     renderer.set_subsample_max_per_frame(last_subsample_cap)
                 elif smooth_render_ms > target_ms * 1.2:
-                    last_subsample_cap = max(500_000, int(cur_cap * 0.85))
+                    last_subsample_cap = max(1, int(cur_cap * 0.85))
                     renderer.set_subsample_max_per_frame(last_subsample_cap)
                 else:
                     last_subsample_cap = cur_cap
@@ -1025,6 +1020,21 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
         if _do_present:
             canvas_context.present()
+
+        # On stationary refinement frames, block here until the GPU has
+        # actually retired the work we just submitted. The point: when
+        # the user resumes motion, there must be NO in-flight refinement
+        # frame queued behind us. If we let refinement keep racing
+        # ahead, the next motion-start get_current_texture() blocks for
+        # hundreds of ms waiting for a stale 100M-particle accum to
+        # drain. Synchronizing here pushes that wait into the stationary
+        # period (where it doesn't matter — the user is sitting still)
+        # and makes resume instantaneous.
+        if (not moved) and has_moved_ever and _frame_encoder is not None:
+            try:
+                device.queue.on_submitted_work_done_sync()
+            except Exception:
+                pass
 
         # Frame committed: snapshot state for the next idle-check.
         prev_state_sig = state_sig
