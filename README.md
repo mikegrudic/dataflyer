@@ -1,4 +1,4 @@
-# DataFlyer
+# DataFlyer (LEGACY REPO - renamed to [vizmo](https://github.com/mikegrudic/vizmo))
 
 Real-time 3D fly-through explorer for unstructured simulation data. Loads HDF5 snapshots from GIZMO/Gadget simulations and renders interactive surface density maps, mass-weighted averages, velocity dispersions, and composite CoolMap visualizations on the GPU via WebGPU.
 
