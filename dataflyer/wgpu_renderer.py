@@ -265,8 +265,11 @@ class WGPURenderer:
         self._star_buf_dirty = True
 
         # Tunables — wired into the dev panel later.
-        self.star_pixel_radius = 40.0
-        self.star_intensity = 20.0
+        # Physical billboard radius, in world (snapshot) units. The
+        # apparent screen size grows as 1/d as the camera approaches,
+        # like a real spherical object. Tune from the dev panel.
+        self.star_world_radius = 0.2
+        self.star_intensity = 10.0
         # UBVRI dust opacities (cm^2/g, MRN-style averages). Σ in
         # Msun/pc^2 → multiply by 2.0834e-4 to get code-unit κ such
         # that τ = κ_code * Σ.
@@ -284,10 +287,6 @@ class WGPURenderer:
         self.star_band_idx = 2  # default V
         self.star_extinction_kappa = self.STAR_BANDS[self.star_band_idx][1]
         self.star_extinction_enabled = True
-        # World-units distance at which a unit-luminosity star reaches
-        # its nominal screen brightness. Brightness scales as 1/d²,
-        # so halving the camera-to-star distance quadruples flux.
-        self.star_dist_ref = 1.0
 
     N_STAR_MODES = 6  # 5 single-band + 1 RGB composite
 
@@ -648,54 +647,39 @@ class WGPURenderer:
         ):
             return  # rotation-only frame — cached columns are still valid
 
-        # Sightline = from observer to stars (parallel-projection
-        # approximation; matches star_gas_columns' convention).
-        mean_star = self._star_positions.mean(axis=0)
-        sightline = mean_star - cam_pos
-        n = float(np.linalg.norm(sightline))
-        if n == 0.0:
-            sightline = np.array([0.0, 0.0, -1.0])
-        else:
-            sightline = sightline / n
-
-        # Deterministic orthonormal basis with -sightline as +z. The
-        # original CrunchSnaps routine drew sx from np.random.normal,
-        # which made every recompute use a fresh 2D projection — the
-        # main source of column-density flicker as the camera moved.
-        # Here sx is derived from the world up axis (or world x axis
-        # when the sightline is nearly aligned with up).
-        z_axis = -sightline
-        up = np.array([0.0, 0.0, 1.0])
-        if abs(np.dot(z_axis, up)) > 0.9:
-            up = np.array([1.0, 0.0, 0.0])
-        sx = up - np.dot(up, z_axis) * z_axis
-        sx /= np.linalg.norm(sx)
-        sy = np.cross(z_axis, sx)
-        basis = np.c_[sx, sy, z_axis].T  # rows are basis vectors
-
         xstar = self._star_positions
         xgas = self._ext_xgas
         mgas = self._ext_mgas
         hgas2 = self._ext_hgas * self._ext_hgas
-
-        xstar_b = xstar @ basis
-        xgas_b = xgas @ basis
-
-        # Vectorized brute force: for each (small N) star, accumulate
-        # the smooth-kernel contribution from every gas particle.
-        # W(b/h) = (3/(π h²)) (1-q²)² with q = b/h, vanishes at q=1.
-        xs = xstar_b[:, 0:2]
-        zs = xstar_b[:, 2]
-        xg = xgas_b[:, 0:2]
-        zg = xgas_b[:, 2]
         inv_pi = 1.0 / np.pi
-        n_stars = xstar_b.shape[0]
+        n_stars = xstar.shape[0]
         columns = np.zeros(n_stars, dtype=np.float64)
+
+        # Per-star line-of-sight integration. Each star uses its own
+        # ray (star → camera); a parallel projection along a single
+        # direction would rotate all gas positions in lockstep as the
+        # camera moves and produce correlated brightness flicker.
+        #
+        # For each gas particle g, compute its impact parameter b
+        # against the ray and the along-ray coordinate t:
+        #     r       = g − star
+        #     t       = r · ray_dir         (positive = toward camera)
+        #     b²      = |r|² − t²            (perpendicular to ray)
+        # The particle contributes when:
+        #     0 < t < |star − camera|       (lies between star and obs)
+        #     b < h_g                       (impact parameter inside h)
+        # using the smooth W(q) = (3/(π h²)) (1-q²)² deposit.
         for s in range(n_stars):
-            dx = xg[:, 0] - xs[s, 0]
-            dy = xg[:, 1] - xs[s, 1]
-            b2 = dx * dx + dy * dy
-            mask = (b2 < hgas2) & (zs[s] < zg)
+            ray = cam_pos - xstar[s]
+            d_obs = float(np.linalg.norm(ray))
+            if d_obs == 0.0:
+                continue
+            ray_dir = ray / d_obs
+            r = xgas - xstar[s]                       # (n_gas, 3)
+            t = r @ ray_dir                           # (n_gas,)
+            r2 = np.einsum("ij,ij->i", r, r)          # |r|²
+            b2 = np.maximum(r2 - t * t, 0.0)
+            mask = (t > 0.0) & (t < d_obs) & (b2 < hgas2)
             if not np.any(mask):
                 continue
             b2m = b2[mask]
@@ -875,12 +859,17 @@ class WGPURenderer:
             rgb[:, ch] = l
 
         # Layout: two vec4 per star.
-        # vec4[0] = (x, y, z, lum_single)
-        # vec4[1] = (lum_R, lum_G, lum_B, 0)
+        # vec4[0] = (x, y, z, L_raw)            ← drives billboard size
+        # vec4[1] = (L_R_att, L_G_att, L_B_att, L_single_att)
+        # The shader divides each L_*_att by L_raw to get a per-channel
+        # attenuation factor in [0,1], so per-pixel surface brightness
+        # is independent of intrinsic luminosity (which goes entirely
+        # into the billboard area via radius ∝ sqrt(L)).
         data = np.zeros((n, 8), dtype=np.float32)
         data[:, 0:3] = pos.astype(np.float32)
-        data[:, 3] = lum_single
+        data[:, 3] = L0  # raw bolometric, for sizing
         data[:, 4:7] = rgb
+        data[:, 7] = lum_single
 
         nbytes = data.nbytes
         if self._star_buf is None or self._star_buf.size < nbytes:
@@ -946,10 +935,10 @@ class WGPURenderer:
         import struct
         params = struct.pack(
             "ffff",
-            float(self.star_pixel_radius),
+            float(self.star_world_radius),
             float(self.star_intensity),
             float(self.star_band_idx),
-            float(self.star_dist_ref),
+            0.0,
         )
         self.device.queue.write_buffer(self._star_params_buf, 0, params)
 

@@ -381,6 +381,11 @@ class DevOverlay(Panel):
             items.append(("slider", "PID Ki", renderer.pid_Ki, 0.0, 2.0, "pid_Ki"))
             items.append(("slider", "PID Kd", renderer.pid_Kd, 0.0, 2.0, "pid_Kd"))
         items.append(("slider", "Hsml Scale", renderer.hsml_scale, 0.1, 5.0, "hsml_scale"))
+        if getattr(renderer, "n_stars", 0) > 0:
+            items.append(("slider", "Star Radius",
+                          renderer.star_world_radius, 0.001, 5.0, "star_world_radius"))
+            items.append(("slider", "Star Intensity",
+                          renderer.star_intensity, 0.0, 100.0, "star_intensity"))
 
         if message:
             items.append(("text", message))
@@ -413,6 +418,16 @@ class DevOverlay(Panel):
             # Slider
             action, key, vmin, vmax = base
             cur = getattr(renderer, key, 1.0)
+            # Log-scale unbounded sliders: each click multiplies/divides
+            # by a fixed factor. Useful for quantities spanning many
+            # orders of magnitude (star brightness, world radius).
+            if key in ("star_world_radius", "star_intensity"):
+                factor = 1.5
+                if action == "slider_dec":
+                    setattr(renderer, key, max(cur / factor, 1e-12))
+                else:
+                    setattr(renderer, key, cur * factor)
+                return True
             step = max((vmax - vmin) / 20, 0.01)
             if action == "slider_dec":
                 setattr(renderer, key, max(vmin, cur - step))
