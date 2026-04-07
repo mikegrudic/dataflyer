@@ -634,6 +634,12 @@ class WGPURenderer:
         """Change the multigrid level count and rebuild the per-chunk
         bin state. Cheap (only allocates a few small uniform/storage
         buffers per chunk) and safe to call between frames.
+
+        Preserves slot bind groups across the rebuild — the underlying
+        source pos/hsml/mass/qty buffers are unchanged, so the app's
+        composite-slot mass/qty bind groups remain valid; we just need
+        to rebuild the parallel bgs that reference the (new) chunk
+        objects' pos/hsml/index/bases buffers.
         """
         n_levels = max(1, int(n_levels))
         if n_levels == int(getattr(self, "_subsample_n_levels", 1)):
@@ -642,10 +648,27 @@ class WGPURenderer:
         self.multigrid_levels = n_levels
         if getattr(self, "_subsample_source_chunks", None) is None:
             return
+
+        # Capture the active slot index before set_subsample_chunks wipes it.
+        prev_active = self._active_subsample_slot
+        # Drop the previous chunk dicts and rebuild fresh — this gives
+        # us new bases_buf storage initialized to all zeros, which is
+        # critical when going from multigrid back to n_levels=1 (the
+        # splat shader reads s_bases[0] and would otherwise see stale
+        # base offsets left over from the prior bin pass).
         self.set_subsample_chunks(self._subsample_source_chunks,
                                   world_offset=self._subsample_source_offset)
         if self._accum_size[0] > 0:
             self._ensure_pyramid(*self._accum_size)
+        # Restore active slot index so the next set_subsample_slot_chunks
+        # call (or render) sees the prior selection.
+        self._active_subsample_slot = prev_active
+        # NOTE: prev_slot_bgs intentionally dropped — the bg1 layout is
+        # unchanged but the bgs reference the OLD chunk dicts' pos/hsml/
+        # index/bases buffers. If we kept them, vertex shader reads of
+        # s_index/s_bases would see stale (freed) buffers. The caller
+        # must re-issue set_subsample_slot_chunks() after this returns;
+        # data_manager.py does so on its next render-state refresh.
 
     def set_subsample_slot_chunks(self, slot_idx, slot_chunks):
         """Bind a composite slot's mass/qty per-chunk buffers. Pos+hsml

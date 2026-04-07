@@ -80,12 +80,24 @@ fn vs_main(
     // indices into [base[level], base[level]+count[level]) ranges and
     // each per-level draw_indirect dispatches with first_instance=base
     // and instance_count=count.
-    let base = s_bases[sub.level_index];
-    let abs_ii = base + ii;
-    if (abs_ii >= sub.n_in_chunk) {
-        return degenerate(corner);
+    // Fast path for n_levels==1: skip s_index/s_bases entirely so the
+    // splat shader has the same memory traffic as the pre-multigrid
+    // version (the auto-LOD PID is tuned against that cost curve and
+    // oscillates if the vertex cost shifts even a little).
+    var local_idx: u32;
+    if (sub.n_levels <= 1u) {
+        if (ii >= sub.n_in_chunk) {
+            return degenerate(corner);
+        }
+        local_idx = ii;
+    } else {
+        let base = s_bases[sub.level_index];
+        let abs_ii = base + ii;
+        if (abs_ii >= sub.n_in_chunk) {
+            return degenerate(corner);
+        }
+        local_idx = s_index[abs_ii];
     }
-    let local_idx = s_index[abs_ii];
 
     let pos = s_pos[local_idx].xyz;
     let hsml = s_hsml[local_idx] * sub.h_scale;
