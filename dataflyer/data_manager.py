@@ -1,10 +1,7 @@
 """Load mesh-free simulation snapshots via h5py with lazy field loading."""
 
-import os
-import re
 import numpy as np
 import h5py
-from natsort import natsorted
 
 # Field name fallbacks for different GIZMO versions
 _FIELD_FALLBACKS = {
@@ -76,6 +73,12 @@ class SnapshotData:
 
         # Apply cosmological corrections if needed
         data = self._cosmo_correct(data, ptype, field)
+
+        # Cache as float32 so subsequent get_field/get_vector_field calls
+        # don't have to re-cast (Velocities is ~1.5 GB at float32 — doing
+        # it twice doubles the cost of every reweight).
+        if data.dtype != np.float32:
+            data = data.astype(np.float32)
 
         self._cache[key] = data
         return data
@@ -150,12 +153,12 @@ class SnapshotData:
             base, idx_str = name[:-1].split("[", 1)
             col = int(idx_str)
             data = self._read_field("PartType0", base)
-            return data[:, col].astype(np.float32)
-        return self._read_field("PartType0", name).astype(np.float32)
+            return np.ascontiguousarray(data[:, col])
+        return self._read_field("PartType0", name)
 
     def get_vector_field(self, name):
         """Load a raw PartType0 vector field. Returns (N, 3) float32 array."""
-        return self._read_field("PartType0", name).astype(np.float32)
+        return self._read_field("PartType0", name)
 
     def close(self):
         self._file.close()
@@ -166,25 +169,3 @@ class SnapshotData:
             self._file.close()
         except Exception:
             pass
-
-
-def find_snapshots(path):
-    """Given a snapshot path, find all sibling snapshots in the same directory.
-    Returns a sorted list of snapshot paths."""
-    dirpath = os.path.dirname(os.path.abspath(path))
-    basename = os.path.basename(path)
-
-    # Extract the naming pattern: snapshot_NNN.hdf5, snap_NNN.hdf5, etc.
-    match = re.match(r"^(.*?)(\d+)(\.hdf5)$", basename, re.IGNORECASE)
-    if not match:
-        return [path]
-
-    prefix, _, suffix = match.groups()
-    pattern = re.compile(re.escape(prefix) + r"\d+" + re.escape(suffix), re.IGNORECASE)
-
-    snaps = [
-        os.path.join(dirpath, f)
-        for f in os.listdir(dirpath)
-        if pattern.match(f)
-    ]
-    return natsorted(snaps)

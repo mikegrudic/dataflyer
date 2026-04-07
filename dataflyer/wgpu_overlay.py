@@ -97,24 +97,6 @@ class WGPUPanelBackend:
         render_pass.draw(6)
 
 
-# ---- Dummy moderngl context for Panel.__init__ ----
-
-class _Dummy:
-    def __getattr__(self, name):
-        return _Dummy()
-    def __call__(self, *a, **kw):
-        return _Dummy()
-    def __setattr__(self, name, val):
-        if name.startswith('_'):
-            object.__setattr__(self, name, val)
-    value = 0
-    size = 1024
-    BLEND = 0
-    SRC_ALPHA = 0
-    ONE_MINUS_SRC_ALPHA = 0
-    filter = (0, 0)
-
-
 class _WGPUPanelMixin:
     """Mixin that overrides Panel's GPU methods with wgpu equivalents."""
 
@@ -156,13 +138,13 @@ class _WGPUPanelMixin:
 
 class WGPUDevOverlay(_WGPUPanelMixin, DevOverlay):
     def __init__(self, device, present_format):
-        DevOverlay.__init__(self, _Dummy())
+        DevOverlay.__init__(self)
         self._init_wgpu(device, present_format)
 
 
 class WGPUUserMenu(_WGPUPanelMixin, UserMenu):
     def __init__(self, device, present_format):
-        UserMenu.__init__(self, _Dummy())
+        UserMenu.__init__(self)
         self._init_wgpu(device, present_format)
         self._cbar_backend = WGPUPanelBackend(device, present_format)
 

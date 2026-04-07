@@ -1,5 +1,4 @@
 // Fullscreen resolve pass: reads accumulation textures, applies colormap.
-// Replaces resolve.vert + resolve.frag.
 
 struct ResolveParams {
     qty_min: f32,
@@ -20,7 +19,7 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
-// Fullscreen triangle: 3 vertices at (-1,-1), (3,-1), (-1,3) cover clip space.
+// Fullscreen triangle.
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     var pos = array<vec2<f32>, 3>(
@@ -58,7 +57,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         val = sqrt(max(mean_sq - mean * mean, 0.0));
     }
 
-    // Map to colormap
     var t: f32;
     if (params.log_scale == 1u) {
         let log_val = log(max(val, 1e-30)) / log(10.0);

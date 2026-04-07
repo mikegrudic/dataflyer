@@ -1,8 +1,4 @@
-"""wgpu backend application: GLFW window + WGPURenderer.
-
-Streamlined main loop that uses wgpu for rendering instead of moderngl.
-Overlays are not yet ported — this provides core rendering only.
-"""
+"""wgpu backend application: GLFW window + WGPURenderer + UI overlays."""
 
 import time
 import atexit
@@ -13,15 +9,22 @@ import wgpu
 from wgpu.utils.glfw_present_info import get_glfw_present_info
 
 from .camera import Camera
-from .data_manager import SnapshotData, find_snapshots
-from .wgpu_renderer import WGPURenderer
+from .data_manager import SnapshotData
+from .wgpu_renderer import WGPURenderer, RenderMode
 from .colormaps import colormap_to_texture_data, AVAILABLE_COLORMAPS
-from .renderer import RenderMode
+from .field_ops import (resolve_field, compute_weights, compute_slot_fields,
+                        combine_fields, make_default_app_state,
+                        is_los_stale, SD_OPS, RENDER_MODES, VECTOR_PROJECTIONS)
 
 
 def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
-                 screenshot=None, benchmark=None, fullscreen=False):
-    """Run the DataFlyer application with the wgpu backend."""
+                 fullscreen=False, screenshot=None):
+    """Run the DataFlyer application with the wgpu backend.
+
+    If `screenshot` is set to a path, the canvas loop runs just long
+    enough for GPU init + auto-range to complete, takes a screenshot,
+    and exits without entering the interactive loop.
+    """
     import os
     snapshot_path = os.path.abspath(snapshot_path)
 
@@ -55,6 +58,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     req_features = set()
     if "float32-blendable" in adapter.features:
         req_features.add("float32-blendable")
+    if "timestamp-query" in adapter.features:
+        req_features.add("timestamp-query")
 
     # Request max storage buffer size the adapter supports (need ~1.6 GB for 134M particles)
     max_ssbo = min(adapter.limits["max-storage-buffer-binding-size"], 2**32 - 1)
@@ -82,7 +87,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     # Camera
     camera = Camera(fov=fov, aspect=width / height)
     boxsize = data.header.get("BoxSize", None)
-    camera.auto_scale(data.positions, boxsize=boxsize)
+    camera.auto_scale(data.positions, masses=data.get_field("Masses"), boxsize=boxsize)
 
     # Renderer
     renderer = WGPURenderer(device, canvas_context, present_format)
@@ -92,13 +97,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     rgba = colormap_to_texture_data("magma")
     renderer.set_colormap(rgba)
 
-    # Load particles — render first frame without grid, then build grid
+    # Load particles. set_particles only stores arrays + n_total; the
+    # actual GPU upload happens in the background-built grid + GPUCompute
+    # init below.
     weights = data.get_field("Masses")
-    renderer.use_tree = False  # skip grid build for instant first frame
     renderer.set_particles(data.positions, data.hsml, weights)
-    renderer.update_visible(camera)
 
-    # Render + present first frame immediately so window is responsive
+    # Render + present an empty first frame immediately so the window
+    # comes up responsive. The GPU upload follows in the canvas tick.
     try:
         renderer.render(camera, fb_w, fb_h)
         canvas_context.present()
@@ -106,25 +112,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     except Exception:
         pass
 
-    # Build grid in background thread so the window stays responsive
     from .gpu_compute import GPUCompute
-    from .spatial_grid import SpatialGrid
-    import threading
-
     gpu_compute = None
-    _bg = {"grid": None, "done": False}  # mutable container for thread result
-
-    def _build_grid_bg():
-        try:
-            _bg["grid"] = SpatialGrid(data.positions, weights, data.hsml, weights)
-            print("  Spatial grid built (background)")
-        except Exception as e:
-            print(f"  Grid build failed: {e}")
-        _bg["done"] = True
-
-    glfw.set_window_title(window, "DataFlyer [wgpu] | Building spatial grid...")
-    grid_thread = threading.Thread(target=_build_grid_bg, daemon=True)
-    grid_thread.start()
+    glfw.set_window_title(window, "DataFlyer [wgpu] | Initializing...")
 
     # UI overlays
     from .wgpu_overlay import WGPUDevOverlay, WGPUUserMenu
@@ -134,33 +124,21 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     _last_message = ""
     _render_mode = RenderMode.surface_density("Masses")
     _cmap_idx = 0
-    _sd_fields = data.available_fields()
-    _vector_fields = data.available_vector_fields()
-    _sd_field = "Masses"
-    _sd_field2 = "None"
-    _sd_op = "*"
-    _render_mode_name = "SurfaceDensity"
-    _wa_data_field = "Masses"
-    _RENDER_MODES = ["SurfaceDensity", "WeightedAverage", "WeightedVariance", "Composite"]
-    _SD_OPS = ["*", "+", "-", "/", "min", "max"]
-    _VECTOR_PROJECTIONS = ["LOS", "|v|", "|v|^2"]
-    _vector_projection = "LOS"
-    _los_camera_fwd = None
-
-    # Composite mode slots
-    _has_vel = "Velocities" in _vector_fields
-    _composite = False
-    _slot = [
-        {"mode": "SurfaceDensity", "weight": "Masses", "data": "Masses",
-         "weight2": "None", "op": "*", "proj": "LOS",
-         "min": -1.0, "max": 3.0, "log": 1, "resolve": 0},
-        {"mode": "WeightedVariance" if _has_vel else "SurfaceDensity",
-         "weight": "Masses",
-         "data": "Velocities" if _has_vel else "Masses",
-         "weight2": "None", "op": "*", "proj": "LOS",
-         "min": -1.0, "max": 3.0, "log": 1,
-         "resolve": 2 if _has_vel else 0},
-    ]
+    _s = make_default_app_state(data)
+    _sd_fields = _s["sd_fields"]
+    _vector_fields = _s["vector_fields"]
+    _sd_field = _s["sd_field"]
+    _sd_field2 = _s["sd_field2"]
+    _sd_op = _s["sd_op"]
+    _render_mode_name = _s["render_mode_name"]
+    _wa_data_field = _s["wa_data_field"]
+    _RENDER_MODES = RENDER_MODES
+    _SD_OPS = SD_OPS
+    _VECTOR_PROJECTIONS = VECTOR_PROJECTIONS
+    _vector_projection = _s["vector_projection"]
+    _los_camera_fwd = _s["los_camera_fwd"]
+    _composite = _s["composite"]
+    _slot = _s["slot"]
 
     # Stars
     if data.n_stars > 0:
@@ -176,45 +154,45 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         gpu_ready_now = gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False)
         fb_w_, fb_h_ = glfw.get_framebuffer_size(window)
 
-        if gpu_ready_now and renderer._grid is not None:
-            # GPU path: write sorted arrays directly, dispatch, render, read back
+        if gpu_ready_now:
+            # GPU subsample path: upload this slot's mass/qty into the
+            # composite slot's per-chunk buffers, bind them as the active
+            # slot, and let _render_accum dispatch the splat draws.
             sorted_mass, sorted_qty = _ensure_slot_sorted(slot_idx)
-            device.queue.write_buffer(gpu_compute._particle_bufs["mass"], 0, sorted_mass.tobytes())
-
-            sl = _state["_slot"][slot_idx]
-            is_los_vec = (sl.get("proj") == "LOS" and
-                          sl["mode"] in ("WeightedAverage", "WeightedVariance") and
-                          sl["data"] in _state["_vector_fields"])
-            if is_los_vec:
-                if not gpu_compute.has_los_field() or getattr(gpu_compute, '_los_field_name', '') != sl["data"]:
-                    gpu_compute.upload_vector_field(renderer._grid, sl["data"], data)
-                gpu_compute.dispatch_los_project(camera)
-            else:
-                device.queue.write_buffer(gpu_compute._particle_bufs["qty"], 0, sorted_qty.tobytes())
-
-            n_out, _, summary_data = gpu_compute.dispatch_cull(
-                camera, renderer.max_render_particles,
-                lod_pixels=renderer.lod_pixels,
-                viewport_width=renderer._viewport_width,
-                summary_overlap=renderer.summary_overlap,
-            )
-            renderer.set_particle_buffers_from_gpu(gpu_compute.get_output_buffers(), n_out)
+            slot_id = _slot_sorted[slot_idx][0]
+            slot_chunks = gpu_compute.upload_subsample_slot(
+                slot_idx, slot_id, sorted_mass, sorted_qty)
+            renderer.set_subsample_slot_chunks(slot_idx, slot_chunks)
+            renderer.set_active_subsample_slot(slot_idx)
+            renderer.n_particles = int(
+                renderer.n_total // max(renderer._subsample_stride, 1))
         else:
-            # CPU fallback
+            # CPU fallback (subsample mode keeps the renderer empty here;
+            # the GPU path is required to actually see anything)
             w, q = app_proxy._compute_slot(s)
             renderer.update_weights(w, q)
-            renderer.update_visible(camera)
 
         renderer._ensure_fbo(fb_w_, fb_h_, which=1)
         renderer._write_camera_uniforms(camera, fb_w_, fb_h_)
         renderer._render_accum(camera, fb_w_, fb_h_, renderer._accum_textures)
-        lo, hi = renderer.read_accum_range()
+        # Lightness (slot 0): mass-weighted entropy, so the surface density
+        # range is set by where the actual mass is. Color (slot 1): raw
+        # entropy on field values, so the dynamic range is the full spread
+        # of the field itself rather than wherever it happens to be dense.
+        lo, hi = renderer.read_accum_range(mass_weighted=(slot_idx == 0))
         s["min"] = lo
         s["max"] = hi
         print(f"Auto-range {label}: {lo:.3g} .. {hi:.3g}")
 
+    def _adjust_range(rend, factor):
+        mid = (rend.qty_min + rend.qty_max) / 2
+        half = (rend.qty_max - rend.qty_min) / 2 * factor
+        rend.qty_min = mid - half
+        rend.qty_max = mid + half
+
     def key_callback(win, key, scancode, action, mods):
         nonlocal user_lod, user_budget, _cmap_idx, needs_auto_range, ui_hidden
+        nonlocal subsample_cap_ceiling, last_subsample_cap
         if user_menu.on_key(key, action):
             return
         if action == glfw.PRESS:
@@ -243,25 +221,31 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 user_lod = renderer.lod_pixels
                 print(f"LOD: {renderer.lod_pixels}px (faster)")
             elif key == glfw.KEY_PERIOD:
-                renderer.max_render_particles = min(
-                    renderer.n_total, int(renderer.max_render_particles * 2))
-                user_budget = renderer.max_render_particles
-                print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
+                # Raise the auto-LOD subsample-cap ceiling. The cap
+                # itself adapts within [floor, ceiling]; this knob is
+                # the ceiling. SUBSAMPLE_CAP_HARD_LIMIT is the hard
+                # upper bound for safe GPU buffer / dispatch limits.
+                subsample_cap_ceiling = min(
+                    SUBSAMPLE_CAP_HARD_LIMIT,
+                    int(subsample_cap_ceiling * 2))
+                print(f"Subsample cap ceiling: "
+                      f"{subsample_cap_ceiling/1e6:.1f}M")
             elif key == glfw.KEY_COMMA:
-                renderer.max_render_particles = max(
-                    1_000, renderer.max_render_particles // 2)
-                user_budget = renderer.max_render_particles
-                print(f"Max particles: {renderer.max_render_particles/1e6:.1f}M")
+                subsample_cap_ceiling = max(
+                    500_000, subsample_cap_ceiling // 2)
+                # Clamp the running cap so the change is felt
+                # immediately, not just at the next motion frame.
+                last_subsample_cap = min(last_subsample_cap,
+                                         subsample_cap_ceiling)
+                renderer.set_subsample_max_per_frame(
+                    min(renderer._subsample_max_per_frame,
+                        subsample_cap_ceiling))
+                print(f"Subsample cap ceiling: "
+                      f"{subsample_cap_ceiling/1e6:.1f}M")
             elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
-                mid = (renderer.qty_min + renderer.qty_max) / 2
-                half = (renderer.qty_max - renderer.qty_min) / 2 * 0.8
-                renderer.qty_min = mid - half
-                renderer.qty_max = mid + half
+                _adjust_range(renderer, 0.8)
             elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
-                mid = (renderer.qty_min + renderer.qty_max) / 2
-                half = (renderer.qty_max - renderer.qty_min) / 2 * 1.25
-                renderer.qty_min = mid - half
-                renderer.qty_max = mid + half
+                _adjust_range(renderer, 1.25)
             elif key == glfw.KEY_C:
                 nonlocal _cmap_idx
                 _cmap_idx = (_cmap_idx + 1) % len(AVAILABLE_COLORMAPS)
@@ -269,7 +253,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 renderer.set_colormap(colormap_to_texture_data(AVAILABLE_COLORMAPS[_cmap_idx]))
                 _state["_cmap_idx"] = _cmap_idx
             elif key == glfw.KEY_P:
-                renderer.screenshot(f"dataflyer_{int(time.time())}.png")
+                _take_screenshot()
             elif key == glfw.KEY_F1 or key == glfw.KEY_BACKSLASH:
                 overlay.enabled = not overlay.enabled
             elif key == glfw.KEY_TAB:
@@ -289,6 +273,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         "_vector_fields": _vector_fields,
         "_vector_projection": _vector_projection,
         "_los_camera_fwd": _los_camera_fwd,
+        "_los_camera_pos": None,
         "_cmap_idx": _cmap_idx,
         "_slot": _slot,
         "_needs_auto_range": False,
@@ -309,94 +294,33 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             _state[name] = value
 
         def _project_field(self, field_name):
-            import numpy as np
-            if field_name in _state["_vector_fields"]:
-                vec = data.get_vector_field(field_name)
-                proj = _state["_vector_projection"]
-                if proj == "LOS":
-                    fwd = camera.forward.copy()
-                    _state["_los_camera_fwd"] = fwd.copy()
-                    return (vec @ fwd).astype(np.float32)
-                elif proj == "|v|":
-                    return np.linalg.norm(vec, axis=1).astype(np.float32)
-                else:
-                    return (vec * vec).sum(axis=1).astype(np.float32)
-            return data.get_field(field_name)
+            if field_name in _state["_vector_fields"] and _state["_vector_projection"] == "LOS":
+                _state["_los_camera_fwd"] = camera.forward.copy()
+                _state["_los_camera_pos"] = camera.position.copy()
+            return resolve_field(field_name, _state["_vector_fields"], data,
+                                 _state["_vector_projection"], camera.forward,
+                                 camera_position=camera.position)
 
         def _compute_weights(self):
-            import numpy as np
-            w = self._project_field(_state["_sd_field"])
-            f2 = _state.get("_sd_field2", "None")
-            if f2 != "None":
-                w2 = self._project_field(f2)
-                op = _state.get("_sd_op", "*")
-                if op == "*": w = w * w2
-                elif op == "+": w = w + w2
-                elif op == "-": w = w - w2
-                elif op == "/": w = w / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
-                elif op == "min": w = np.minimum(w, w2)
-                elif op == "max": w = np.maximum(w, w2)
-            return w
+            if _state["_sd_field"] in _state["_vector_fields"] and _state["_vector_projection"] == "LOS":
+                _state["_los_camera_fwd"] = camera.forward.copy()
+                _state["_los_camera_pos"] = camera.position.copy()
+            return compute_weights(
+                _state["_sd_field"], _state.get("_sd_field2", "None"),
+                _state.get("_sd_op", "*"), _state["_vector_fields"], data,
+                _state["_vector_projection"], camera.forward,
+                camera_position=camera.position)
 
         def _compute_slot(self, slot):
             """Compute weights and qty for a composite slot dict."""
-            s = slot
-            w_name = s["weight"]
-            if w_name in _state["_vector_fields"]:
-                vec = data.get_vector_field(w_name)
-                proj = s["proj"]
-                if proj == "LOS":
-                    weights = (vec @ camera.forward).astype(np.float32)
-                elif proj == "|v|":
-                    weights = np.linalg.norm(vec, axis=1).astype(np.float32)
-                else:
-                    weights = (vec * vec).sum(axis=1).astype(np.float32)
-            else:
-                weights = data.get_field(w_name)
-                if s.get("weight2", "None") != "None":
-                    w2_name = s["weight2"]
-                    if w2_name in _state["_vector_fields"]:
-                        vec = data.get_vector_field(w2_name)
-                        proj = s["proj"]
-                        if proj == "LOS":
-                            w2 = (vec @ camera.forward).astype(np.float32)
-                        elif proj == "|v|":
-                            w2 = np.linalg.norm(vec, axis=1).astype(np.float32)
-                        else:
-                            w2 = (vec * vec).sum(axis=1).astype(np.float32)
-                    else:
-                        w2 = data.get_field(w2_name)
-                    op = s.get("op", "*")
-                    if op == "*": weights = weights * w2
-                    elif op == "+": weights = weights + w2
-                    elif op == "-": weights = weights - w2
-                    elif op == "/": weights = weights / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
-                    elif op == "min": weights = np.minimum(weights, w2)
-                    elif op == "max": weights = np.maximum(weights, w2)
-
-            if s["mode"] in ("WeightedAverage", "WeightedVariance"):
-                d_name = s["data"]
-                if d_name in _state["_vector_fields"]:
-                    vec = data.get_vector_field(d_name)
-                    proj = s["proj"]
-                    if proj == "LOS":
-                        qty = (vec @ camera.forward).astype(np.float32)
-                    elif proj == "|v|":
-                        qty = np.linalg.norm(vec, axis=1).astype(np.float32)
-                    else:
-                        qty = (vec * vec).sum(axis=1).astype(np.float32)
-                else:
-                    qty = data.get_field(d_name)
-            else:
-                qty = None
-
-            resolve = {"SurfaceDensity": 0, "WeightedAverage": 1, "WeightedVariance": 2}[s["mode"]]
-            s["resolve"] = resolve
-            return weights, qty
+            return compute_slot_fields(slot, _state["_vector_fields"], data,
+                                       camera.forward,
+                                       camera_position=camera.position)
 
         def _apply_render_mode(self, auto_range=True):
             nonlocal _render_mode, needs_auto_range, refine_budget, refine_saved_lod, refine_saved_budget
             _state["_los_camera_fwd"] = None
+            _state["_los_camera_pos"] = None
             refine_budget = 0
             refine_saved_lod = None
             refine_saved_budget = None
@@ -407,11 +331,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             if mode == "Composite":
                 _render_mode = RenderMode(name="Composite", weight_field="", qty_field="", resolve_mode=-1)
                 # Pre-populate slot caches then auto-range
-                if renderer._grid is not None:
-                    for si in range(2):
-                        _ensure_slot_sorted(si)
-                    _auto_range_composite_slot(0, "Lightness")
-                    _auto_range_composite_slot(1, "Color")
+                for si in range(2):
+                    _ensure_slot_sorted(si)
+                _auto_range_composite_slot(0, "Lightness")
+                _auto_range_composite_slot(1, "Color")
                 return
 
             if mode in ("WeightedAverage", "WeightedVariance"):
@@ -430,13 +353,25 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 renderer.resolve_mode = 0
 
             renderer.update_weights(weights, qty)
-            if gpu_compute is not None and renderer._grid is not None:
-                gpu_compute.upload_weights(renderer._grid)
-                _uses_los = (_state["_vector_projection"] == "LOS" and
-                             _state.get("_wa_data_field", "") in _state["_vector_fields"])
-                if _uses_los:
-                    gpu_compute.upload_vector_field(renderer._grid,
-                                                   _state["_wa_data_field"], data)
+            print(f"  [diag] mode={mode} n_total={renderer.n_total} "
+                  f"n_particles={renderer.n_particles} "
+                  f"lod_pixels={renderer.lod_pixels:.1f} "
+                  f"resolve_mode={renderer.resolve_mode} "
+                  f"chunks={renderer._subsample_chunks is not None} "
+                  f"max_per_frame={renderer._subsample_max_per_frame}", flush=True)
+            if gpu_compute is not None:
+                _t = time.perf_counter()
+                gpu_compute.upload_weights(
+                    renderer._all_mass, renderer._all_qty)
+                print(f"  [diag] upload_weights: {(time.perf_counter()-_t)*1000:.0f}ms", flush=True)
+                # GPU LOS projection isn't wired into the subsample path
+                # (would need to update qty across every per-chunk buffer
+                # per camera rotation). The CPU _project_field above
+                # already produced the right LOS-projected qty for the
+                # current camera orientation; subsequent rotations will
+                # render with stale qty until the user re-applies the
+                # render mode (the canvas tick re-fires _apply_render_mode
+                # when LOS staleness is detected).
             if auto_range:
                 needs_auto_range = True
 
@@ -485,98 +420,162 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
     needs_auto_range = True
     ui_hidden = False
-    _gpu_upload_iter = None  # chunked upload iterator
-
     # Main loop state
     last_time = time.perf_counter()
     frame_count = 0
     fps_time = time.perf_counter()
+    # Wall-clock duration of the previous renderer.render() call. This is
+    # the only signal that reflects real GPU latency (encode/submit are
+    # async). Used by the subsample cap-growth gate so we don't overshoot
+    # into a backlogged swapchain.
+    last_render_ms = 0.0
+    smooth_render_ms = 0.0  # EMA of last_render_ms
     fps = 0.0
+
+    # Idle-frame short-circuit. We re-render only when something visible
+    # could have changed. Tracked: camera movement, framebuffer resize,
+    # _state mutations (qty range, log, render mode, colormap, composite
+    # slot params), the per-frame subsample cap (progressive refinement),
+    # current LOD, and pending auto-range. When none changed we skip
+    # render+overlay+submit entirely and sleep briefly.
+    dirty = True
+    prev_state_sig = None
+    prev_cap = None
+    prev_lod_pixels = None
+    prev_n_particles = None
+    prev_fb_size = (0, 0)
+    # Number of consecutive idle frames seen. We only start sleeping
+    # after a few in a row so a transient `moved=False` frame in the
+    # middle of a slow rotation doesn't introduce a visible stutter.
+    idle_streak = 0
+    IDLE_STREAK_THRESHOLD = 6
+    # Throttle LOS-projection recomputes during motion. _apply_render_mode
+    # does a full CPU LOS projection over every particle and can take
+    # hundreds of ms on big snapshots, so firing it every ~1.15° rotation
+    # step would tank the framerate. While the camera is moving we cap
+    # the rate; once the camera stops the gate opens immediately so the
+    # final image is fresh.
+    last_los_recompute_time = 0.0
+    LOS_MOVING_THROTTLE_S = 0.15
+    # Tracks the camera position from the previous frame so we can
+    # detect translations independently of rotations. Per-particle LOS
+    # is invariant under rotation, so only translations should freeze
+    # the slot LOS cache.
+    prev_camera_pos = camera.position.copy()
 
     # Progressive refinement / auto-LOD state
     was_moving = False
-    last_cull_time = 0.0
     user_lod = renderer.lod_pixels
     user_budget = renderer.max_render_particles
+    # Per-frame instance cap for the compute-driven splat path. Initialized
+    # to 4M; afterwards adapted to the highest cap that sustained target FPS.
+    last_subsample_cap = 4_000_000
+    # Auto-LOD ceiling for the per-frame subsample cap. The cap adapts
+    # within [floor, ceiling]; the , / . keys halve / double this.
+    # SUBSAMPLE_CAP_HARD_LIMIT is the upper bound (safe GPU dispatch /
+    # buffer headroom on commodity hardware).
+    SUBSAMPLE_CAP_HARD_LIMIT = 200_000_000
+    subsample_cap_ceiling = 16_000_000
+    # Don't grow the cap before the user has moved the camera at least
+    # once — startup has no FPS history to validate growth against.
+    has_moved_ever = False
+    # Frames to wait before firing the post-init auto-range. Set when
+    # GPU subsample chunks are first wired up.
+    pending_auto_range_frames = 0
     smooth_frame_ms = 0.0
     smooth_fps_ema = 0.0
-    last_lod_adjust = 0.0
-    pid_prev_error = 0.0
-    pid_integral = 0.0
     refine_budget = 0
+    # Last lod_pixels value at which the smoothed frame time was at or below
+    # target. Used to restart camera motion at a known-sustainable quality
+    # instead of starting at the user's manual LOD and overshooting.
+    last_sustainable_lod = renderer.lod_pixels
+    auto_lod_warmup_frames = 0  # frames remaining where auto-LOD is suppressed
     refine_saved_lod = None
     refine_saved_budget = None
 
     # Pre-sort and cache slot weight arrays (done once per slot config change)
     _slot_sorted = [None, None]  # (slot_id, sorted_mass, sorted_qty) per slot
 
-    def _ensure_slot_sorted(slot_idx):
+    def _ensure_slot_sorted(slot_idx, freeze_los_key=False):
         """Ensure sorted mass/qty arrays are cached for this slot. Returns (mass, qty).
 
-        For LOS vector qty fields, qty is a placeholder — GPU projection handles it.
-        Only the weight (mass) array needs to be sorted on CPU.
+        For LOS vector qty fields, qty was historically a placeholder — the
+        GPU LOS projection path filled it in. The subsample-mode pipeline
+        doesn't run GPU LOS projection, so we always compute qty on the CPU
+        here. The result is correct at the current camera orientation and
+        becomes stale on rotation; the canvas loop calls _apply_render_mode
+        again when LOS staleness is detected.
+
+        `freeze_los_key=True` makes the cache key ignore the current
+        camera direction for LOS vector slots (any cached entry, regardless
+        of which forward it was computed at, will be reused). The
+        per-frame composite render path uses this during camera motion to
+        avoid a ~1.5 s/frame CPU reprojection on every micro-rotation —
+        the stale projection is acceptable while the user is rotating;
+        once they stop, the gate opens and the next frame refreshes once.
         """
         sl = _state["_slot"][slot_idx]
+        # When the slot uses an LOS-projected vector field, the cached
+        # projection depends on the camera direction — include a
+        # quantized forward in the cache key so a rotation invalidates
+        # the entry.
+        is_los_vec = (sl.get("proj") == "LOS"
+                      and (sl["weight"] in _state["_vector_fields"]
+                           or sl.get("weight2", "None") in _state["_vector_fields"]
+                           or (sl["mode"] in ("WeightedAverage", "WeightedVariance")
+                               and sl["data"] in _state["_vector_fields"])))
+        if is_los_vec and not freeze_los_key:
+            # Per-particle LOS depends only on camera *position*
+            # (rotation leaves the camera→particle direction unchanged).
+            pos_key = tuple(int(round(float(c) * 1000)) for c in camera.position)
+        else:
+            pos_key = None
         slot_id = (sl["weight"], sl.get("weight2", "None"), sl.get("op", "*"),
-                   sl["mode"], sl["data"], sl.get("proj", "LOS"))
+                   sl["mode"], sl["data"], sl.get("proj", "LOS"), pos_key)
         cached = _slot_sorted[slot_idx]
         if cached is not None and cached[0] == slot_id:
             return cached[1], cached[2]
 
-        # Only compute the weight field — skip qty for LOS (GPU handles it)
-        is_los_qty = (sl.get("proj") == "LOS" and
-                      sl["mode"] in ("WeightedAverage", "WeightedVariance") and
-                      sl["data"] in _state["_vector_fields"])
+        # Compute weight (and optional second weight field) on the CPU.
+        # The GPU upload path is in raw particle order, so no sort is
+        # applied here.
+        proj = sl.get("proj", "LOS")
+        vf = _state["_vector_fields"]
+        w = resolve_field(sl["weight"], vf, data, proj, camera.forward,
+                          camera_position=camera.position)
+        w2_name = sl.get("weight2", "None")
+        if w2_name != "None":
+            w2 = resolve_field(w2_name, vf, data, proj, camera.forward,
+                               camera_position=camera.position)
+            w = combine_fields(w, w2, sl.get("op", "*"))
+        sm = w.astype(np.float32)
 
-        # Compute weight
-        w_name = sl["weight"]
-        if w_name in _state["_vector_fields"]:
-            vec = data.get_vector_field(w_name)
-            proj = sl.get("proj", "LOS")
-            if proj == "LOS":
-                w = (vec @ camera.forward).astype(np.float32)
-            elif proj == "|v|":
-                w = np.linalg.norm(vec, axis=1).astype(np.float32)
-            else:
-                w = (vec * vec).sum(axis=1).astype(np.float32)
-        else:
-            w = data.get_field(w_name)
-            if sl.get("weight2", "None") != "None":
-                w2 = data.get_field(sl["weight2"])
-                op = sl.get("op", "*")
-                if op == "*": w = w * w2
-                elif op == "+": w = w + w2
-                elif op == "-": w = w - w2
-                elif op == "/": w = w / np.maximum(np.abs(w2), 1e-30) * np.sign(w2)
-                elif op == "min": w = np.minimum(w, w2)
-                elif op == "max": w = np.maximum(w, w2)
-
-        so = renderer._grid.sort_order
-        sm = w[so].astype(np.float32)
-
-        if is_los_qty:
-            # Placeholder — GPU LOS projection will fill qty buffer
-            sq = sm  # won't be used
-        elif sl["mode"] in ("WeightedAverage", "WeightedVariance"):
-            d_name = sl["data"]
-            if d_name in _state["_vector_fields"]:
-                vec = data.get_vector_field(d_name)
-                proj = sl.get("proj", "LOS")
-                if proj == "|v|":
-                    q = np.linalg.norm(vec, axis=1).astype(np.float32)
-                else:
-                    q = (vec * vec).sum(axis=1).astype(np.float32)
-            else:
-                q = data.get_field(d_name)
-            sq = q[so].astype(np.float32)
+        if sl["mode"] in ("WeightedAverage", "WeightedVariance"):
+            q = resolve_field(sl["data"], vf, data, proj, camera.forward,
+                              camera_position=camera.position)
+            sq = q.astype(np.float32)
         else:
             sq = sm
 
         _slot_sorted[slot_idx] = (slot_id, sm, sq)
         return sm, sq
 
-    def _render_composite_frame(fb_w, fb_h):
-        """Render two fields into separate FBOs and composite them."""
+    def _render_composite_frame(fb_w, fb_h, encoder=None, screen_view=None,
+                                freeze_los_key=False):
+        """Render two fields into separate FBOs and composite them.
+
+        If `encoder` and `screen_view` are provided, all sub-passes (two
+        accum passes + one composite resolve) are appended to the shared
+        encoder and the caller submits. Otherwise the legacy path runs
+        each sub-call with its own encoder+submit.
+
+        `freeze_los_key=True` (passed from the main loop while the
+        camera is rotating) makes the LOS vector slot cache ignore the
+        current camera forward, so we don't pay a ~1.5 s/frame CPU
+        reprojection on every micro-rotation. The cached LOS field is
+        slightly stale during motion; on stop the gate opens and the
+        next frame recomputes once with the fresh forward.
+        """
         renderer._ensure_fbo(fb_w, fb_h, which=1)
         renderer._ensure_fbo(fb_w, fb_h, which=2)
 
@@ -585,91 +584,70 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
         for i in range(2):
             sl = _state["_slot"][i]
-
-            cache_ready = _slot_sorted[i] is not None
-            if gpu_ready_now and renderer._grid is not None and cache_ready:
-                sorted_mass, sorted_qty = _slot_sorted[i][1], _slot_sorted[i][2]
+            if gpu_ready_now:
+                # Subsample path: ensure the slot's sorted mass/qty is
+                # cached for the *current* camera direction (the cache
+                # key includes a quantized fwd for LOS slots), then
+                # upload to the slot's per-chunk buffers and render.
+                sorted_mass, sorted_qty = _ensure_slot_sorted(
+                    i, freeze_los_key=freeze_los_key)
                 slot_id = _slot_sorted[i][0]
-
-                # Upload to persistent per-slot GPU buffers (no-op if unchanged)
-                gpu_compute.upload_slot_data(i, slot_id, sorted_mass, sorted_qty)
-
-                # GPU-to-GPU copy from slot buffers to active particle buffers (~1ms)
-                gpu_compute.activate_slot(i)
-
-                # For LOS vector fields: overwrite qty with GPU projection
-                is_los_vec = (sl.get("proj") == "LOS" and
-                              sl["mode"] in ("WeightedAverage", "WeightedVariance") and
-                              sl["data"] in _state["_vector_fields"])
-                if is_los_vec:
-                    if not gpu_compute.has_los_field() or getattr(gpu_compute, '_los_field_name', '') != sl["data"]:
-                        gpu_compute.upload_vector_field(renderer._grid, sl["data"], data)
-                    gpu_compute.dispatch_los_project(camera)
-
-                n_out, n_vis, summary_data = gpu_compute.dispatch_cull(
-                    camera, renderer.max_render_particles,
-                    lod_pixels=renderer.lod_pixels,
-                    viewport_width=renderer._viewport_width,
-                    summary_overlap=renderer.summary_overlap,
-                )
-                renderer.set_particle_buffers_from_gpu(gpu_compute.get_output_buffers(), n_out)
-                s_pos, s_hsml, s_mass, s_qty, s_cov = summary_data
-                if renderer.use_aniso_summaries and len(s_pos) > 0:
-                    renderer._upload_aniso_summaries(s_pos, s_mass, s_qty, s_cov)
-                else:
-                    renderer._upload_aniso_summaries(
-                        np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                        np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
+                slot_chunks = gpu_compute.upload_subsample_slot(
+                    i, slot_id, sorted_mass, sorted_qty)
+                renderer.set_subsample_slot_chunks(i, slot_chunks)
+                renderer.set_active_subsample_slot(i)
+                renderer.n_particles = int(
+                    renderer.n_total // max(renderer._subsample_stride, 1))
             else:
                 w, q = app_proxy._compute_slot(sl)
                 renderer.update_weights(w, q)
-                renderer.update_visible(camera)
 
             renderer._write_camera_uniforms(camera, fb_w, fb_h)
-            renderer._render_accum(camera, fb_w, fb_h, accum_sets[i])
+            renderer._render_accum(camera, fb_w, fb_h, accum_sets[i],
+                                   encoder=encoder)
+        # Reset active slot so non-composite passes use the default path.
+        renderer.set_active_subsample_slot(None)
 
         s0, s1 = _state["_slot"][0], _state["_slot"][1]
         renderer.render_composite(
             camera, fb_w, fb_h,
             s0["resolve"], s0["min"], s0["max"], s0["log"],
             s1["resolve"], s1["min"], s1["max"], s1["log"],
+            encoder=encoder, screen_view=screen_view,
         )
 
     def do_cull():
-        """Run cull via GPU compute (zero-copy) or CPU fallback."""
-        if gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False):
-            n_out, n_vis, summary_data = gpu_compute.dispatch_cull(
-                camera, renderer.max_render_particles,
-                lod_pixels=renderer.lod_pixels,
-                viewport_width=renderer._viewport_width,
-                summary_overlap=renderer.summary_overlap,
-            )
-            # Zero-copy: point renderer at compute output buffers
-            renderer.set_particle_buffers_from_gpu(gpu_compute.get_output_buffers(), n_out)
-            # Upload summaries (few, still CPU)
-            s_pos, s_hsml, s_mass, s_qty, s_cov = summary_data
-            if renderer.use_aniso_summaries and len(s_pos) > 0:
-                renderer._upload_aniso_summaries(s_pos, s_mass, s_qty, s_cov)
-            else:
-                renderer._upload_aniso_summaries(
-                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                    np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
+        """Update the subsample stride from the auto-LOD lod_pixels.
+        Cull/sampling happens inside the vertex shader at draw time.
+        """
+        if gpu_compute is None or not getattr(gpu_compute, '_upload_ready', False):
+            return
+        stride = max(float(renderer.lod_pixels), 1.0)
+        renderer.set_subsample_stride(stride)
+        renderer.n_particles = int(renderer.n_total // max(stride, 1.0))
+        renderer._last_cull_ms = 0.0
+        renderer._last_upload_ms = 0.0
+
+    def _take_screenshot(path=None):
+        """Render the current view at full framebuffer resolution into
+        an offscreen texture and save it. Filename defaults to
+        dataflyer_<timestamp>.png in the cwd.
+        """
+        import os
+        if path is None:
+            path = f"dataflyer_{int(time.time())}.png"
+        fb_w_, fb_h_ = glfw.get_framebuffer_size(window)
+        if _state["_composite"]:
+            s0 = _state["_slot"][0]
+            s1 = _state["_slot"][1]
+            comp = (s0["resolve"], s0["min"], s0["max"], s0["log"],
+                    s1["resolve"], s1["min"], s1["max"], s1["log"])
+            renderer.screenshot(path, fb_w_, fb_h_, camera, composite_args=comp)
         else:
-            renderer.update_visible(camera)
+            renderer.screenshot(path, fb_w_, fb_h_, camera)
+        return os.path.abspath(path)
 
-    # --- Benchmark mode ---
-    if benchmark is not None:
-        _run_wgpu_benchmark(
-            benchmark, window, canvas_context, device, renderer, camera, data,
-            gpu_compute, _bg, grid_thread, do_cull, fb_w, fb_h,
-            user_lod, user_budget, app_proxy,
-        )
-        renderer.release()
-        data.close()
-        glfw.destroy_window(window)
-        return
-
-    print("DataFlyer [wgpu] running. WASD=move, mouse=look, ESC=quit, R=auto-range.")
+    print("DataFlyer [wgpu] running. WASD=move, mouse=look, ESC=quit, R=auto-range, P=screenshot.")
 
     while not glfw.window_should_close(window):
         now = time.perf_counter()
@@ -682,72 +660,110 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             fps = frame_count / (now - fps_time)
             frame_count = 0
             fps_time = now
-            n_vis = renderer.n_particles + renderer.n_aniso
+            n_vis = renderer.n_particles
             n_tot = renderer.n_total
+            init_msg = " | Initializing GPU..." if gpu_compute is None else ""
             glfw.set_window_title(
                 window,
-                f"DataFlyer [wgpu] | {fps:.0f} fps | {n_vis/1e6:.1f}M/{n_tot/1e6:.1f}M"
+                f"DataFlyer [wgpu] | {fps:.0f} fps | {n_vis/1e6:.1f}M/{n_tot/1e6:.1f}M{init_msg}"
             )
 
         glfw.poll_events()
 
-        # Pick up background grid build when complete
-        if _bg["done"] and _bg["grid"] is not None and renderer._grid is None:
-            renderer._grid = _bg["grid"]
-            renderer.use_tree = True
-            # Do one CPU cull to get initial visible data
-            renderer.update_visible(camera)
-            needs_auto_range = True
-            _bg["grid"] = None  # don't repeat
-
-        # GPU compute init (blocking upload once grid is available)
+        # GPU subsample pipeline init (one-time upload, first frame).
         gpu_ready = getattr(gpu_compute, '_upload_ready', False)
-        # Only use GPU compute for datasets large enough to benefit (>10M particles)
-        GPU_COMPUTE_THRESHOLD = 10_000_000
-        if (not gpu_ready and gpu_compute is None and renderer._grid is not None
-                and renderer.n_total >= GPU_COMPUTE_THRESHOLD):
+        if not gpu_ready and gpu_compute is None:
             try:
                 gpu_compute = GPUCompute(device)
-                gpu_compute.upload_snapshot(renderer._grid)
+                gpu_compute.upload_subsample_only(
+                    renderer._all_pos, renderer._all_hsml,
+                    renderer._all_mass, renderer._all_qty)
+                renderer.set_subsample_chunks(
+                    gpu_compute.get_chunk_bufs(),
+                    world_offset=gpu_compute.get_pos_offset())
+                renderer.set_subsample_stride(int(max(renderer.lod_pixels, 1)))
+                # Prime renderer.n_particles so the first render() call
+                # doesn't early-out before the user has moved.
+                do_cull()
+                print("  GPU subsample pipeline initialized")
+                # Defer the post-init auto-range a few frames so the
+                # GPU has actually rendered something into the FBO
+                # before we read it back. The pre-init auto-range that
+                # fires from set_particles ran against an empty FBO
+                # so its qty range is garbage.
+                pending_auto_range_frames = 3
+                needs_auto_range = False
                 gpu_ready = True
-                print("  GPU compute pipeline initialized (zero-copy)")
             except Exception as e:
                 print(f"  GPU compute init failed: {e}")
                 gpu_compute = None
 
         # Camera movement
         moved = camera.update(dt)
+        # Per-particle LOS depends on camera position only, not on
+        # orientation, so detect translation separately from rotation.
+        translated = bool(np.any(camera.position != prev_camera_pos))
+        prev_camera_pos = camera.position.copy()
 
-        # GPU-side LOS projection: update qty buffer when camera rotates
-        if (gpu_compute is not None and gpu_ready and gpu_compute.has_los_field()
-                and _state["_vector_projection"] == "LOS"):
-            los_fwd = _state.get("_los_camera_fwd")
-            if los_fwd is None or float(np.dot(los_fwd, camera.forward)) < 0.9998:
-                gpu_compute.dispatch_los_project(camera)
-                _state["_los_camera_fwd"] = camera.forward.copy()
-        elif not moved:
-            # CPU fallback for non-GPU LOS (when gpu_compute not ready)
-            def _is_los_stale():
-                # Check if any active field is a vector with LOS projection
-                uses_vector = False
-                if _state["_render_mode_name"] in ("WeightedAverage", "WeightedVariance"):
-                    if _state["_wa_data_field"] in _vector_fields:
-                        uses_vector = True
-                if _state["_sd_field"] in _vector_fields:
-                    uses_vector = True
-                sd_f2 = _state.get("_sd_field2", "None")
-                if sd_f2 != "None" and sd_f2 in _vector_fields:
-                    uses_vector = True
-                if not uses_vector:
-                    return False
-                if _state["_vector_projection"] != "LOS":
-                    return False
-                if _state["_los_camera_fwd"] is None:
-                    return True
-                dot = float(np.dot(_state["_los_camera_fwd"], camera.forward))
-                return dot < 0.9998
-            if _is_los_stale():
+        # Subsample per-frame instance cap. Init to 4M (used only at the
+        # very first frame); after that the cap learns the highest value
+        # that sustained the target FPS during motion ("last sustainable")
+        # and resets to that on motion start. Stopped frames grow the cap
+        # for progressive refinement, but only after the user has moved
+        # at least once and only when the previous frame met its target
+        # (so we never over-extend with no FPS history to validate).
+        target_ms = 1000.0 / max(renderer.target_fps, 1.0)
+        # Smoothed render-time EMA, fed by last_render_ms (not dt). dt
+        # measures how often Python loops; render-time measures how
+        # long the GPU actually takes to retire each frame.
+        if last_render_ms > 0:
+            smooth_render_ms = (0.85 * smooth_render_ms + 0.15 * last_render_ms
+                                if smooth_render_ms > 0 else last_render_ms)
+        if moved:
+            has_moved_ever = True
+            if not was_moving:
+                renderer.set_subsample_max_per_frame(last_subsample_cap)
+            if smooth_render_ms > 0:
+                cur_cap = renderer._subsample_max_per_frame
+                if smooth_render_ms < target_ms * 0.9:
+                    last_subsample_cap = min(subsample_cap_ceiling, int(cur_cap * 1.1) + 1)
+                    renderer.set_subsample_max_per_frame(last_subsample_cap)
+                elif smooth_render_ms > target_ms * 1.2:
+                    last_subsample_cap = max(500_000, int(cur_cap * 0.85))
+                    renderer.set_subsample_max_per_frame(last_subsample_cap)
+                else:
+                    last_subsample_cap = cur_cap
+        elif has_moved_ever:
+            # Stopped after at least one motion: refine progressively.
+            # The growth gate uses last_render_ms (wall-clock duration of
+            # the previous renderer.render() call), which captures real
+            # GPU latency via get_current_texture's swapchain block.
+            # Python's `dt` is a useless signal here — Metal queues
+            # encode/submit asynchronously and Python keeps racing
+            # ahead, so dt stays small even when the GPU is buried.
+            cur = renderer._subsample_max_per_frame
+            REFINE_FRAME_MS = 100.0
+            if 0 < last_render_ms <= REFINE_FRAME_MS and cur < subsample_cap_ceiling:
+                renderer.set_subsample_max_per_frame(
+                    min(int(cur * 1.4) + 1, subsample_cap_ceiling))
+
+        # Per-particle LOS depends only on camera position, so the
+        # cached projection is invalid only when the camera has
+        # *translated* (rotation is free). Skip the recompute while
+        # translation is in progress — it's too expensive (full CPU LOS
+        # pass over every particle) to run mid-flight on large
+        # snapshots; once the user stops translating, the gate opens
+        # and the next frame refreshes once.
+        if not translated:
+            if is_los_stale(_state["_render_mode_name"], _state["_wa_data_field"],
+                            _state["_sd_field"], _state.get("_sd_field2", "None"),
+                            _vector_fields, _state["_vector_projection"],
+                            _state.get("_los_camera_fwd"), camera.forward,
+                            los_camera_pos=_state.get("_los_camera_pos"),
+                            camera_position=camera.position):
                 app_proxy._apply_render_mode(auto_range=True)
+                last_los_recompute_time = now
+                dirty = True
 
         # --- Cull / progressive refinement / auto-LOD ---
         # Composite mode: progressive refinement via budget, cull happens in _render_composite_frame
@@ -760,11 +776,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     refine_saved_budget = None
                 refine_budget = 0
                 if not was_moving and renderer.auto_lod:
-                    renderer.lod_pixels = max(user_lod, 8)
-                    renderer.max_render_particles = min(user_budget, 2_000_000)
+                    renderer.lod_pixels = float(last_sustainable_lod)
+                    renderer.max_render_particles = user_budget
 
                 if not was_moving:
-                    pid_integral = 0.0
+                    smooth_fps_ema = max(renderer.target_fps, 1.0)
+                    smooth_frame_ms = 1000.0 / smooth_fps_ema
 
                 # Smoothed frame time (unbiased EMA of frame rate)
                 import math
@@ -774,24 +791,34 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     fps_inst = 1.0 / dt
                     smooth_fps_ema = (1 - a) * smooth_fps_ema + a * fps_inst
                     smooth_frame_ms = 1000.0 / max(smooth_fps_ema, 0.01)
-                # PID auto-LOD on log2(budget)
-                if renderer.auto_lod and smooth_frame_ms > 0 and dt > 0:
+                # Auto-LOD on log2(lod_pixels). Symmetric proportional with
+                # deadband to prevent drift from frame-time jitter.
+                if (renderer.auto_lod and smooth_frame_ms > 0 and dt > 0
+                        and was_moving):
                     target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-                    error = math.log2(max(smooth_frame_ms / target_ms, 0.01))
-                    pid_integral += error * dt
-                    pid_integral = max(-4.0, min(4.0, pid_integral))
-                    derivative = (error - pid_prev_error) / dt
-                    pid_prev_error = error
-                    rate = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
-                    output = rate * dt
-                    log2_budget = math.log2(max(renderer.max_render_particles, 1_000))
-                    log2_budget -= output
-                    log2_n = math.log2(max(renderer.n_total, 1))
-                    log2_budget = max(math.log2(1_000), min(log2_n, log2_budget))
-                    renderer.max_render_particles = max(1_000, min(
-                        renderer.n_total, int(2 ** log2_budget)))
-                    frac = renderer.max_render_particles / max(renderer.n_total, 1)
-                    renderer.lod_pixels = max(1.0, min(256.0, 1.0 / max(frac, 0.004)))
+                    err_smooth = math.log2(max(smooth_frame_ms / target_ms, 0.01))
+                    DEADBAND = 0.5
+                    if err_smooth > DEADBAND:
+                        error = err_smooth - DEADBAND
+                        gain = 1.0
+                    elif err_smooth < -DEADBAND:
+                        error = err_smooth + DEADBAND
+                        gain = 1.0
+                    else:
+                        error = 0.0
+                        gain = 0.0
+                    step = gain * error * dt
+                    step = max(-1.0, min(2.0, step))
+                    log2_lod = math.log2(max(renderer.lod_pixels, 1.0))
+                    log2_lod += step
+                    log2_max = math.log2(max(renderer.n_total // 1000, 2))
+                    log2_lod = max(0.0, min(log2_max, log2_lod))
+                    renderer.lod_pixels = float(2 ** log2_lod)
+                    renderer.max_render_particles = user_budget
+                    if err_smooth <= 0.0:
+                        last_sustainable_lod = min(last_sustainable_lod, renderer.lod_pixels)
+                    elif err_smooth > 0.5:
+                        last_sustainable_lod = max(last_sustainable_lod, renderer.lod_pixels)
 
             elif refine_budget < renderer.n_total:
                 if was_moving:
@@ -816,68 +843,92 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             refine_budget = 0
 
             if not was_moving and renderer.auto_lod:
-                # Just started moving — low-quality cull for responsive first frame
-                renderer.lod_pixels = max(user_lod, 4)
-                renderer.max_render_particles = min(user_budget, 4_000_000)
+                # Restart at the last sustainable LOD so we don't overshoot
+                # quality and trigger a corrective drop.
+                renderer.lod_pixels = float(last_sustainable_lod)
+                renderer.max_render_particles = user_budget
                 do_cull()
-                last_cull_time = now
+                # Suppress auto-LOD reaction for several frames to let the
+                # renderer / EMA stabilize after the LOD switch.
+                auto_lod_warmup_frames = 4
 
             if not was_moving:
-                pid_integral = 0.0
+                smooth_fps_ema = max(renderer.target_fps, 1.0)
+                smooth_frame_ms = 1000.0 / smooth_fps_ema
 
-            # Smoothed frame time (unbiased EMA of frame rate)
+            # Smoothed frame time (unbiased EMA of frame rate). Skip
+            # accumulation while warming up so the EMA doesn't carry the
+            # one-off resume cost into post-warmup auto-LOD decisions.
             import math
             if dt > 0:
-                tau = max(renderer.auto_lod_smooth, 0.01)
-                a = min(1.0, dt / tau)
-                fps_inst = 1.0 / dt
-                smooth_fps_ema = (1 - a) * smooth_fps_ema + a * fps_inst
-                smooth_frame_ms = 1000.0 / max(smooth_fps_ema, 0.01)
-            # PID auto-LOD on log2(budget)
-            if renderer.auto_lod and smooth_frame_ms > 0 and dt > 0:
+                if auto_lod_warmup_frames > 0:
+                    auto_lod_warmup_frames -= 1
+                    smooth_fps_ema = max(renderer.target_fps, 1.0)
+                    smooth_frame_ms = 1000.0 / smooth_fps_ema
+                else:
+                    tau = max(renderer.auto_lod_smooth, 0.01)
+                    a = min(1.0, dt / tau)
+                    fps_inst = 1.0 / dt
+                    smooth_fps_ema = (1 - a) * smooth_fps_ema + a * fps_inst
+                    smooth_frame_ms = 1000.0 / max(smooth_fps_ema, 0.01)
+            # Auto-LOD on log2(lod_pixels). Pure proportional with asymmetric
+            # responsiveness: a single slow frame coarsens immediately, but
+            # quality bumps require sustained headroom (the EMA-smoothed
+            # frame time below target). Skip the first frame after
+            # resuming motion — that frame includes one-off cull/upload
+            # cost from the LOD change and would otherwise drive a spurious
+            # large coarsening step.
+            if (renderer.auto_lod and smooth_frame_ms > 0 and dt > 0
+                    and was_moving and auto_lod_warmup_frames == 0):
                 target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-                error = math.log2(max(smooth_frame_ms / target_ms, 0.01))
-                pid_integral += error * dt
-                pid_integral = max(-4.0, min(4.0, pid_integral))
-                derivative = (error - pid_prev_error) / dt
-                pid_prev_error = error
-                output = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
-                log2_budget = math.log2(max(renderer.max_render_particles, 1_000))
-                log2_budget -= output
-                log2_n = math.log2(max(renderer.n_total, 1))
-                log2_budget = max(math.log2(1_000), min(log2_n, log2_budget))
-                renderer.max_render_particles = max(1_000, min(
-                    renderer.n_total, int(2 ** log2_budget)))
-                frac = renderer.max_render_particles / max(renderer.n_total, 1)
-                renderer.lod_pixels = max(1.0, min(256.0, 1.0 / max(frac, 0.004)))
+                err_smooth = math.log2(max(smooth_frame_ms / target_ms, 0.01))
+                # Symmetric proportional with ±0.5-octave deadband.
+                DEADBAND = 0.5
+                if err_smooth > DEADBAND:
+                    error = err_smooth - DEADBAND
+                    gain = 1.0
+                elif err_smooth < -DEADBAND:
+                    error = err_smooth + DEADBAND
+                    gain = 1.0
+                else:
+                    error = 0.0
+                    gain = 0.0
+                step = gain * error * dt
+                step = max(-1.0, min(2.0, step))
+                log2_lod = math.log2(max(renderer.lod_pixels, 1.0))
+                log2_lod += step
+                # Stride ceiling: never coarser than ~n_total/1000.
+                log2_max = math.log2(max(renderer.n_total // 1000, 2))
+                log2_lod = max(0.0, min(log2_max, log2_lod))
+                renderer.lod_pixels = float(2 ** log2_lod)
+                renderer.max_render_particles = user_budget
+                if err_smooth <= 0.0:
+                    last_sustainable_lod = min(last_sustainable_lod, renderer.lod_pixels)
+                elif err_smooth > 0.5:
+                    last_sustainable_lod = max(last_sustainable_lod, renderer.lod_pixels)
 
             # Cull every frame while moving (PID controls budget to keep it fast)
             do_cull()
-            last_cull_time = now
 
-        elif refine_budget < renderer.n_total:
+        elif renderer.lod_pixels > 1.0:
             # --- STOPPED: progressive refinement ---
-            if was_moving:
-                smooth_frame_ms = 0.0
-                refine_saved_lod = renderer.lod_pixels
-                refine_saved_budget = renderer.max_render_particles
-                refine_budget = max(user_budget, 4_000_000)
+            # Halve lod_pixels each frame toward the user-budget floor so
+            # rendering stays interactive even when fully refined.
+            refine_floor = max(1.0, renderer.n_total / max(user_budget, 1))
 
-            if refine_budget == 0:
-                refine_budget = max(user_budget, 4_000_000)
-                refine_saved_lod = renderer.lod_pixels
-                refine_saved_budget = renderer.max_render_particles
+            if renderer.lod_pixels <= refine_floor:
+                pass  # already refined
+            else:
+                if was_moving:
+                    smooth_frame_ms = 0.0
+                    refine_saved_lod = renderer.lod_pixels
+                    refine_saved_budget = renderer.max_render_particles
+                    auto_lod_warmup_frames = 0
 
-            refine_budget = min(refine_budget * 2, renderer.n_total)
-            renderer.lod_pixels = 1
-            renderer.max_render_particles = refine_budget
+                renderer.lod_pixels = max(refine_floor, renderer.lod_pixels * 0.5)
+                renderer.max_render_particles = user_budget
 
-            do_cull()
-
-            # Restore settings (render uses data already uploaded)
-            if refine_saved_lod is not None:
-                renderer.lod_pixels = refine_saved_lod
-                renderer.max_render_particles = refine_saved_budget
+                do_cull()
 
         was_moving = moved
 
@@ -887,43 +938,154 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             fb_w, fb_h = new_fb_w, new_fb_h
             canvas_context.set_physical_size(fb_w, fb_h)
             camera.aspect = fb_w / max(fb_h, 1)
-            win_w, win_h = glfw.get_window_size(window)
+            win_w, _ = glfw.get_window_size(window)
             renderer._viewport_width = win_w  # LOD uses window size, not retina
 
-        # Render
+        # --- Idle-frame short-circuit ---
+        # Build a signature of all state that affects the rendered image.
+        # If nothing has changed since the last presented frame and we
+        # aren't carrying any pending work, skip the entire render path
+        # (no swapchain acquire, no encode, no submit) and sleep briefly
+        # so the loop doesn't burn CPU.
         try:
-            if _state["_composite"]:
-                _render_composite_frame(fb_w, fb_h)
-            else:
-                renderer.render(camera, fb_w, fb_h)
+            _slot0 = _state["_slot"][0]
+            _slot1 = _state["_slot"][1]
+            state_sig = (
+                _state.get("_composite"),
+                _slot0.get("min"), _slot0.get("max"),
+                _slot0.get("log"), _slot0.get("resolve"),
+                _slot1.get("min"), _slot1.get("max"),
+                _slot1.get("log"), _slot1.get("resolve"),
+                _state.get("_render_mode_name"),
+                _state.get("_cmap_idx"),
+                _state.get("_wa_data_field"),
+                _state.get("_sd_field"),
+                _state.get("_sd_field2"),
+                _state.get("_sd_op"),
+                _state.get("_vector_projection"),
+                renderer.qty_min, renderer.qty_max, renderer.log_scale,
+                renderer.hsml_scale,
+                ui_hidden,
+            )
+        except Exception:
+            state_sig = None  # be conservative: render
+        cap_now = renderer._subsample_max_per_frame
+        lod_now = renderer.lod_pixels
+        n_particles_now = renderer.n_particles
+        fb_size_now = (fb_w, fb_h)
+
+        frame_dirty = (
+            dirty
+            or moved
+            or needs_auto_range
+            or pending_auto_range_frames > 0
+            or state_sig is None
+            or state_sig != prev_state_sig
+            or cap_now != prev_cap
+            or lod_now != prev_lod_pixels
+            or n_particles_now != prev_n_particles
+            or fb_size_now != prev_fb_size
+        )
+
+        if not frame_dirty:
+            # Require a few consecutive idle frames before we actually
+            # start sleeping. A single `moved=False` tick in the middle
+            # of a slow rotation (e.g. between mouse-delta events) would
+            # otherwise insert a 5ms sleep and cause visible stutter,
+            # most noticeably in LOS variance / composite modes whose
+            # CPU-cached projection already updates coarsely.
+            idle_streak += 1
+            if idle_streak >= IDLE_STREAK_THRESHOLD:
+                # Don't increment frame_count for slept frames so the
+                # FPS counter isn't inflated by no-op iterations.
+                frame_count = max(frame_count - 1, 0)
+                time.sleep(0.005)
+                continue
+            # Otherwise fall through and render anyway (cheap, since
+            # nothing changed the GPU work is essentially the same as
+            # the last frame).
+        else:
+            idle_streak = 0
+
+        # Render. Time the call wall-clock — most of this is
+        # get_current_texture blocking on the swapchain present, which
+        # is the only signal that reflects real GPU latency (Python's
+        # encode + submit are async w.r.t. the GPU).
+        _t_render = time.perf_counter()
+
+        # Single encoder + single submit per frame: acquire the swapchain
+        # texture once, append accum/resolve and the overlay/UI passes to
+        # the same command encoder, submit at the end. This halves the
+        # per-frame wgpu FFI roundtrips vs. the old "render submits, then
+        # overlay submits" path.
+        _frame_encoder = None
+        _frame_screen_view = None
+        try:
+            current_tex = canvas_context.get_current_texture()
+            _frame_screen_view = current_tex.create_view()
+            _frame_encoder = device.create_command_encoder()
+        except Exception:
+            import traceback; traceback.print_exc()
+
+        try:
+            if _frame_encoder is not None:
+                if _state["_composite"]:
+                    _render_composite_frame(
+                        fb_w, fb_h,
+                        encoder=_frame_encoder, screen_view=_frame_screen_view,
+                        freeze_los_key=translated)
+                else:
+                    renderer.render(
+                        camera, fb_w, fb_h,
+                        encoder=_frame_encoder, screen_view=_frame_screen_view)
         except Exception as e:
             print(f"Render error: {e}")
             import traceback; traceback.print_exc()
-            # Ensure we still present something (avoid black flash)
+            # Ensure we still present something (avoid black flash). The
+            # legacy fallback path uses its own encoder/submit.
             try:
                 renderer.render(camera, fb_w, fb_h)
             except Exception:
                 pass
-
+        last_render_ms = (time.perf_counter() - _t_render) * 1000.0
         # Auto-range on first frame
+        if pending_auto_range_frames > 0:
+            pending_auto_range_frames -= 1
+            if pending_auto_range_frames == 0:
+                needs_auto_range = True
         if needs_auto_range and not _state["_composite"]:
             lo, hi = renderer.read_accum_range()
             renderer.qty_min = lo
             renderer.qty_max = hi
             print(f"Auto-range: {lo:.3g} .. {hi:.3g}")
+            # The pre-built frame encoder already encoded a resolve with
+            # the *stale* qty range. Drop it so we don't submit stale
+            # pixels on top of the freshly-auto-ranged image. The legacy
+            # render() call below uses its own encoder and submits
+            # immediately; the overlay block will fall back to its own
+            # encoder since _frame_encoder is now None.
+            _frame_encoder = None
+            _frame_screen_view = None
             try:
                 renderer.render(camera, fb_w, fb_h)
             except Exception:
                 pass
             needs_auto_range = False
+            # Headless screenshot mode: take the shot now that init,
+            # auto-range, and one full render have completed, then exit.
+            if screenshot is not None:
+                _take_screenshot(screenshot)
+                glfw.set_window_should_close(window, True)
 
         # Update timing stats
         cull_s = getattr(renderer, '_last_cull_ms', 0) / 1000
         upload_s = getattr(renderer, '_last_upload_ms', 0) / 1000
+        render_s = getattr(renderer, '_last_render_ms', 0) / 1000
         alpha = 0.2
-        if cull_s > 0 or upload_s > 0:
+        if cull_s > 0 or upload_s > 0 or render_s > 0:
             _timings["cull"] = _timings["cull"] * (1 - alpha) + cull_s * alpha
             _timings["upload"] = _timings["upload"] * (1 - alpha) + upload_s * alpha
+            _timings["render"] = _timings["render"] * (1 - alpha) + render_s * alpha
 
         # Sync auto-range request from proxy
         if _state["_needs_auto_range"]:
@@ -933,10 +1095,19 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         # Overlay rendering pass (on top of the resolved image)
         # Skip overlay + present on odd frames when skip_vsync is on
         _do_present = not renderer.skip_vsync or frame_count % 2 == 0
-        if not ui_hidden and _do_present:
+        # If the auto-range branch dropped the prebuilt frame encoder,
+        # we need a fresh one (with its own swapchain view) just for the
+        # overlay pass.
+        if not ui_hidden and _do_present and _frame_encoder is None:
+            try:
+                current_tex = canvas_context.get_current_texture()
+                _frame_screen_view = current_tex.create_view()
+                _frame_encoder = device.create_command_encoder()
+            except Exception:
+                import traceback; traceback.print_exc()
+        if not ui_hidden and _do_present and _frame_encoder is not None:
           try:
-            current_tex = canvas_context.get_current_texture()
-            screen_view = current_tex.create_view()
+            screen_view = _frame_screen_view
 
             overlay.set_framebuffer_size(fb_w, fb_h)
             user_menu.set_framebuffer_size(fb_w, fb_h)
@@ -948,9 +1119,12 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 overlay._last_update_time = now
                 was_enabled = overlay.enabled
                 overlay.enabled = True
+                init_status = ("Initializing: uploading to GPU..."
+                               if gpu_compute is None else "")
+                overlay_message = init_status if init_status else _last_message
                 overlay.update(
                     renderer, camera, fps, _render_mode.name,
-                    AVAILABLE_COLORMAPS[_state["_cmap_idx"]], _timings, _last_message,
+                    AVAILABLE_COLORMAPS[_state["_cmap_idx"]], _timings, overlay_message,
                     smooth_fps=smooth_fps_val,
                 )
                 overlay.enabled = was_enabled
@@ -968,8 +1142,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 composite_slots=_state["_slot"] if _state["_composite"] else None,
             )
 
-            encoder = device.create_command_encoder()
-            rpass = encoder.begin_render_pass(color_attachments=[{
+            rpass = _frame_encoder.begin_render_pass(color_attachments=[{
                 "view": screen_view,
                 "load_op": "load",
                 "store_op": "store",
@@ -978,13 +1151,29 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             if overlay.enabled:
                 overlay.render_to_pass(rpass)
             rpass.end()
-            device.queue.submit([encoder.finish()])
           except Exception:
             import traceback
             traceback.print_exc()
 
+        # Submit the single per-frame encoder (covers accum + resolve +
+        # optional overlay/UI). Then present.
+        if _frame_encoder is not None:
+            try:
+                device.queue.submit([_frame_encoder.finish()])
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
         if _do_present:
             canvas_context.present()
+
+        # Frame committed: snapshot state for the next idle-check.
+        prev_state_sig = state_sig
+        prev_cap = cap_now
+        prev_lod_pixels = lod_now
+        prev_n_particles = n_particles_now
+        prev_fb_size = fb_size_now
+        dirty = False
 
     # Cleanup
     renderer.release()
@@ -992,285 +1181,3 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     glfw.destroy_window(window)
 
 
-def _run_wgpu_benchmark(n_frames, window, canvas_context, device, renderer, camera,
-                        data, gpu_compute, _bg, grid_thread, do_cull, fb_w, fb_h,
-                        user_lod, user_budget, app_proxy):
-    """Run the scripted benchmark using the wgpu backend."""
-    import math
-
-    # Wait for grid build
-    print("  Waiting for spatial grid...")
-    grid_thread.join()
-    if _bg["grid"] is not None and renderer._grid is None:
-        renderer._grid = _bg["grid"]
-        renderer.use_tree = True
-        renderer.update_visible(camera)
-        _bg["grid"] = None
-
-    # Init GPU compute if available
-    from .gpu_compute import GPUCompute
-    GPU_COMPUTE_THRESHOLD = 10_000_000
-    if (gpu_compute is None and renderer._grid is not None
-            and renderer.n_total >= GPU_COMPUTE_THRESHOLD):
-        try:
-            gpu_compute = GPUCompute(device)
-            gpu_compute.upload_snapshot(renderer._grid)
-            print("  GPU compute pipeline initialized")
-        except Exception as e:
-            print(f"  GPU compute init failed: {e}")
-
-    boxsize = data.header.get("BoxSize", None)
-    extent = float(boxsize) if boxsize else float(np.linalg.norm(
-        data.positions.max(axis=0) - data.positions.min(axis=0)))
-    center = np.mean([data.positions.min(axis=0), data.positions.max(axis=0)], axis=0)
-    start_pos = camera.position.copy()
-    fwd0 = camera.forward.copy()
-    up0 = camera.up.copy()
-    right0 = camera.right.copy()
-
-    def rodrigues(v, axis, angle):
-        c, s = np.cos(angle), np.sin(angle)
-        return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1 - c)
-
-    def slerp_vec(a, b, t):
-        blend = a * (1 - t) + b * t
-        n = np.linalg.norm(blend)
-        return blend / n if n > 1e-8 else a
-
-    # Build keyframes (same as moderngl benchmark)
-    keyframes = []
-    def kf(pos, fwd, up, label):
-        keyframes.append((pos.astype(np.float32), fwd.astype(np.float32),
-                          up.astype(np.float32), label))
-
-    kf(start_pos, fwd0, up0, "start")
-    kf(start_pos, rodrigues(fwd0, right0, np.radians(30)), up0, "look up")
-    kf(start_pos, rodrigues(fwd0, right0, np.radians(-30)), up0, "look down")
-    kf(start_pos, rodrigues(fwd0, up0, np.radians(45)), up0, "look left")
-    kf(start_pos, rodrigues(fwd0, up0, np.radians(-45)), up0, "look right")
-    kf(start_pos, fwd0, rodrigues(up0, fwd0, np.radians(30)), "roll left")
-    kf(start_pos, fwd0, rodrigues(up0, fwd0, np.radians(-30)), "roll right")
-    kf(start_pos, fwd0, up0, "reset")
-
-    far_pos = start_pos + fwd0 * extent * 1.5
-    n_fly = max(n_frames // 4, 10)
-    for i in range(n_fly):
-        t = (i + 1) / n_fly
-        kf(start_pos * (1 - t) + far_pos * t, fwd0, up0, f"fly out {int(t*100)}%")
-
-    fwd_back = -fwd0
-    kf(far_pos, fwd_back, up0, "turn around")
-
-    for i in range(n_fly):
-        t = (i + 1) / n_fly
-        kf(far_pos * (1 - t) + start_pos * t, fwd_back, up0, f"fly back {int(t*100)}%")
-
-    n_orbit = max(n_frames - len(keyframes), 0)
-    if n_orbit > 0:
-        radius = extent * 0.6
-        angles = np.linspace(0, 2 * np.pi, n_orbit, endpoint=False)
-        for theta in angles:
-            pos = np.array([center[0] + radius * np.sin(theta), center[1],
-                            center[2] + radius * np.cos(theta)], dtype=np.float32)
-            fwd = (center - pos).astype(np.float32)
-            fwd = fwd / np.linalg.norm(fwd)
-            kf(pos, fwd, up0, "orbit")
-
-    keyframes = keyframes[:n_frames]
-
-    # Progressive refinement to full detail
-    budget = max(4_000_000, renderer.max_render_particles)
-    while budget < renderer.n_total:
-        budget = min(budget * 2, renderer.n_total)
-        renderer.lod_pixels = 1
-        renderer.max_render_particles = budget
-        if gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False):
-            gpu_compute.dispatch_cull(camera, budget, lod_pixels=1,
-                                      viewport_width=renderer._viewport_width,
-                                      summary_overlap=renderer.summary_overlap)
-        else:
-            renderer.update_visible(camera)
-        try:
-            renderer.render(camera, fb_w, fb_h)
-            canvas_context.present()
-        except Exception:
-            pass
-        glfw.poll_events()
-        n_vis = renderer.n_particles + renderer.n_aniso
-        print(f"  Refining: {n_vis:,} / {renderer.n_total:,}")
-        if glfw.window_should_close(window):
-            return
-
-    # Auto-range at full quality
-    try:
-        renderer.render(camera, fb_w, fb_h)
-        canvas_context.present()
-    except Exception:
-        pass
-    lo, hi = renderer.read_accum_range()
-    renderer.qty_min = lo
-    renderer.qty_max = hi
-    print(f"  Auto-range: {lo:.3g} .. {hi:.3g}")
-
-    renderer.lod_pixels = user_lod
-    renderer.max_render_particles = user_budget
-
-    # PID state
-    smooth_frame_ms = 0.0
-    pid_integral = 0.0
-    pid_prev_error = 0.0
-    was_moving = False
-    last_cull_time = 0.0
-    refine_budget = 0
-
-    TRANSITION_S = 0.5
-    HOLD_S = 1.5
-
-    frame_times = []
-    cull_times = []
-    n_vis_list = []
-    phase_list = []
-    kf_idx_list = []
-    lod_list = []
-    budget_list = []
-
-    def render_frame():
-        try:
-            renderer.render(camera, fb_w, fb_h)
-            canvas_context.present()
-        except Exception:
-            pass
-        glfw.poll_events()
-
-    def record(t_frame_ms, phase, ki):
-        cull_times.append(getattr(renderer, '_last_cull_ms', 0) + getattr(renderer, '_last_upload_ms', 0))
-        frame_times.append(t_frame_ms)
-        n_vis_list.append(renderer.n_particles + renderer.n_aniso)
-        phase_list.append(phase)
-        kf_idx_list.append(ki)
-        lod_list.append(renderer.lod_pixels)
-        budget_list.append(renderer.max_render_particles)
-
-    def pid_update(dt_s):
-        nonlocal pid_integral, pid_prev_error
-        if not renderer.auto_lod or dt_s <= 0:
-            return
-        target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-        error = math.log2(max(dt_s * 1000 / target_ms, 0.01))
-        pid_integral += error * dt_s
-        pid_integral = max(-4.0, min(4.0, pid_integral))
-        derivative = (error - pid_prev_error) / dt_s
-        pid_prev_error = error
-        rate = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
-        output = rate * dt_s
-        log2_budget = math.log2(max(renderer.max_render_particles, 1_000))
-        log2_budget -= output
-        log2_n = math.log2(max(renderer.n_total, 1))
-        log2_budget = max(math.log2(1_000), min(log2_n, log2_budget))
-        renderer.max_render_particles = max(1_000, min(renderer.n_total, int(2 ** log2_budget)))
-        frac = renderer.max_render_particles / max(renderer.n_total, 1)
-        renderer.lod_pixels = max(1.0, min(256.0, 1.0 / max(frac, 0.004)))
-
-    prev_kf = keyframes[0]
-
-    for ki, (pos, fwd, up, label) in enumerate(keyframes):
-        if glfw.window_should_close(window):
-            break
-        p0, f0, u0, _ = prev_kf
-
-        # Transition
-        t_start = time.perf_counter()
-        t_prev = t_start
-        while not glfw.window_should_close(window):
-            elapsed = time.perf_counter() - t_start
-            if elapsed >= TRANSITION_S:
-                break
-            t = elapsed / TRANSITION_S
-            camera.position = (p0 * (1 - t) + pos * t).astype(np.float32)
-            camera._forward = slerp_vec(f0, fwd, t).astype(np.float32)
-            camera._up = slerp_vec(u0, up, t).astype(np.float32)
-            camera._dirty = True
-
-            now = time.perf_counter()
-            dt_s = now - t_prev
-            if dt_s > 0:
-                if not was_moving:
-                    smooth_frame_ms = 0.0
-                    pid_integral = 0.0
-                elif smooth_frame_ms == 0.0:
-                    smooth_frame_ms = dt_s * 1000
-                else:
-                    tau = max(renderer.auto_lod_smooth, 0.01)
-                    a = min(dt_s / tau, 1.0)
-                    smooth_frame_ms = (1 - a) * smooth_frame_ms + a * dt_s * 1000
-                pid_update(dt_s)
-
-            do_cull()
-            render_frame()
-            was_moving = True
-            refine_budget = 0
-
-            now2 = time.perf_counter()
-            record((now2 - t_prev) * 1000, "transition", ki)
-            t_prev = now2
-
-        # Hold
-        camera.position = pos.copy()
-        camera._forward = fwd.copy()
-        camera._up = up.copy()
-        camera._dirty = True
-
-        t_start = time.perf_counter()
-        t_prev = t_start
-        hold_refine_budget = max(user_budget, 4_000_000)
-        while not glfw.window_should_close(window):
-            if time.perf_counter() - t_start >= HOLD_S:
-                break
-            hold_refine_budget = min(hold_refine_budget * 2, renderer.n_total)
-            renderer.lod_pixels = 1
-            renderer.max_render_particles = hold_refine_budget
-            do_cull()
-            render_frame()
-            renderer.lod_pixels = user_lod
-            renderer.max_render_particles = user_budget
-            was_moving = False
-
-            now2 = time.perf_counter()
-            record((now2 - t_prev) * 1000, "hold", ki)
-            t_prev = now2
-
-        prev_kf = (pos, fwd, up, label)
-
-    # Print results
-    frame_times = np.array(frame_times)
-    cull_times = np.array(cull_times)
-    phases = np.array(phase_list)
-
-    print(f"\n--- wgpu Benchmark Results ({len(frame_times)} frames) ---")
-    for phase_name in ("transition", "hold"):
-        mask = phases == phase_name
-        if not mask.any():
-            continue
-        ft = frame_times[mask]
-        ct = cull_times[mask]
-        fps = 1000.0 / ft
-        print(f"  {phase_name.capitalize()} ({mask.sum()} frames):")
-        print(f"    Frame time:  median={np.median(ft):.1f}ms  "
-              f"p5={np.percentile(ft, 5):.1f}ms  p95={np.percentile(ft, 95):.1f}ms")
-        print(f"    FPS:         median={np.median(fps):.0f}  "
-              f"p5={np.percentile(fps, 5):.0f}  p95={np.percentile(fps, 95):.0f}")
-        print(f"    Cull time:   median={np.median(ct):.1f}ms  p95={np.percentile(ct, 95):.1f}ms")
-    print(f"  Particles:   {renderer.n_total:,} total")
-
-    outfile = f"benchmark_wgpu_{int(time.time())}.npz"
-    kf_labels = [kf[3] for kf in keyframes]
-    np.savez(outfile,
-             frame_time_ms=frame_times, cull_time_ms=cull_times,
-             n_visible=np.array(n_vis_list), phase=phases,
-             keyframe_idx=np.array(kf_idx_list),
-             keyframe_labels=np.array(kf_labels),
-             lod_pixels=np.array(lod_list),
-             max_render_particles=np.array(budget_list),
-             n_total=renderer.n_total, backend="wgpu")
-    print(f"  Saved: {outfile} ({len(frame_times)} frames)")
-    print("-----------------------------------\n")

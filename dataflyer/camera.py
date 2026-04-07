@@ -26,7 +26,7 @@ class Camera:
         self.speed = 1.0  # units/sec, will be auto-scaled from data
         self.mouse_sensitivity = 0.002
         self.invert_mouse = True
-        self.roll_speed = 1.5  # rad/sec
+        self.roll_speed = 0.75  # rad/sec
 
         # Input state
         self._keys = set()
@@ -164,7 +164,7 @@ class Camera:
             self._moving = True
 
     def on_scroll(self, offset):
-        self.speed *= 1.15 ** offset
+        self.speed *= 1.15 ** (offset / 3.0)
 
     def _yaw(self, angle):
         c, s = np.cos(angle), np.sin(angle)
@@ -190,21 +190,33 @@ class Camera:
         self._dirty = True
 
     def auto_scale(self, positions, masses=None, boxsize=None):
-        """Set speed and clip planes. Starts at the box center looking along -z."""
+        """Set speed and clip planes. Starts above the mass-weighted median
+        (computed from a 100x subsample) looking down -z."""
         pmin = positions.min(axis=0)
         pmax = positions.max(axis=0)
         extent = np.linalg.norm(pmax - pmin)
 
-        if boxsize is not None:
-            center = np.ones(3, dtype=np.float32) * boxsize / 2
+        # Mass-weighted median from a 100x subsample
+        n = len(positions)
+        step = max(1, n // 100) if n > 100 else 1
+        sub_pos = positions[::step]
+        if masses is not None:
+            sub_w = np.asarray(masses[::step], dtype=np.float64)
         else:
-            center = ((pmin + pmax) / 2).astype(np.float32)
+            sub_w = np.ones(len(sub_pos), dtype=np.float64)
+        center = np.empty(3, dtype=np.float32)
+        for axis in range(3):
+            order = np.argsort(sub_pos[:, axis])
+            cw = np.cumsum(sub_w[order])
+            half = cw[-1] * 0.5
+            idx = min(int(np.searchsorted(cw, half)), len(order) - 1)
+            center[axis] = float(sub_pos[order[idx], axis])
 
         # Start at top of data looking down -z
         self.position = np.array([center[0], center[1], pmax[2]], dtype=np.float32)
         self._forward = np.array([0, 0, -1], dtype=np.float32)
         self._up = np.array([0, 1, 0], dtype=np.float32)
         self._dirty = True
-        self.speed = extent / 10
+        self.speed = extent / 20
         self.near = extent * 1e-6
         self.far = extent * 10
