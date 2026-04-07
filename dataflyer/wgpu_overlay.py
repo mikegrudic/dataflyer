@@ -1,8 +1,8 @@
 """wgpu-based UI overlay: renders PIL panel images as textured quads.
 
-Provides WGPUDevOverlay and WGPUUserMenu that mirror the moderngl versions
-but use wgpu for the final GPU upload + draw step. All PIL rendering and
-widget logic is inherited from the base classes.
+Provides WGPUDevOverlay and WGPUUserMenu. All PIL rendering and widget
+logic is inherited from the base classes; this module only handles the
+final GPU upload + draw step.
 """
 
 import numpy as np
@@ -104,7 +104,8 @@ class _WGPUPanelMixin:
         self._wgpu_backend = WGPUPanelBackend(device, present_format)
 
     def _upload_panel(self, tw, th, data):
-        """Override: upload via wgpu instead of moderngl."""
+        """Upload the PIL panel image into a wgpu texture and build the
+        textured-quad vertex buffer for this frame's draw call."""
         self._tex = True  # satisfy dirty-flag check in render_panel
         fb_w, fb_h = self._fb_width, self._fb_height
         s = self.style

@@ -72,7 +72,7 @@ Select from the **Mode** dropdown in the user menu:
 
 3D vector fields (e.g. Velocities) are automatically detected. When selected as a weight or data field, a **Proj** dropdown appears:
 
-- **LOS** — Line-of-sight component (dot product with camera forward). Recomputed when the camera rotates.
+- **LOS** — Per-particle line-of-sight component (dot product with the unit vector from the camera to the particle). Invariant under camera rotation; recomputed when the camera translates past a small threshold.
 - **|v|** — Euclidean norm.
 - **|v|^2** — Squared norm.
 
@@ -93,16 +93,3 @@ dataflyer/
   shaders/          - WGSL shaders (common, splat_subsample, resolve, composite,
                       star, text)
 ```
-
-## Tests
-
-```bash
-pytest tests/
-```
-
-- `test_surface_density_vs_sinkvis.py` — Validates GPU surface density against CrunchSnaps/Meshoid
-- `test_composite_state.py` — Verifies composite mode state consistency across mode switches
-- `test_summary_splat_mass.py` — Validates summary-splat mass conservation
-- `test_adaptive_octree.py` — Adaptive octree gather correctness
-- `bench_perf_regression.py` — Performance benchmark (`python tests/bench_perf_regression.py`)
-- `bench_wgpu_vs_moderngl.py`, `bench_detailed.py` — Additional benchmarks

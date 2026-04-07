@@ -114,9 +114,8 @@ ACCUM_FORMAT_FALLBACK = "rgba16float"
 
 
 class WGPURenderer:
-    """wgpu renderer matching SplatRenderer's public interface."""
+    """Splat renderer backed by wgpu."""
 
-    # Kernel names (must match SplatRenderer.KERNELS)
     KERNELS = ["cubic_spline", "wendland_c2", "gaussian", "quartic", "sphere"]
 
     def __init__(self, device, canvas_context=None, present_format=None):
@@ -140,20 +139,15 @@ class WGPURenderer:
         self.qty_min = -1.0
         self.qty_max = 3.0
         self.resolve_mode = 0
-        self.lod_pixels = 16
         self.log_scale = 1
-        self.max_render_particles = 64_000_000
-        # LOD: only "subsample" is supported. The dropdown / overlay
-        # carry it for backwards compat with the existing UI strings.
-        self.lod_strategy = "subsample"
         self.kernel = "cubic_spline"
         self.auto_lod = True
         self.target_fps = 15.0
         self.auto_lod_smooth = 0.3
-        # PID gains kept on the renderer for the auto-LOD overlay panel
-        self.pid_Kp = 0.5
-        self.pid_Kd = 0.0
+        # PID gains for the auto-LOD controller (tunable from the dev panel).
+        self.pid_Kp = 1.0
         self.pid_Ki = 0.0
+        self.pid_Kd = 0.0
         self.skip_vsync = False
         self.hsml_scale = 1.0
 
@@ -244,9 +238,12 @@ class WGPURenderer:
         self._star_bg0 = _make_bind_group(
             dev, self._star_bgl0, [self._camera_buf, self._star_params_buf])
 
-        # Subsample state set later via set_subsample_chunks/set_subsample_stride.
+        # Subsample state set later via set_subsample_chunks. The
+        # cap-based auto-LOD is the sole LOD knob — there is no
+        # separate stride. Each draw renders min(n_total, cap)
+        # particles, with each splat enlarged by (n_total/cap)^(1/3)
+        # to compensate for the missing neighbors.
         self._subsample_chunks = None
-        self._subsample_stride = 1
         self._subsample_max_per_frame = 4_000_000
         self._slot_subsample_bgs = [None, None]
         self._active_subsample_slot = None
@@ -388,7 +385,7 @@ class WGPURenderer:
             },
         )
 
-    # ---- Data management (matches SplatRenderer interface) ----
+    # ---- Data management ----
 
     def set_particles(self, positions, hsml, masses, quantity=None):
         """Store CPU-side particle data. The actual GPU upload is
@@ -402,8 +399,6 @@ class WGPURenderer:
             quantity = masses
         self._all_qty = quantity.astype(np.float32)
         self.n_total = len(masses)
-        # Default LOD: stride ~ n^(1/3)/16. Auto-LOD adapts from here.
-        self.lod_pixels = max(1.0, self.n_total ** (1.0 / 3.0) / 16.0)
 
     def update_weights(self, masses, quantity=None):
         """Update the renderer's CPU mass/qty arrays after a field swap.
@@ -455,10 +450,6 @@ class WGPURenderer:
                 "n": int(cb["n"]), "start": int(cb["start"]),
             })
         self._subsample_chunks = out
-
-    def set_subsample_stride(self, stride):
-        """Set the stride used by the compute-driven splat path."""
-        self._subsample_stride = max(int(stride), 1)
 
     def set_subsample_slot_chunks(self, slot_idx, slot_chunks):
         """Bind a composite slot's mass/qty per-chunk buffers. Pos+hsml
@@ -654,9 +645,20 @@ class WGPURenderer:
         """
         self._write_camera_uniforms(camera, width, height)
 
-        # Subsample params must be written before the render pass begins.
+        # Compute the per-chunk dispatch budget BEFORE beginning the
+        # render pass — wgpu forbids write_buffer mid-pass, so all
+        # uniform writes must happen now.
+        budget = 0
+        n_total_chunks = 0
+        eff_stride = 1.0
         if self._subsample_chunks is not None:
-            self._write_subsample_params(camera, self._subsample_stride)
+            n_total_chunks = sum(ck["n"] for ck in self._subsample_chunks)
+            cap = self._subsample_max_per_frame
+            budget = min(n_total_chunks, cap)
+            budget = max(1, budget)
+            # Each rendered splat stands in for `eff_stride` particles.
+            eff_stride = max(n_total_chunks / max(budget, 1), 1.0)
+            self._write_subsample_params(camera, eff_stride)
 
         dev = self.device
         owns_encoder = encoder is None
@@ -681,19 +683,10 @@ class WGPURenderer:
                         if slot is not None
                         and self._slot_subsample_bgs[slot] is not None
                         else None)
-            cap = self._subsample_max_per_frame
-            stride = max(float(self._subsample_stride), 1.0)
-            n_total = sum(ck["n"] for ck in self._subsample_chunks)
-            budget = max(1, int(round(n_total / stride)))
-            if budget > cap:
-                budget = cap
-            # Effective fractional stride after capping.
-            eff_stride = max(n_total / max(budget, 1), 1.0)
-            self._write_subsample_params(camera, eff_stride)
             render_pass.set_pipeline(self._splat_subsample_pipeline)
             for i, ck in enumerate(self._subsample_chunks):
                 # Proportional share of the budget for this chunk.
-                instances = max(1, int(round(budget * ck["n"] / n_total)))
+                instances = max(1, int(round(budget * ck["n"] / n_total_chunks)))
                 instances = min(instances, ck["n"])
                 render_pass.set_bind_group(0, ck["bg0"])
                 bg1 = slot_bgs[i] if slot_bgs is not None else ck["bg1"]

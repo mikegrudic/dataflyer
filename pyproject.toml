@@ -12,17 +12,12 @@ requires-python = ">=3.9"
 dependencies = [
     "numpy",
     "h5py",
-    "moderngl>=5.8",
     "glfw>=2.5",
     "matplotlib",
-    "PyOpenGL",
     "natsort",
     "Pillow",
-    "wgpu"
+    "wgpu>=0.19",
 ]
-
-[project.optional-dependencies]
-wgpu = ["wgpu>=0.19"]
 
 [project.scripts]
 dataflyer = "dataflyer.app:main"
