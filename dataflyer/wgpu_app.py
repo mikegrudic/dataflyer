@@ -706,7 +706,21 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         if moved:
             has_moved_ever = True
             if not was_moving:
-                renderer.set_subsample_max_per_frame(last_subsample_cap)
+                # Stationary refinement may have pushed the cap up to
+                # ~n_total. The first motion frame must NOT inherit
+                # that — it would block for hundreds of ms while the
+                # GPU drains the in-flight refined accum and the user
+                # would perceive motion-start as frozen. Hard-reset to
+                # a small interactive cap; the cap-growth loop below
+                # walks back up to last_subsample_cap over the next
+                # few frames as long as the GPU keeps up.
+                MOTION_RESUME_CAP = 4_000_000
+                resume_cap = min(last_subsample_cap, MOTION_RESUME_CAP)
+                renderer.set_subsample_max_per_frame(resume_cap)
+                # Reset the smoothed render-time EMA so the just-elapsed
+                # multi-second stationary frame doesn't poison the
+                # cap-grow gate for the first few motion frames.
+                smooth_render_ms = 0.0
             if smooth_render_ms > 0:
                 cur_cap = renderer._subsample_max_per_frame
                 if smooth_render_ms < target_ms * 0.9:
