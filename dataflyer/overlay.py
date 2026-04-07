@@ -365,6 +365,10 @@ class DevOverlay(Panel):
         items.append(("text", f"Colormap: {cmap_name}"))
         items.append(("text", f"Pos: ({camera.position[0]:.2f}, {camera.position[1]:.2f}, {camera.position[2]:.2f})"))
         items.append(("text", f"Speed: {camera.speed:.3g}"))
+        if getattr(renderer, "n_stars", 0) > 0:
+            ext = "ON" if getattr(renderer, "star_extinction_enabled", False) else "OFF"
+            band = getattr(renderer, "star_band", "?")
+            items.append(("text", f"Stars: {renderer.n_stars}  Band: {band}  Ext: {ext}  (B/⇧B cycle, O toggle)"))
         items.append(("text", ""))
 
         items.append(("toggle", "Invert Mouse", camera.invert_mouse, "cam:invert_mouse"))

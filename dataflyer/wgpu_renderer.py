@@ -226,6 +226,68 @@ class WGPURenderer:
         self._active_subsample_slot = None
         self._world_offset = None
 
+        # ---- Realistic stars overlay ----
+        self._star_shader = dev.create_shader_module(
+            code=_load_wgsl("star_realistic.wgsl"))
+        self._star_params_buf = dev.create_buffer(
+            size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+        self._star_bgl0 = dev.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": VF, "buffer": {"type": "uniform"}},
+            {"binding": 1, "visibility": VF, "buffer": {"type": "uniform"}},
+        ])
+        self._star_bgl1 = _storage_bgl(dev, 1, V)
+        star_layout = dev.create_pipeline_layout(
+            bind_group_layouts=[self._star_bgl0, self._star_bgl1])
+        # Additive blend over the resolved (sRGB / unorm) screen target.
+        star_blend = {
+            "color": {"operation": "add", "src_factor": "one", "dst_factor": "one"},
+            "alpha": {"operation": "add", "src_factor": "one", "dst_factor": "one"},
+        }
+        self._star_pipeline = dev.create_render_pipeline(
+            layout=star_layout,
+            vertex={"module": self._star_shader, "entry_point": "vs_main", "buffers": []},
+            primitive={"topology": "triangle-strip", "strip_index_format": "uint32"},
+            fragment={"module": self._star_shader, "entry_point": "fs_main",
+                      "targets": [{"format": self.present_format, "blend": star_blend}]},
+        )
+        self._star_buf = None
+        self._star_bg0 = None
+        self._star_bg1 = None
+        self._star_buf_dirty = True
+
+        # Tunables — wired into the dev panel later.
+        self.star_pixel_radius = 6.0
+        self.star_intensity = 1.0
+        # UBVRI dust opacities (cm^2/g, MRN-style averages). Σ in
+        # Msun/pc^2 → multiply by 2.0834e-4 to get code-unit κ such
+        # that τ = κ_code * Σ.
+        _S2C = 2.0834e-4
+        self.STAR_BANDS = [
+            ("U", 700.0 * _S2C),
+            ("B", 440.0 * _S2C),
+            ("V", 200.0 * _S2C),
+            ("R", 140.0 * _S2C),
+            ("I", 100.0 * _S2C),
+        ]
+        self.star_band_idx = 2  # default V
+        self.star_extinction_kappa = self.STAR_BANDS[self.star_band_idx][1]
+        self.star_extinction_enabled = True
+
+    @property
+    def star_band(self):
+        return self.STAR_BANDS[self.star_band_idx][0]
+
+    def cycle_star_band(self, step=1):
+        self.star_band_idx = (self.star_band_idx + step) % len(self.STAR_BANDS)
+        self.star_extinction_kappa = self.STAR_BANDS[self.star_band_idx][1]
+        self._star_buf_dirty = True
+        print(f"  [stars] band={self.star_band}  κ={self.star_extinction_kappa:.4g}")
+
+    def toggle_star_extinction(self):
+        self.star_extinction_enabled = not self.star_extinction_enabled
+        self._star_buf_dirty = True
+        print(f"  [stars] extinction {'ON' if self.star_extinction_enabled else 'OFF'}")
+
     def set_colormap(self, rgba_data):
         """Set colormap from RGBA uint8 array of shape (N, 4).
 
@@ -456,7 +518,7 @@ class WGPURenderer:
         path. wgpu_app raises this gradually as refinement progresses
         and resets it on camera motion.
         """
-        self._subsample_max_per_frame = max(int(max_inst), 1)
+        self._subsample_max_per_frame = max(int(max_inst), 1000)
 
     def _write_subsample_params(self, camera, stride):
         """Write each chunk's params uniform. Must be called BEFORE
@@ -504,7 +566,7 @@ class WGPURenderer:
             self.device.queue.write_buffer(
                 ck["params_buf"], 0, cam_bytes + tail)
 
-    def upload_stars(self, positions, masses):
+    def upload_stars(self, positions, masses, luminosity=None):
         """Upload star particle data.
 
         Keeps the CPU-side count and the position/mass arrays around so
@@ -513,10 +575,120 @@ class WGPURenderer:
         shader pipeline have been removed.
         """
         self.n_stars = len(masses)
+        # Invalidate any cached extinction columns — star set has changed.
+        self._star_columns = None
+        self._star_columns_cam_pos = None
         if self.n_stars == 0:
             return
-        self._star_positions = positions.astype(np.float32)
+        self._star_positions = positions.astype(np.float64)
         self._star_masses = masses.astype(np.float32)
+        if luminosity is None:
+            # Fallback to mass as a stand-in luminosity proxy.
+            self._star_luminosity = self._star_masses.copy()
+        else:
+            self._star_luminosity = np.asarray(luminosity, dtype=np.float32)
+        self._star_buf_dirty = True
+
+    def set_extinction_gas(self, positions, masses, hsml):
+        """Provide gas particle data used to compute per-star extinction
+        columns via a direct port of starforge_tools.star_gas_columns.
+
+        Stored as float64 because the KDTree query in star_gas_columns
+        runs on these arrays directly.
+        """
+        self._ext_xgas = np.ascontiguousarray(positions, dtype=np.float64)
+        self._ext_mgas = np.ascontiguousarray(masses, dtype=np.float64)
+        self._ext_hgas = np.ascontiguousarray(hsml, dtype=np.float64)
+        self._star_columns = None
+        self._star_columns_cam_pos = None
+
+    def _update_star_columns(self, camera):
+        """Recompute per-star gas column densities when the camera has
+        translated. Pure rotation preserves every star→camera sightline
+        (parallel-projection approximation along the camera forward axis,
+        which only depends on the camera position relative to the stars
+        when forward = normalize(mean_star_pos - cam_pos)), so we key the
+        cache on camera.position alone.
+
+        Direct port of starforge_tools.star_gas_columns; result lives in
+        self._star_columns and is consumed by the future star draw path.
+        """
+        if getattr(self, "n_stars", 0) == 0:
+            return
+        if getattr(self, "_ext_xgas", None) is None:
+            return
+
+        cam_pos = np.asarray(camera.position, dtype=np.float64)
+        prev = self._star_columns_cam_pos
+        if (
+            self._star_columns is not None
+            and prev is not None
+            and np.array_equal(prev, cam_pos)
+        ):
+            return  # rotation-only frame — cached columns are still valid
+
+        # Sightline = from observer to stars (parallel-projection
+        # approximation; matches star_gas_columns' convention).
+        mean_star = self._star_positions.mean(axis=0)
+        sightline = mean_star - cam_pos
+        n = float(np.linalg.norm(sightline))
+        if n == 0.0:
+            sightline = np.array([0.0, 0.0, -1.0])
+        else:
+            sightline = sightline / n
+
+        from scipy.spatial import KDTree
+
+        xstar = self._star_positions
+        xgas = self._ext_xgas
+        mgas = self._ext_mgas
+        hgas = self._ext_hgas
+
+        if not np.allclose(sightline, np.array([0.0, 0.0, -1.0])):
+            # Build an orthonormal basis with -sightline as +z.
+            sx = np.random.normal(size=(3,))
+            sx -= np.inner(sx, -sightline) * sightline
+            sx /= np.linalg.norm(sx)
+            sy = np.cross(-sightline, sx)
+            basis = np.c_[sx, sy, -sightline].T
+            xstar_b = xstar @ basis
+            xgas_b = xgas @ basis
+        else:
+            xstar_b = xstar
+            xgas_b = xgas
+
+        star_tree = KDTree(xstar_b[:, :2])
+        gas_ngb_dist, gas_ngb = star_tree.query(xgas_b[:, :2], workers=-1)
+        overlapping = (gas_ngb_dist < hgas) & (xstar_b[gas_ngb, 2] < xgas_b[:, 2])
+
+        xgas_o = xgas_b[overlapping]
+        mgas_o = mgas[overlapping]
+        hgas_o = hgas[overlapping]
+
+        ngb = star_tree.query_ball_point(xgas_o[:, :2], hgas_o, workers=-1)
+
+        columns = np.zeros(xstar_b.shape[0], dtype=np.float64)
+        for i, nbrs in enumerate(ngb):
+            if nbrs:
+                columns[nbrs] += mgas_o[i] / (np.pi * hgas_o[i] * hgas_o[i])
+
+        self._star_columns = columns.astype(np.float32)
+        self._star_columns_cam_pos = cam_pos.copy()
+
+        # Debug: report column-density stats and the resulting attenuation
+        # so we can sanity-check star_extinction_kappa for this snapshot.
+        c = self._star_columns
+        tau = self.star_extinction_kappa * c
+        atten = np.exp(-tau)
+        L = self._star_luminosity if self._star_luminosity is not None else self._star_masses
+        Latt = L.astype(np.float64) * atten
+        print(
+            f"  [stars] Σ: min={c.min():.3g} mean={c.mean():.3g} max={c.max():.3g}  "
+            f"τ: min={tau.min():.3g} mean={tau.mean():.3g} max={tau.max():.3g}  "
+            f"exp(-τ): min={atten.min():.3g} mean={atten.mean():.3g} max={atten.max():.3g}  "
+            f"L: min={L.min():.3g} mean={L.mean():.3g} max={L.max():.3g}  "
+            f"L·exp(-τ): min={Latt.min():.3g} mean={Latt.mean():.3g} max={Latt.max():.3g}"
+        )
 
     # ---- Accumulation textures ----
 
@@ -593,16 +765,124 @@ class WGPURenderer:
 
     # ---- Render passes ----
 
-    def _encode_star_overlay(self, encoder, screen_view):
-        """Append a star overlay render pass to the given encoder.
+    def _ensure_star_buffer(self):
+        """(Re)build the per-star storage buffer holding (xyz, attenuated L)."""
+        n = getattr(self, "n_stars", 0)
+        if n == 0:
+            return False
+        if self._star_positions is None or self._star_luminosity is None:
+            return False
 
-        The dedicated star shader pipeline was removed; this is now a
-        no-op placeholder. Star particle data is still loaded by the
-        data manager and uploaded by upload_stars(), so a future
-        replacement (e.g. routing stars through the splat pipeline)
-        can re-introduce a draw here without re-plumbing the loop.
+        # World-origin shift mirrors the splat path so float32 precision
+        # holds at cosmological scales.
+        offset = getattr(self, "_world_offset", None)
+        pos = self._star_positions
+        if offset is not None:
+            pos = pos - np.asarray(offset, dtype=np.float64)
+        # Track the offset so we rebuild if it changes after upload.
+        self._star_buf_offset_used = (
+            None if offset is None else np.asarray(offset, dtype=np.float64).copy()
+        )
+
+        lum = self._star_luminosity.astype(np.float32, copy=True)
+        cols = getattr(self, "_star_columns", None)
+        if self.star_extinction_enabled and cols is not None and len(cols) == n:
+            tau = self.star_extinction_kappa * cols
+            lum *= np.exp(-tau).astype(np.float32)
+
+        data = np.empty((n, 4), dtype=np.float32)
+        data[:, 0:3] = pos.astype(np.float32)
+        data[:, 3] = lum
+
+        # One-shot diagnostic so we can verify positions/luminosity.
+        sample = data[0]
+        print(
+            f"  [stars] rebuild n={n} offset={offset} "
+            f"sample_pos={sample[0]:.3g},{sample[1]:.3g},{sample[2]:.3g} "
+            f"L_uploaded[min/mean/max]={lum.min():.3g}/{lum.mean():.3g}/{lum.max():.3g}"
+        )
+
+        nbytes = data.nbytes
+        if self._star_buf is None or self._star_buf.size < nbytes:
+            self._star_buf = self.device.create_buffer(
+                size=nbytes,
+                usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
+            )
+            self._star_bg1 = self.device.create_bind_group(
+                layout=self._star_bgl1,
+                entries=[{"binding": 0,
+                          "resource": {"buffer": self._star_buf}}],
+            )
+        self.device.queue.write_buffer(self._star_buf, 0, data.tobytes())
+
+        if self._star_bg0 is None:
+            self._star_bg0 = self.device.create_bind_group(
+                layout=self._star_bgl0,
+                entries=[
+                    {"binding": 0, "resource": {"buffer": self._camera_buf}},
+                    {"binding": 1, "resource": {"buffer": self._star_params_buf}},
+                ],
+            )
+        self._star_buf_dirty = False
+        return True
+
+    def _encode_star_overlay(self, encoder, screen_view):
+        """Draw realistic-stars billboards over the resolved screen.
+
+        Updates the per-star extinction column cache (cheap on rotation-
+        only frames), refreshes the storage buffer when stars or columns
+        changed, then issues an instanced quad draw additively blended
+        into `screen_view`.
         """
-        return
+        if getattr(self, "n_stars", 0) == 0:
+            return
+        cam = getattr(self, "_last_camera", None)
+        if cam is None or screen_view is None:
+            return
+
+        prev_cam_pos = self._star_columns_cam_pos
+        self._update_star_columns(cam)
+        # Force a rebuild if either columns refreshed or the world-origin
+        # offset changed since the last buffer build.
+        cur_off = getattr(self, "_world_offset", None)
+        used_off = getattr(self, "_star_buf_offset_used", None)
+        offset_changed = (
+            (cur_off is None) != (used_off is None)
+            or (cur_off is not None and used_off is not None
+                and not np.array_equal(np.asarray(cur_off, dtype=np.float64), used_off))
+        )
+        if (
+            self._star_buf_dirty
+            or self._star_columns_cam_pos is not prev_cam_pos
+            or offset_changed
+        ):
+            self._star_buf_dirty = True
+        if self._star_buf_dirty:
+            if not self._ensure_star_buffer():
+                return
+
+        import struct
+        params = struct.pack(
+            "ffff",
+            float(self.star_pixel_radius),
+            float(self.star_intensity),
+            0.0, 0.0,
+        )
+        self.device.queue.write_buffer(self._star_params_buf, 0, params)
+
+        rp = encoder.begin_render_pass(
+            color_attachments=[{
+                "view": screen_view,
+                "clear_value": (0, 0, 0, 1),
+                "load_op": "load",
+                "store_op": "store",
+            }],
+        )
+        rp.set_pipeline(self._star_pipeline)
+        rp.set_bind_group(0, self._star_bg0)
+        rp.set_bind_group(1, self._star_bg1)
+        rp.draw(4, int(self.n_stars), 0, 0)
+        rp.end()
 
     def _render_accum(self, camera, width, height, accum_textures, encoder=None):
         """Render additive accumulation pass into given textures.
@@ -685,6 +965,7 @@ class WGPURenderer:
         text field doesn't trigger an N-particle re-accum.
         """
         self._viewport_width = width
+        self._last_camera = camera
         if self._colormap_tex is None:
             return
         if self.n_particles == 0 and self._subsample_chunks is None:

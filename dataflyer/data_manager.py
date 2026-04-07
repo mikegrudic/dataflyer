@@ -13,6 +13,27 @@ _FIELD_FALLBACKS = {
 }
 
 
+def _zams_luminosity(mass_msun):
+    """Piecewise ZAMS L(M) in Lsun for main-sequence stars.
+
+    Coefficients from a standard mass-luminosity relation; accurate to
+    within a factor of ~2 across 0.1 - 100 Msun and good enough to drive
+    the realistic-stars renderer when the snapshot lacks a luminosity
+    field.
+    """
+    m = np.asarray(mass_msun, dtype=np.float32)
+    L = np.empty_like(m)
+    a = m < 0.43
+    b = (m >= 0.43) & (m < 2.0)
+    c = (m >= 2.0) & (m < 55.0)
+    d = m >= 55.0
+    L[a] = 0.23 * m[a] ** 2.3
+    L[b] = m[b] ** 4.0
+    L[c] = 1.4 * m[c] ** 3.5
+    L[d] = 32000.0 * m[d]
+    return L
+
+
 class SnapshotData:
     """Manages particle data from an HDF5 snapshot with lazy field loading."""
 
@@ -44,11 +65,24 @@ class SnapshotData:
         # Star data (eagerly loaded, usually small)
         if self._stars:
             self.star_positions = self._read_field("PartType5", "Coordinates").astype(np.float32)
-            self.star_masses = self._read_field("PartType5", "Masses").astype(np.float32)
+            # Prefer Sink_Mass (true accreted mass) for realistic-stars luminosity.
+            grp = self._file["PartType5"]
+            if "Sink_Mass" in grp:
+                self.star_masses = grp["Sink_Mass"][:].astype(np.float32)
+            else:
+                self.star_masses = self._read_field("PartType5", "Masses").astype(np.float32)
             self.n_stars = len(self.star_masses)
+            # Luminosity in Lsun. Use snapshot field if present, else ZAMS L(M).
+            if "StarLuminosity_Solar" in grp:
+                self.star_luminosity = grp["StarLuminosity_Solar"][:].astype(np.float32)
+            elif "StarLuminosity" in grp:
+                self.star_luminosity = grp["StarLuminosity"][:].astype(np.float32)
+            else:
+                self.star_luminosity = _zams_luminosity(self.star_masses)
         else:
             self.star_positions = np.zeros((0, 3), dtype=np.float32)
             self.star_masses = np.zeros(0, dtype=np.float32)
+            self.star_luminosity = np.zeros(0, dtype=np.float32)
             self.n_stars = 0
 
     def _read_field(self, ptype, field):
