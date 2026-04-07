@@ -141,7 +141,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
     # Stars
     if data.n_stars > 0:
-        renderer.upload_stars(data.star_positions, data.star_masses)
+        renderer.upload_stars(data.star_positions, data.star_masses,
+                              luminosity=getattr(data, "star_luminosity", None))
+        if data.n_particles > 0:
+            renderer.set_extinction_gas(data.positions, data.masses, data.hsml)
         print(f"  {data.n_stars} star particles loaded")
 
     # Input callbacks
@@ -261,6 +264,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 overlay.enabled = not overlay.enabled
             elif key == glfw.KEY_TAB:
                 ui_hidden = not ui_hidden
+            elif key == glfw.KEY_B:
+                renderer.cycle_star_band(-1 if (mods & glfw.MOD_SHIFT) else 1)
+            elif key == glfw.KEY_O:
+                renderer.toggle_star_extinction()
         camera.on_key(key, action)
 
     glfw.set_key_callback(window, key_callback)
