@@ -1,10 +1,7 @@
 """Load mesh-free simulation snapshots via h5py with lazy field loading."""
 
-import os
-import re
 import numpy as np
 import h5py
-from natsort import natsorted
 
 # Field name fallbacks for different GIZMO versions
 _FIELD_FALLBACKS = {
@@ -172,25 +169,3 @@ class SnapshotData:
             self._file.close()
         except Exception:
             pass
-
-
-def find_snapshots(path):
-    """Given a snapshot path, find all sibling snapshots in the same directory.
-    Returns a sorted list of snapshot paths."""
-    dirpath = os.path.dirname(os.path.abspath(path))
-    basename = os.path.basename(path)
-
-    # Extract the naming pattern: snapshot_NNN.hdf5, snap_NNN.hdf5, etc.
-    match = re.match(r"^(.*?)(\d+)(\.hdf5)$", basename, re.IGNORECASE)
-    if not match:
-        return [path]
-
-    prefix, _, suffix = match.groups()
-    pattern = re.compile(re.escape(prefix) + r"\d+" + re.escape(suffix), re.IGNORECASE)
-
-    snaps = [
-        os.path.join(dirpath, f)
-        for f in os.listdir(dirpath)
-        if pattern.match(f)
-    ]
-    return natsorted(snaps)

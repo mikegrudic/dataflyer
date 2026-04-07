@@ -1,16 +1,10 @@
-"""UI overlay panels rendered as PIL images to GPU textures."""
+"""UI overlay panels rendered as PIL images. The actual GPU upload +
+draw step lives in wgpu_overlay.py; this file contains only the
+backend-agnostic widget layout, hit-testing, and PIL rendering.
+"""
 
-import moderngl
-import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from pathlib import Path
 from dataclasses import dataclass
-
-SHADER_DIR = Path(__file__).parent / "shaders"
-
-
-def _load_shader(name):
-    return (SHADER_DIR / name).read_text()
 
 
 def _get_font(size):
@@ -83,20 +77,10 @@ class Panel:
     # Reference height for DPI scaling (styles are designed for 1080p)
     _REF_HEIGHT = 1080
 
-    def __init__(self, ctx, style):
-        self.ctx = ctx
+    def __init__(self, style):
         self.style = style
         self._base_style = style  # unscaled original
         self._tex = None
-        self._prog = ctx.program(
-            vertex_shader=_load_shader("text.vert"),
-            fragment_shader=_load_shader("text.frag"),
-        )
-        self._vbo = ctx.buffer(reserve=6 * 4 * 4)
-        self._vao = ctx.vertex_array(
-            self._prog,
-            [(self._vbo, "2f 2f", "in_position", "in_uv")],
-        )
         self._font = _get_font(style.font_size)
         self._dpi_scale = 1.0
         self._widgets = []
@@ -289,32 +273,12 @@ class Panel:
         self._upload_panel(tw, th, data)
 
     def _upload_panel(self, tw, th, data):
-        """Upload PIL image to GPU and build vertex data. Override for wgpu."""
-        if self._tex is not None:
-            self._tex.release()
-        self._tex = self.ctx.texture((tw, th), 4, data=data)
-        self._tex.filter = (0x2601, 0x2601)
-
-        fb_w, fb_h = self._fb_width, self._fb_height
-        s = self.style
-        px_w = tw / fb_w * 2
-        px_h = th / fb_h * 2
-        if s.position == "top-right":
-            x1 = 1.0 - px_w - 0.01
-            x2 = 1.0 - 0.01
-            y1 = 1.0 - px_h - 0.01
-            y2 = 1.0 - 0.01
-        else:
-            x1 = -1.0 + 0.01
-            x2 = -1.0 + px_w + 0.01
-            y1 = -1.0 + 0.01
-            y2 = -1.0 + px_h + 0.01
-
-        verts = np.array([
-            x1, y1, 0, 1,  x2, y1, 1, 1,  x1, y2, 0, 0,
-            x2, y1, 1, 1,  x2, y2, 1, 0,  x1, y2, 0, 0,
-        ], dtype=np.float32)
-        self._vbo.write(verts.tobytes())
+        """Upload PIL image to GPU and build vertex data.
+        Concrete subclass (WGPU panel mixin) overrides this with the
+        wgpu upload path; the base method is a no-op so headless tests
+        and any code that constructs a Panel without a backend works.
+        """
+        pass
 
     def _hit_test(self, x, y):
         """Convert screen coords to panel-local and find widget. Returns widget tuple or None."""
@@ -351,23 +315,11 @@ class Panel:
         return None
 
     def render(self):
-        if self._tex is None:
-            return
-        self.ctx.enable(moderngl.BLEND)
-        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-        self._tex.use(location=0)
-        self._prog["u_texture"].value = 0
-        self._vao.render(vertices=6)
-        self.ctx.disable(moderngl.BLEND)
+        """Render hook overridden by the wgpu panel mixin."""
+        pass
 
     def release(self):
-        for attr in ("_tex", "_vbo", "_vao", "_prog"):
-            obj = getattr(self, attr, None)
-            if obj is not None:
-                try:
-                    obj.release()
-                except Exception:
-                    pass
+        self._tex = None
 
     def on_scroll(self, yoffset):
         """Handle scroll for open dropdowns. Returns True if consumed."""
@@ -382,8 +334,8 @@ class Panel:
 class DevOverlay(Panel):
     """Developer HUD with performance info and interactive toggles."""
 
-    def __init__(self, ctx):
-        super().__init__(ctx, DEV_STYLE)
+    def __init__(self):
+        super().__init__(DEV_STYLE)
         self.enabled = False
         self._last_message = ""
 
@@ -394,13 +346,7 @@ class DevOverlay(Panel):
         self._last_message = message
 
         items = []
-        n_vis = renderer.n_particles + renderer.n_big
-        n_aniso = getattr(renderer, "n_aniso", 0)
-        n_summaries = getattr(renderer, "n_summaries", n_aniso)
-        # In isotropic mode summaries are folded into n_particles; subtract
-        # so the breakdown isn't double-counted.
-        n_real_particles = max(n_vis - (n_summaries if n_aniso == 0 else 0), 0)
-        n_drawn = n_vis + n_aniso
+        n_vis = renderer.n_particles
         n_tot = renderer.n_total
         scale = "log" if renderer.log_scale else "linear"
 
@@ -408,7 +354,6 @@ class DevOverlay(Panel):
         pid_str = f"  (PID: {smooth_fps:.0f})" if smooth_fps > 0 else ""
         items.append(("text", f"FPS: {fps:.0f}{pid_str}"))
         items.append(("text", f"Particles: {n_vis:,} / {n_tot:,}"))
-        items.append(("text", f"Drawn: {n_drawn:,} ({n_real_particles:,} parts + {n_summaries:,} summaries)"))
         items.append(("text", f"LOD: {renderer.lod_pixels}px  Budget: {renderer.max_render_particles/1e6:.1f}M"))
         items.append(("text", f"Cull: {timings.get('cull',0)*1000:.0f}ms  Upload: {timings.get('upload',0)*1000:.0f}ms  Render: {timings.get('render',0)*1000:.0f}ms"))
         if renderer.log_scale:
@@ -423,15 +368,7 @@ class DevOverlay(Panel):
         items.append(("text", ""))
 
         items.append(("toggle", "Invert Mouse", camera.invert_mouse, "cam:invert_mouse"))
-        items.append(("toggle", "Tree", renderer.use_tree, "use_tree"))
-        items.append(("toggle", "Adaptive Tree", renderer.use_adaptive_tree, "use_adaptive_tree"))
-        items.append(("toggle", "Importance Sampling", renderer.use_importance_sampling, "use_importance_sampling"))
-        items.append(("toggle", "Hybrid Rendering", renderer.use_hybrid_rendering, "use_hybrid_rendering"))
-        items.append(("toggle", "Quad Rendering", renderer.use_quad_rendering, "use_quad_rendering"))
-        items.append(("toggle", "Aniso Summaries", renderer.use_aniso_summaries, "use_aniso_summaries"))
-        items.append(("toggle", "Bypass Cull", renderer.bypass_cull, "bypass_cull"))
-        if hasattr(renderer, 'skip_vsync'):
-            items.append(("toggle", "Skip Vsync", renderer.skip_vsync, "skip_vsync"))
+        items.append(("toggle", "Skip Vsync", renderer.skip_vsync, "skip_vsync"))
         items.append(("toggle", "Auto LOD", renderer.auto_lod, "auto_lod"))
         if renderer.auto_lod:
             items.append(("slider", "Target FPS", renderer.target_fps, 1.0, 60.0, "target_fps"))
@@ -439,23 +376,7 @@ class DevOverlay(Panel):
             items.append(("slider", "PID Kp", renderer.pid_Kp, 0.0, 10.0, "pid_Kp"))
             items.append(("slider", "PID Ki", renderer.pid_Ki, 0.0, 2.0, "pid_Ki"))
             items.append(("slider", "PID Kd", renderer.pid_Kd, 0.0, 2.0, "pid_Kd"))
-        items.append(("text", ""))
-
-        items.append(("dropdown", "Kernel", renderer.kernel, renderer.KERNELS, "kernel"))
-        items.append(("dropdown", "LOD Strategy",
-                      getattr(renderer, "lod_strategy", "geometric"),
-                      getattr(renderer, "LOD_STRATEGIES",
-                              ["geometric", "particle_count", "subsample"]),
-                      "lod_strategy"))
-        items.append(("text", ""))
-
         items.append(("slider", "Hsml Scale", renderer.hsml_scale, 0.1, 5.0, "hsml_scale"))
-        items.append(("slider", "Summary Scale", renderer.summary_scale, 0.1, 10.0, "summary_scale"))
-        items.append(("slider", "Summary Overlap", renderer.summary_overlap, 0.0, 1.0, "summary_overlap"))
-        items.append(("slider", "Tree Min N", renderer.tree_min_particles, 0, 1e7, "tree_min_particles"))
-        items.append(("slider", "Leaf Size", renderer.tree_leaf_size, 8, 4096, "tree_leaf_size"))
-        items.append(("slider", "Cull Interval", renderer.cull_interval, 0.0, 5.0, "cull_interval"))
-        items.append(("text", f"Aniso splats: {renderer.n_aniso:,}"))
 
         if message:
             items.append(("text", message))
@@ -493,15 +414,6 @@ class DevOverlay(Panel):
                 setattr(renderer, key, max(vmin, cur - step))
             else:
                 setattr(renderer, key, min(vmax, cur + step))
-            if key == "tree_min_particles":
-                renderer._needs_grid_rebuild = True
-            elif key == "tree_leaf_size":
-                # Snap to nearest power of 2 in [8, 4096]
-                import math
-                val = getattr(renderer, key)
-                p = max(3, min(12, round(math.log2(max(val, 8)))))
-                setattr(renderer, key, int(2 ** p))
-                renderer._needs_grid_rebuild = True
             return True
 
         if wtype == "toggle":
@@ -511,25 +423,6 @@ class DevOverlay(Panel):
                 setattr(self._camera, attr, not getattr(self._camera, attr))
             else:
                 setattr(renderer, key, not getattr(renderer, key))
-            if key == "use_adaptive_tree":
-                renderer._needs_grid_rebuild = True
-            return True
-
-        if wtype == "dropdown_item":
-            key, value = widget[3], widget[4]
-            if key == "kernel":
-                renderer.kernel = value
-            elif key == "lod_strategy":
-                renderer.lod_strategy = value
-                # Reset lod_pixels to a sensible default for the new strategy.
-                if value == "particle_count":
-                    renderer.lod_pixels = float(getattr(renderer, "tree_leaf_size", 64))
-                elif value == "subsample":
-                    renderer.lod_pixels = 1.0
-                else:  # geometric
-                    n = max(getattr(renderer, "n_total", 1), 1)
-                    renderer.lod_pixels = max(1.0, n ** (1.0 / 3.0) / 16.0)
-            self._dropdown_open = None
             return True
 
         return True
@@ -538,20 +431,13 @@ class DevOverlay(Panel):
 class UserMenu(Panel):
     """Always-visible user menu with weight field, limits, scale, colorbar."""
 
-    def __init__(self, ctx):
-        super().__init__(ctx, USER_STYLE)
+    def __init__(self):
+        super().__init__(USER_STYLE)
         self.show_colorbar = False
         self._editing = None
         self._edit_buffer = ""
         self._app_ref = None
-
-        # Separate colorbar overlay
         self._cbar_tex = None
-        self._cbar_vbo = ctx.buffer(reserve=6 * 4 * 4)
-        self._cbar_vao = ctx.vertex_array(
-            self._prog,
-            [(self._cbar_vbo, "2f 2f", "in_position", "in_uv")],
-        )
 
     def on_key(self, key, action):
         import glfw
@@ -777,24 +663,9 @@ class UserMenu(Panel):
         draw.text((label_x, cbar_top - 4), self._hi_str, fill=self.style.text_color, font=self._font)
         draw.text((label_x, cbar_top + cbar_h - LH + 4), self._lo_str, fill=self.style.text_color, font=self._font)
 
-        data = img.tobytes()
-        if self._cbar_tex is not None:
-            self._cbar_tex.release()
-        self._cbar_tex = self.ctx.texture((total_w, total_h), 4, data=data)
-        self._cbar_tex.filter = (0x2601, 0x2601)
-
-        px_w = total_w / fb_w * 2
-        px_h = total_h / fb_h * 2
-        x1 = -1.0 + 0.01
-        x2 = x1 + px_w
-        y1 = -px_h / 2
-        y2 = px_h / 2
-
-        verts = np.array([
-            x1, y1, 0, 1,  x2, y1, 1, 1,  x1, y2, 0, 0,
-            x2, y1, 1, 1,  x2, y2, 1, 0,  x1, y2, 0, 0,
-        ], dtype=np.float32)
-        self._cbar_vbo.write(verts.tobytes())
+        # Hand the rendered colorbar PIL image off to the wgpu mixin
+        # which actually uploads it to the GPU.
+        self._cbar_data = (total_w, total_h, img.tobytes())
 
     def on_click(self, x, y, app):
         self._app_ref = app
@@ -893,24 +764,5 @@ class UserMenu(Panel):
 
         return True
 
-    def render(self):
-        if self._tex is None:
-            return
-        super().render()
-        if self.show_colorbar and self._cbar_tex is not None:
-            self.ctx.enable(moderngl.BLEND)
-            self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-            self._cbar_tex.use(location=0)
-            self._prog["u_texture"].value = 0
-            self._cbar_vao.render(vertices=6)
-            self.ctx.disable(moderngl.BLEND)
-
-    def release(self):
-        super().release()
-        for attr in ("_cbar_tex", "_cbar_vbo", "_cbar_vao"):
-            obj = getattr(self, attr, None)
-            if obj is not None:
-                try:
-                    obj.release()
-                except Exception:
-                    pass
+    # render() / release() come from Panel; the wgpu mixin overrides
+    # render to draw the optional colorbar quad alongside the panel.

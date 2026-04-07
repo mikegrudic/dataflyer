@@ -1,8 +1,4 @@
-"""wgpu backend application: GLFW window + WGPURenderer.
-
-Streamlined main loop that uses wgpu for rendering instead of moderngl.
-Overlays are not yet ported — this provides core rendering only.
-"""
+"""wgpu backend application: GLFW window + WGPURenderer + UI overlays."""
 
 import time
 import atexit
@@ -13,17 +9,16 @@ import wgpu
 from wgpu.utils.glfw_present_info import get_glfw_present_info
 
 from .camera import Camera
-from .data_manager import SnapshotData, find_snapshots
-from .wgpu_renderer import WGPURenderer
+from .data_manager import SnapshotData
+from .wgpu_renderer import WGPURenderer, RenderMode
 from .colormaps import colormap_to_texture_data, AVAILABLE_COLORMAPS
-from .renderer import RenderMode
 from .field_ops import (resolve_field, compute_weights, compute_slot_fields,
-                        project_vector, combine_fields, make_default_app_state,
+                        combine_fields, make_default_app_state,
                         is_los_stale, SD_OPS, RENDER_MODES, VECTOR_PROJECTIONS)
 
 
 def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
-                 screenshot=None, benchmark=None, fullscreen=False):
+                 fullscreen=False):
     """Run the DataFlyer application with the wgpu backend."""
     import os
     snapshot_path = os.path.abspath(snapshot_path)
@@ -97,20 +92,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     rgba = colormap_to_texture_data("magma")
     renderer.set_colormap(rgba)
 
-    # Load particles — render first frame without grid, then build grid
+    # Load particles. set_particles only stores arrays + n_total; the
+    # actual GPU upload happens in the background-built grid + GPUCompute
+    # init below.
     weights = data.get_field("Masses")
-    renderer.use_tree = False  # skip grid build for instant first frame
     renderer.set_particles(data.positions, data.hsml, weights)
 
-    # In subsample mode, skip the eager CPU upload of all particles to the
-    # legacy renderer buffers — for 100M+ snapshots that uploads ~3 GB and
-    # blocks the canvas thread for 5+ seconds before the GPU compute path
-    # even starts. The window will show an empty frame until GPU init
-    # completes; that's much better than a long beachball.
-    if getattr(renderer, "lod_strategy", "geometric") != "subsample":
-        renderer.update_visible(camera)
-
-    # Render + present first frame immediately so window is responsive
+    # Render + present an empty first frame immediately so the window
+    # comes up responsive. The GPU upload follows in the canvas tick.
     try:
         renderer.render(camera, fb_w, fb_h)
         canvas_context.present()
@@ -268,8 +257,6 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 from .colormaps import colormap_to_texture_data
                 renderer.set_colormap(colormap_to_texture_data(AVAILABLE_COLORMAPS[_cmap_idx]))
                 _state["_cmap_idx"] = _cmap_idx
-            elif key == glfw.KEY_P:
-                renderer.screenshot(f"dataflyer_{int(time.time())}.png")
             elif key == glfw.KEY_F1 or key == glfw.KEY_BACKSLASH:
                 overlay.enabled = not overlay.enabled
             elif key == glfw.KEY_TAB:
@@ -370,17 +357,8 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 # already produced the right LOS-projected qty for the
                 # current camera orientation; subsequent rotations will
                 # render with stale qty until the user re-applies the
-                # render mode. Acceptable for now.
-                in_subsample = (
-                    getattr(renderer, "lod_strategy", "geometric")
-                    == "subsample")
-                _uses_los = (
-                    not in_subsample
-                    and _state["_vector_projection"] == "LOS"
-                    and _state.get("_wa_data_field", "") in _state["_vector_fields"])
-                if _uses_los:
-                    gpu_compute.upload_vector_field(renderer._grid,
-                                                   _state["_wa_data_field"], data)
+                # render mode (the canvas tick re-fires _apply_render_mode
+                # when LOS staleness is detected).
             if auto_range:
                 needs_auto_range = True
 
@@ -437,7 +415,6 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
 
     # Progressive refinement / auto-LOD state
     was_moving = False
-    last_cull_time = 0.0
     user_lod = renderer.lod_pixels
     user_budget = renderer.max_render_particles
     # Per-frame instance cap for the compute-driven splat path. Initialized
@@ -447,23 +424,15 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     # once — startup has no FPS history to validate growth against.
     has_moved_ever = False
     # Frames to wait before firing the post-init auto-range. Set when
-    # GPU subsample chunks are first wired up; counts down each frame
-    # so the GPU has time to actually render new data into the FBO
-    # before we read it back.
+    # GPU subsample chunks are first wired up.
     pending_auto_range_frames = 0
     smooth_frame_ms = 0.0
     smooth_fps_ema = 0.0
-    last_lod_adjust = 0.0
-    pid_prev_error = 0.0
-    pid_integral = 0.0
     refine_budget = 0
     # Last lod_pixels value at which the smoothed frame time was at or below
     # target. Used to restart camera motion at a known-sustainable quality
     # instead of starting at the user's manual LOD and overshooting.
     last_sustainable_lod = renderer.lod_pixels
-    # Per-strategy memory of the last known-sustainable LOD value, so
-    # switching strategies doesn't carry an irrelevant value over.
-    last_sustainable_by_strategy = {}
     auto_lod_warmup_frames = 0  # frames remaining where auto-LOD is suppressed
     refine_saved_lod = None
     refine_saved_budget = None
@@ -577,78 +546,16 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         )
 
     def do_cull():
-        """Run cull via GPU compute (zero-copy) or CPU fallback."""
-        if gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False):
-            # Compute-driven splat: cull happens inside the vertex shader
-            # against the source per-chunk buffers. Nothing to do here
-            # except update the renderer's stride; per-frame _render_accum
-            # writes the cull params and dispatches one draw per chunk.
-            if getattr(renderer, "lod_strategy", "geometric") == "subsample":
-                stride = max(int(renderer.lod_pixels), 1)
-                renderer.set_subsample_stride(stride)
-                # HUD count: estimate from stride.
-                renderer.n_particles = int(renderer.n_total // max(stride, 1))
-                renderer.n_summaries = 0
-                renderer._upload_summary_arrays(
-                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                    np.zeros(0, np.float32), np.zeros(0, np.float32))
-                renderer._upload_aniso_summaries(
-                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                    np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
-                renderer._last_cull_ms = 0.0
-                renderer._last_upload_ms = 0.0
-                return
-            n_out, n_vis, summary_data = gpu_compute.dispatch_cull(
-                camera, renderer.max_render_particles,
-                lod_pixels=renderer.lod_pixels,
-                viewport_width=renderer._viewport_width,
-                summary_overlap=renderer.summary_overlap,
-            )
-            # Zero-copy: point renderer at compute output buffers
-            renderer.set_particle_buffers_from_gpu(gpu_compute.get_output_buffers(), n_out)
-            s_pos, s_hsml, s_mass, s_qty, s_cov = summary_data
-            renderer.n_summaries = len(s_pos)
-
-            if renderer.use_aniso_summaries and len(s_pos) > 0:
-                renderer._upload_aniso_summaries(s_pos, s_mass, s_qty, s_cov)
-                renderer._upload_summary_arrays(
-                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                    np.zeros(0, np.float32), np.zeros(0, np.float32))
-            elif len(s_pos) > 0:
-                # Isotropic: derive isotropic hsml from covariance trace and
-                # upload as half-res summary splats.
-                trace = s_cov[:, 0] + s_cov[:, 3] + s_cov[:, 5]
-                iso_hsml = (np.sqrt(np.maximum(trace, 1e-30) / 3.0)
-                            * 2.0 * renderer.summary_scale).astype(np.float32)
-                renderer._upload_summary_arrays(s_pos, iso_hsml, s_mass, s_qty)
-                renderer._upload_aniso_summaries(
-                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                    np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
-            else:
-                renderer._upload_summary_arrays(
-                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                    np.zeros(0, np.float32), np.zeros(0, np.float32))
-                renderer._upload_aniso_summaries(
-                    np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
-                    np.zeros(0, np.float32), np.zeros((0, 6), np.float32))
-        else:
-            # CPU fallback when GPU compute isn't ready. Skip in subsample
-            # mode — uploading 100M+ particles to the legacy renderer
-            # buffers each frame is the entire startup beachball.
-            if getattr(renderer, "lod_strategy", "geometric") != "subsample":
-                renderer.update_visible(camera)
-
-    # --- Benchmark mode ---
-    if benchmark is not None:
-        _run_wgpu_benchmark(
-            benchmark, window, canvas_context, device, renderer, camera, data,
-            gpu_compute, _bg, grid_thread, do_cull, fb_w, fb_h,
-            user_lod, user_budget, app_proxy,
-        )
-        renderer.release()
-        data.close()
-        glfw.destroy_window(window)
-        return
+        """Update the subsample stride from the auto-LOD lod_pixels.
+        Cull/sampling happens inside the vertex shader at draw time.
+        """
+        if gpu_compute is None or not getattr(gpu_compute, '_upload_ready', False):
+            return
+        stride = max(float(renderer.lod_pixels), 1.0)
+        renderer.set_subsample_stride(stride)
+        renderer.n_particles = int(renderer.n_total // max(stride, 1.0))
+        renderer._last_cull_ms = 0.0
+        renderer._last_upload_ms = 0.0
 
     print("DataFlyer [wgpu] running. WASD=move, mouse=look, ESC=quit, R=auto-range.")
 
@@ -663,14 +570,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             fps = frame_count / (now - fps_time)
             frame_count = 0
             fps_time = now
-            n_vis = renderer.n_particles + renderer.n_aniso
+            n_vis = renderer.n_particles
             n_tot = renderer.n_total
             init_msg = ""
             if not _bg["done"]:
                 init_msg = " | Building spatial grid..."
             elif renderer._grid is None:
                 init_msg = " | Loading grid..."
-            elif gpu_compute is None and renderer.n_total >= 10_000_000:
+            elif gpu_compute is None:
                 init_msg = " | Initializing GPU compute..."
             glfw.set_window_title(
                 window,
@@ -682,61 +589,32 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         # Pick up background grid build when complete
         if _bg["done"] and _bg["grid"] is not None and renderer._grid is None:
             renderer._grid = _bg["grid"]
-            renderer.use_tree = True
-            # Skip the one-shot CPU cull when subsample mode is active —
-            # it lazily allocates ~6 GB of shuffled views and on a 100M+
-            # snapshot blocks the canvas thread for many seconds. The GPU
-            # subsample path doesn't need it.
-            if getattr(renderer, "lod_strategy", "geometric") != "subsample":
-                renderer.update_visible(camera)
-            needs_auto_range = True
             _bg["grid"] = None  # don't repeat
 
-        # GPU compute init (blocking upload once grid is available)
+        # GPU subsample pipeline init (one-time upload after grid is built)
         gpu_ready = getattr(gpu_compute, '_upload_ready', False)
-        # Subsample mode always uses the GPU path (no CPU fallback). For
-        # other strategies, only initialize GPU compute on datasets large
-        # enough to benefit.
-        GPU_COMPUTE_THRESHOLD = 10_000_000
-        in_subsample_mode = (
-            getattr(renderer, 'lod_strategy', 'geometric') == 'subsample')
-        gpu_threshold_met = (in_subsample_mode
-                             or renderer.n_total >= GPU_COMPUTE_THRESHOLD)
-        if (not gpu_ready and gpu_compute is None and renderer._grid is not None
-                and gpu_threshold_met):
-            is_adaptive = getattr(renderer._grid, 'is_adaptive', False)
-            in_subsample = (
-                getattr(renderer, 'lod_strategy', 'geometric') == 'subsample')
+        if (not gpu_ready and gpu_compute is None
+                and renderer._grid is not None):
             try:
                 gpu_compute = GPUCompute(device)
-                if is_adaptive or in_subsample:
-                    gpu_compute.upload_subsample_only(
-                        renderer._grid,
-                        max_output=int(renderer.max_render_particles))
-                    renderer.set_subsample_chunks(
-                        gpu_compute.get_chunk_bufs(),
-                        world_offset=gpu_compute.get_pos_offset())
-                    renderer.set_subsample_stride(int(max(renderer.lod_pixels, 1)))
-                    # Prime renderer.n_particles with a non-zero count
-                    # so the first render() call doesn't early-out. The
-                    # auto-LOD controller adjusts it on subsequent
-                    # frames once the camera moves.
-                    do_cull()
-                    print("  GPU subsample pipeline initialized (zero-copy)")
-                    # Defer auto-range a few frames so the GPU actually
-                    # has rendered the new chunk bind groups into the FBO
-                    # before we read it back. The earlier auto-range that
-                    # fired when the bg grid completed ran against an
-                    # empty FBO (chunks weren't bound yet) so its
-                    # qty_min/qty_max are garbage. needs_auto_range fires
-                    # again once the deferral elapses.
-                    pending_auto_range_frames = 3
-                    needs_auto_range = False
-                else:
-                    gpu_compute.upload_snapshot(
-                        renderer._grid,
-                        max_output=int(renderer.max_render_particles))
-                    print("  GPU compute pipeline initialized (zero-copy)")
+                gpu_compute.upload_subsample_only(
+                    renderer._grid,
+                    max_output=int(renderer.max_render_particles))
+                renderer.set_subsample_chunks(
+                    gpu_compute.get_chunk_bufs(),
+                    world_offset=gpu_compute.get_pos_offset())
+                renderer.set_subsample_stride(int(max(renderer.lod_pixels, 1)))
+                # Prime renderer.n_particles so the first render() call
+                # doesn't early-out before the user has moved.
+                do_cull()
+                print("  GPU subsample pipeline initialized")
+                # Defer the post-init auto-range a few frames so the
+                # GPU has actually rendered something into the FBO
+                # before we read it back. The pre-init auto-range that
+                # fires from set_particles ran against an empty FBO
+                # so its qty range is garbage.
+                pending_auto_range_frames = 3
+                needs_auto_range = False
                 gpu_ready = True
             except Exception as e:
                 print(f"  GPU compute init failed: {e}")
@@ -752,47 +630,37 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
         # for progressive refinement, but only after the user has moved
         # at least once and only when the previous frame met its target
         # (so we never over-extend with no FPS history to validate).
-        if getattr(renderer, "lod_strategy", "geometric") == "subsample":
-            target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-            if moved:
-                has_moved_ever = True
-                if not was_moving:
+        target_ms = 1000.0 / max(renderer.target_fps, 1.0)
+        if moved:
+            has_moved_ever = True
+            if not was_moving:
+                renderer.set_subsample_max_per_frame(last_subsample_cap)
+            if smooth_frame_ms > 0:
+                cur_cap = renderer._subsample_max_per_frame
+                if smooth_frame_ms < target_ms * 0.9:
+                    last_subsample_cap = min(64_000_000, int(cur_cap * 1.1) + 1)
                     renderer.set_subsample_max_per_frame(last_subsample_cap)
-                # Adapt last_subsample_cap from measured FPS while moving.
-                if smooth_frame_ms > 0:
-                    cur_cap = renderer._subsample_max_per_frame
-                    if smooth_frame_ms < target_ms * 0.9:
-                        last_subsample_cap = min(
-                            64_000_000, int(cur_cap * 1.1) + 1)
-                        renderer.set_subsample_max_per_frame(last_subsample_cap)
-                    elif smooth_frame_ms > target_ms * 1.2:
-                        last_subsample_cap = max(
-                            500_000, int(cur_cap * 0.85))
-                        renderer.set_subsample_max_per_frame(last_subsample_cap)
-                    else:
-                        last_subsample_cap = cur_cap
-            elif has_moved_ever:
-                # Stopped after at least one motion: refine progressively.
-                # Use the actual last-frame dt (smooth_frame_ms only updates
-                # during motion). Grow as long as the last frame stayed
-                # within a refinement budget; stop growing once individual
-                # frames cross that budget.
-                cur = getattr(renderer, "_subsample_max_per_frame", 4_000_000)
-                MAX_CAP = 200_000_000  # well above n_total/4 for SN_512
-                REFINE_FRAME_MS = 500.0  # tolerable per-refinement-frame time
-                last_ms = dt * 1000.0 if dt > 0 else 0.0
-                if 0 < last_ms <= REFINE_FRAME_MS and cur < MAX_CAP:
-                    renderer.set_subsample_max_per_frame(min(cur * 2, MAX_CAP))
+                elif smooth_frame_ms > target_ms * 1.2:
+                    last_subsample_cap = max(500_000, int(cur_cap * 0.85))
+                    renderer.set_subsample_max_per_frame(last_subsample_cap)
+                else:
+                    last_subsample_cap = cur_cap
+        elif has_moved_ever:
+            # Stopped after at least one motion: refine progressively.
+            # Grow the cap as long as the last frame stayed within a
+            # refinement budget; stop growing once individual frames
+            # cross that budget.
+            cur = renderer._subsample_max_per_frame
+            MAX_CAP = 200_000_000
+            REFINE_FRAME_MS = 500.0
+            last_ms = dt * 1000.0 if dt > 0 else 0.0
+            if 0 < last_ms <= REFINE_FRAME_MS and cur < MAX_CAP:
+                renderer.set_subsample_max_per_frame(min(cur * 2, MAX_CAP))
 
-        # GPU-side LOS projection: update qty buffer when camera rotates
-        if (gpu_compute is not None and gpu_ready and gpu_compute.has_los_field()
-                and _state["_vector_projection"] == "LOS"):
-            los_fwd = _state.get("_los_camera_fwd")
-            if los_fwd is None or float(np.dot(los_fwd, camera.forward)) < 0.9998:
-                gpu_compute.dispatch_los_project(camera)
-                _state["_los_camera_fwd"] = camera.forward.copy()
-        elif not moved:
-            # CPU fallback for non-GPU LOS (when gpu_compute not ready)
+        # LOS projection is computed on the CPU at _apply_render_mode
+        # time (subsample mode has no GPU LOS path). Re-fire it when the
+        # camera has rotated enough to invalidate the cached projection.
+        if not moved:
             if is_los_stale(_state["_render_mode_name"], _state["_wa_data_field"],
                             _state["_sd_field"], _state.get("_sd_field2", "None"),
                             _vector_fields, _state["_vector_projection"],
@@ -810,14 +678,10 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     refine_saved_budget = None
                 refine_budget = 0
                 if not was_moving and renderer.auto_lod:
-                    strat = getattr(renderer, "lod_strategy", "geometric")
-                    resume_lod = last_sustainable_by_strategy.get(
-                        strat, last_sustainable_lod)
-                    renderer.lod_pixels = float(resume_lod)
+                    renderer.lod_pixels = float(last_sustainable_lod)
                     renderer.max_render_particles = user_budget
 
                 if not was_moving:
-                    pid_integral = 0.0
                     smooth_fps_ema = max(renderer.target_fps, 1.0)
                     smooth_frame_ms = 1000.0 / smooth_fps_ema
 
@@ -849,24 +713,14 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                     step = max(-1.0, min(2.0, step))
                     log2_lod = math.log2(max(renderer.lod_pixels, 1.0))
                     log2_lod += step
-                    strat = getattr(renderer, "lod_strategy", "geometric")
-                    if strat == "particle_count":
-                        log2_max = math.log2(max(renderer.n_total, 2))
-                    elif strat == "subsample":
-                        log2_max = math.log2(max(renderer.n_total // 1000, 2))
-                    else:
-                        log2_max = 8.0
+                    log2_max = math.log2(max(renderer.n_total // 1000, 2))
                     log2_lod = max(0.0, min(log2_max, log2_lod))
                     renderer.lod_pixels = float(2 ** log2_lod)
                     renderer.max_render_particles = user_budget
-                    pid_integral = 0.0
-                    pid_prev_error = error
-                    prev = last_sustainable_by_strategy.get(strat, renderer.lod_pixels)
                     if err_smooth <= 0.0:
-                        last_sustainable_by_strategy[strat] = min(prev, renderer.lod_pixels)
+                        last_sustainable_lod = min(last_sustainable_lod, renderer.lod_pixels)
                     elif err_smooth > 0.5:
-                        last_sustainable_by_strategy[strat] = max(prev, renderer.lod_pixels)
-                    last_sustainable_lod = last_sustainable_by_strategy[strat]
+                        last_sustainable_lod = max(last_sustainable_lod, renderer.lod_pixels)
 
             elif refine_budget < renderer.n_total:
                 if was_moving:
@@ -891,23 +745,16 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             refine_budget = 0
 
             if not was_moving and renderer.auto_lod:
-                # Restart at the last sustainable LOD for the current
-                # strategy so we don't overshoot quality and trigger a
-                # corrective drop.
-                strat = getattr(renderer, "lod_strategy", "geometric")
-                resume_lod = last_sustainable_by_strategy.get(
-                    strat, last_sustainable_lod)
-                renderer.lod_pixels = float(resume_lod)
+                # Restart at the last sustainable LOD so we don't overshoot
+                # quality and trigger a corrective drop.
+                renderer.lod_pixels = float(last_sustainable_lod)
                 renderer.max_render_particles = user_budget
                 do_cull()
-                last_cull_time = now
                 # Suppress auto-LOD reaction for several frames to let the
-                # renderer / EMA stabilize after the LOD switch and avoid
-                # reacting to one-off resume cost.
+                # renderer / EMA stabilize after the LOD switch.
                 auto_lod_warmup_frames = 4
 
             if not was_moving:
-                pid_integral = 0.0
                 smooth_fps_ema = max(renderer.target_fps, 1.0)
                 smooth_frame_ms = 1000.0 / smooth_fps_ema
 
@@ -936,17 +783,9 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             if (renderer.auto_lod and smooth_frame_ms > 0 and dt > 0
                     and was_moving and auto_lod_warmup_frames == 0):
                 target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-                inst_frame_ms = dt * 1000.0
-                err_inst = math.log2(max(inst_frame_ms / target_ms, 0.01))
                 err_smooth = math.log2(max(smooth_frame_ms / target_ms, 0.01))
-                # Deadband around target to prevent drift from frame-time
-                # jitter. Within ±0.5 octaves (~0.7×–1.4× target) the
-                # controller does nothing.
+                # Symmetric proportional with ±0.5-octave deadband.
                 DEADBAND = 0.5
-                # Coarsen on the smoothed error so single slow frames don't
-                # trigger drift. Brighten only on smoothed headroom too.
-                # Symmetric gain — asymmetric gains cause monotonic drift
-                # in the presence of frame-time noise.
                 if err_smooth > DEADBAND:
                     error = err_smooth - DEADBAND
                     gain = 1.0
@@ -960,47 +799,24 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
                 step = max(-1.0, min(2.0, step))
                 log2_lod = math.log2(max(renderer.lod_pixels, 1.0))
                 log2_lod += step
-                # The LOD ceiling depends on the strategy: pixel size for
-                # geometric (1..256), particle count for particle_count
-                # (1..n_total), stride for subsample (up to ~n_total/1000
-                # so the strategy can adapt to extreme scenes).
-                strat = getattr(renderer, "lod_strategy", "geometric")
-                if strat == "particle_count":
-                    log2_max = math.log2(max(renderer.n_total, 2))
-                elif strat == "subsample":
-                    log2_max = math.log2(max(renderer.n_total // 1000, 2))
-                else:
-                    log2_max = 8.0  # 256
+                # Stride ceiling: never coarser than ~n_total/1000.
+                log2_max = math.log2(max(renderer.n_total // 1000, 2))
                 log2_lod = max(0.0, min(log2_max, log2_lod))
                 renderer.lod_pixels = float(2 ** log2_lod)
                 renderer.max_render_particles = user_budget
-                pid_integral = 0.0
-                pid_prev_error = error
-                # Track the smallest (finest) lod_pixels we've sustained at
-                # or below target FPS, per-strategy. Used as the restart
-                # value next time the camera starts moving.
-                prev = last_sustainable_by_strategy.get(strat, renderer.lod_pixels)
                 if err_smooth <= 0.0:
-                    last_sustainable_by_strategy[strat] = min(prev, renderer.lod_pixels)
+                    last_sustainable_lod = min(last_sustainable_lod, renderer.lod_pixels)
                 elif err_smooth > 0.5:
-                    last_sustainable_by_strategy[strat] = max(prev, renderer.lod_pixels)
-                last_sustainable_lod = last_sustainable_by_strategy[strat]
+                    last_sustainable_lod = max(last_sustainable_lod, renderer.lod_pixels)
 
             # Cull every frame while moving (PID controls budget to keep it fast)
             do_cull()
-            last_cull_time = now
 
         elif renderer.lod_pixels > 1.0:
             # --- STOPPED: progressive refinement ---
-            # Halve lod_pixels each frame toward a strategy-dependent floor.
-            # Geometric/particle_count refine to lod=1 (full detail).
-            # Subsample refines to a stride that fits the user_budget so
+            # Halve lod_pixels each frame toward the user-budget floor so
             # rendering stays interactive even when fully refined.
-            strat = getattr(renderer, "lod_strategy", "geometric")
-            if strat == "subsample":
-                refine_floor = max(1.0, renderer.n_total / max(user_budget, 1))
-            else:
-                refine_floor = 1.0
+            refine_floor = max(1.0, renderer.n_total / max(user_budget, 1))
 
             if renderer.lod_pixels <= refine_floor:
                 pass  # already refined
@@ -1024,7 +840,7 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
             fb_w, fb_h = new_fb_w, new_fb_h
             canvas_context.set_physical_size(fb_w, fb_h)
             camera.aspect = fb_w / max(fb_h, 1)
-            win_w, win_h = glfw.get_window_size(window)
+            win_w, _ = glfw.get_window_size(window)
             renderer._viewport_width = win_w  # LOD uses window size, not retina
 
         # Render
@@ -1143,225 +959,3 @@ def run_wgpu_app(snapshot_path, width=1920, height=1080, fov=90.0,
     glfw.destroy_window(window)
 
 
-def _run_wgpu_benchmark(n_frames, window, canvas_context, device, renderer, camera,
-                        data, gpu_compute, _bg, grid_thread, do_cull, fb_w, fb_h,
-                        user_lod, user_budget, app_proxy):
-    """Run the scripted benchmark using the wgpu backend."""
-    import math
-
-    # Wait for grid build
-    print("  Waiting for spatial grid...")
-    grid_thread.join()
-    if _bg["grid"] is not None and renderer._grid is None:
-        renderer._grid = _bg["grid"]
-        renderer.use_tree = True
-        renderer.update_visible(camera)
-        _bg["grid"] = None
-
-    # Init GPU compute if available
-    from .gpu_compute import GPUCompute
-    GPU_COMPUTE_THRESHOLD = 10_000_000
-    if (gpu_compute is None and renderer._grid is not None
-            and renderer.n_total >= GPU_COMPUTE_THRESHOLD):
-        try:
-            gpu_compute = GPUCompute(device)
-            gpu_compute.upload_snapshot(renderer._grid)
-            print("  GPU compute pipeline initialized")
-        except Exception as e:
-            print(f"  GPU compute init failed: {e}")
-
-    boxsize = data.header.get("BoxSize", None)
-    extent = float(boxsize) if boxsize else float(np.linalg.norm(
-        data.positions.max(axis=0) - data.positions.min(axis=0)))
-    center = np.mean([data.positions.min(axis=0), data.positions.max(axis=0)], axis=0)
-    start_pos = camera.position.copy()
-    fwd0 = camera.forward.copy()
-    up0 = camera.up.copy()
-    right0 = camera.right.copy()
-
-    from .benchmark import build_benchmark_keyframes, slerp_vec, print_benchmark_results
-
-    keyframes = build_benchmark_keyframes(camera, center, extent, n_frames)
-
-    # Progressive refinement to full detail
-    budget = max(4_000_000, renderer.max_render_particles)
-    while budget < renderer.n_total:
-        budget = min(budget * 2, renderer.n_total)
-        renderer.lod_pixels = 1
-        renderer.max_render_particles = budget
-        if gpu_compute is not None and getattr(gpu_compute, '_upload_ready', False):
-            gpu_compute.dispatch_cull(camera, budget, lod_pixels=1,
-                                      viewport_width=renderer._viewport_width,
-                                      summary_overlap=renderer.summary_overlap)
-        else:
-            renderer.update_visible(camera)
-        try:
-            renderer.render(camera, fb_w, fb_h)
-            canvas_context.present()
-        except Exception:
-            pass
-        glfw.poll_events()
-        n_vis = renderer.n_particles + renderer.n_aniso
-        print(f"  Refining: {n_vis:,} / {renderer.n_total:,}")
-        if glfw.window_should_close(window):
-            return
-
-    # Auto-range at full quality
-    try:
-        renderer.render(camera, fb_w, fb_h)
-        canvas_context.present()
-    except Exception:
-        pass
-    lo, hi = renderer.read_accum_range()
-    renderer.qty_min = lo
-    renderer.qty_max = hi
-    print(f"  Auto-range: {lo:.3g} .. {hi:.3g}")
-
-    renderer.lod_pixels = user_lod
-    renderer.max_render_particles = user_budget
-
-    # PID state
-    smooth_frame_ms = 0.0
-    pid_integral = 0.0
-    pid_prev_error = 0.0
-    was_moving = False
-    last_cull_time = 0.0
-    refine_budget = 0
-
-    TRANSITION_S = 0.5
-    HOLD_S = 1.5
-
-    frame_times = []
-    cull_times = []
-    n_vis_list = []
-    phase_list = []
-    kf_idx_list = []
-    lod_list = []
-    budget_list = []
-
-    def render_frame():
-        try:
-            renderer.render(camera, fb_w, fb_h)
-            canvas_context.present()
-        except Exception:
-            pass
-        glfw.poll_events()
-
-    def record(t_frame_ms, phase, ki):
-        cull_times.append(getattr(renderer, '_last_cull_ms', 0) + getattr(renderer, '_last_upload_ms', 0))
-        frame_times.append(t_frame_ms)
-        n_vis_list.append(renderer.n_particles + renderer.n_aniso)
-        phase_list.append(phase)
-        kf_idx_list.append(ki)
-        lod_list.append(renderer.lod_pixels)
-        budget_list.append(renderer.max_render_particles)
-
-    def pid_update(dt_s):
-        nonlocal pid_integral, pid_prev_error
-        if not renderer.auto_lod or dt_s <= 0:
-            return
-        target_ms = 1000.0 / max(renderer.target_fps, 1.0)
-        error = math.log2(max(dt_s * 1000 / target_ms, 0.01))
-        pid_integral += error * dt_s
-        pid_integral = max(-4.0, min(4.0, pid_integral))
-        derivative = (error - pid_prev_error) / dt_s
-        pid_prev_error = error
-        rate = renderer.pid_Kp * error + renderer.pid_Ki * pid_integral + renderer.pid_Kd * derivative
-        output = rate * dt_s
-        log2_budget = math.log2(max(renderer.max_render_particles, 1_000))
-        log2_budget -= output
-        log2_n = math.log2(max(renderer.n_total, 1))
-        log2_budget = max(math.log2(1_000), min(log2_n, log2_budget))
-        renderer.max_render_particles = max(1_000, min(renderer.n_total, int(2 ** log2_budget)))
-        frac = renderer.max_render_particles / max(renderer.n_total, 1)
-        renderer.lod_pixels = max(1.0, min(256.0, 1.0 / max(frac, 0.004)))
-
-    prev_kf = keyframes[0]
-
-    for ki, (pos, fwd, up, label) in enumerate(keyframes):
-        if glfw.window_should_close(window):
-            break
-        p0, f0, u0, _ = prev_kf
-
-        # Transition
-        t_start = time.perf_counter()
-        t_prev = t_start
-        while not glfw.window_should_close(window):
-            elapsed = time.perf_counter() - t_start
-            if elapsed >= TRANSITION_S:
-                break
-            t = elapsed / TRANSITION_S
-            camera.position = (p0 * (1 - t) + pos * t).astype(np.float32)
-            camera._forward = slerp_vec(f0, fwd, t).astype(np.float32)
-            camera._up = slerp_vec(u0, up, t).astype(np.float32)
-            camera._dirty = True
-
-            now = time.perf_counter()
-            dt_s = now - t_prev
-            if dt_s > 0:
-                if not was_moving:
-                    smooth_frame_ms = 0.0
-                    pid_integral = 0.0
-                elif smooth_frame_ms == 0.0:
-                    smooth_frame_ms = dt_s * 1000
-                else:
-                    tau = max(renderer.auto_lod_smooth, 0.01)
-                    a = min(dt_s / tau, 1.0)
-                    smooth_frame_ms = (1 - a) * smooth_frame_ms + a * dt_s * 1000
-                pid_update(dt_s)
-
-            do_cull()
-            render_frame()
-            was_moving = True
-            refine_budget = 0
-
-            now2 = time.perf_counter()
-            record((now2 - t_prev) * 1000, "transition", ki)
-            t_prev = now2
-
-        # Hold
-        camera.position = pos.copy()
-        camera._forward = fwd.copy()
-        camera._up = up.copy()
-        camera._dirty = True
-
-        t_start = time.perf_counter()
-        t_prev = t_start
-        hold_refine_budget = max(user_budget, 4_000_000)
-        while not glfw.window_should_close(window):
-            if time.perf_counter() - t_start >= HOLD_S:
-                break
-            hold_refine_budget = min(hold_refine_budget * 2, renderer.n_total)
-            renderer.lod_pixels = 1
-            renderer.max_render_particles = hold_refine_budget
-            do_cull()
-            render_frame()
-            renderer.lod_pixels = user_lod
-            renderer.max_render_particles = user_budget
-            was_moving = False
-
-            now2 = time.perf_counter()
-            record((now2 - t_prev) * 1000, "hold", ki)
-            t_prev = now2
-
-        prev_kf = (pos, fwd, up, label)
-
-    # Print results
-    frame_times = np.array(frame_times)
-    cull_times = np.array(cull_times)
-
-    print_benchmark_results(frame_times, cull_times, phase_list,
-                            renderer.n_total, backend="wgpu")
-
-    outfile = f"benchmark_wgpu_{int(time.time())}.npz"
-    kf_labels = [kf[3] for kf in keyframes]
-    np.savez(outfile,
-             frame_time_ms=frame_times, cull_time_ms=cull_times,
-             n_visible=np.array(n_vis_list), phase=np.array(phase_list),
-             keyframe_idx=np.array(kf_idx_list),
-             keyframe_labels=np.array(kf_labels),
-             lod_pixels=np.array(lod_list),
-             max_render_particles=np.array(budget_list),
-             n_total=renderer.n_total, backend="wgpu")
-    print(f"  Saved: {outfile} ({len(frame_times)} frames)")
-    print("-----------------------------------\n")
