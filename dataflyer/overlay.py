@@ -354,7 +354,7 @@ class DevOverlay(Panel):
         pid_str = f"  (PID: {smooth_fps:.0f})" if smooth_fps > 0 else ""
         items.append(("text", f"FPS: {fps:.0f}{pid_str}"))
         items.append(("text", f"Particles: {n_vis:,} / {n_tot:,}"))
-        items.append(("text", f"LOD: {renderer.lod_pixels}px  Budget: {renderer._subsample_max_per_frame/1e6:.1f}M"))
+        items.append(("text", f"Budget: {renderer._subsample_max_per_frame/1e6:.1f}M"))
         items.append(("text", f"Cull: {timings.get('cull',0)*1000:.0f}ms  Upload: {timings.get('upload',0)*1000:.0f}ms  Render: {timings.get('render',0)*1000:.0f}ms"))
         if renderer.log_scale:
             range_str = f"10^{renderer.qty_min:.2f} .. 10^{renderer.qty_max:.2f}"
@@ -748,11 +748,9 @@ class UserMenu(Panel):
                     app._apply_render_mode()
             elif key == "wa_data_field":
                 app._wa_data_field = value
-                app._los_camera_fwd = None
                 app._apply_render_mode()
             elif key == "vector_projection":
                 app._vector_projection = value
-                app._los_camera_fwd = None
                 app._apply_render_mode()
             elif key == "colormap":
                 from .colormaps import AVAILABLE_COLORMAPS

@@ -119,7 +119,6 @@ def make_default_app_state(data):
         "render_mode_name": "SurfaceDensity",
         "wa_data_field": "Masses",
         "vector_projection": "LOS",
-        "los_camera_fwd": None,
         "composite": False,
         "slot": [
             {"mode": "SurfaceDensity", "weight": "Masses", "data": "Masses",
@@ -148,16 +147,15 @@ def uses_vector_field(render_mode_name, wa_data_field, sd_field, sd_field2, vect
 
 
 def is_los_stale(render_mode_name, wa_data_field, sd_field, sd_field2,
-                 vector_fields, vector_projection, los_camera_fwd, camera_forward,
-                 los_camera_pos=None, camera_position=None,
+                 vector_fields, vector_projection,
+                 los_camera_pos, camera_position,
                  pos_threshold=None):
     """Check if the LOS projection needs recomputing.
 
     The LOS vector field projects each particle's vector onto the unit
     vector from the *camera position* to that particle. That direction
     is invariant under pure camera rotation — only translation
-    invalidates it. So when `camera_position` and `los_camera_pos` are
-    available, we ignore orientation and check only translation.
+    invalidates it.
 
     `pos_threshold` is the maximum tolerated translation in world units
     before the cache is considered stale; if None it falls back to 1.0.
@@ -167,17 +165,11 @@ def is_los_stale(render_mode_name, wa_data_field, sd_field, sd_field2,
         return False
     if vector_projection != "LOS":
         return False
-    # Per-particle LOS: only translation matters.
-    if camera_position is not None:
-        if los_camera_pos is None:
-            return True
-        thr = pos_threshold if pos_threshold is not None else 1.0
-        return float(np.linalg.norm(np.asarray(camera_position)
-                                    - np.asarray(los_camera_pos))) > thr
-    # Legacy global-direction LOS: orientation matters.
-    if los_camera_fwd is None:
+    if los_camera_pos is None:
         return True
-    return float(np.dot(los_camera_fwd, camera_forward)) < 0.9998
+    thr = pos_threshold if pos_threshold is not None else 1.0
+    return float(np.linalg.norm(np.asarray(camera_position)
+                                - np.asarray(los_camera_pos))) > thr
 
 
 def project_vector(vec, projection, camera_forward,
